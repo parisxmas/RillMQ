@@ -27,6 +27,11 @@ fn j_kind_pub() = 80
 
 fn j_kind_ack() = 65
 
+# A term: whose turn it is to lead this queue. It goes in the journal with
+# everything else because it has to survive the same things the messages do,
+# and because a copy then learns it the same way it learns anything.
+fn j_kind_term() = 84
+
 fn j_head() = 13
 
 fn j_overhead() = 17
@@ -64,6 +69,8 @@ fn j_pub_record(id, body) = j_record(j_kind_pub(), id, body)
 
 fn j_ack_record(id) = j_record(j_kind_ack(), id, "")
 
+fn j_term_record(term) = j_record(j_kind_term(), term, "")
+
 # -- reading bytes ----------------------------------------------------------------
 
 fn j_read_u32(s, at) =
@@ -98,13 +105,13 @@ fn j_check(s, at, len) =
 # that was not part of a whole record, which is where the file is cut back to
 # and where appending starts again.
 type Replay
-  Replay(name: Str, live: Map(Int, Str), order: List(Int), top: Int, upto: Int)
+  Replay(name: Str, live: Map(Int, Str), order: List(Int), top: Int, upto: Int, term: Int)
 
 fn j_replay(path) =
   fd = file_open(path, "r")
-  if fd < 0 then Replay("", map_new(), Nil, 0, 0)
+  if fd < 0 then Replay("", map_new(), Nil, 0, 0, 0)
   else
-    r = j_walk(fd, "", 0, Replay("", map_new(), Nil, 0, 0))
+    r = j_walk(fd, "", 0, Replay("", map_new(), Nil, 0, 0, 0))
     file_close(fd)
     j_finish(r)
 
@@ -113,16 +120,17 @@ fn j_replay(path) =
 fn j_walk(fd, buf, base, r: Replay) =
   step = j_scan(buf, 0, r)
   more = file_read(fd, j_block())
-  if str_len(more) == 0 then Replay(step.name, step.live, step.order, step.top, base + step.upto) else j_walk(fd, buf[step.upto:] + more, base + step.upto, Replay(step.name, step.live, step.order, step.top, 0))
+  if str_len(more) == 0 then Replay(step.name, step.live, step.order, step.top, base + step.upto, step.term) else j_walk(fd, buf[step.upto:] + more, base + step.upto, Replay(step.name, step.live, step.order, step.top, 0, step.term))
 
 fn j_block() = 262144
 
 fn j_scan(buf, at, r: Replay) = match j_take(buf, at)
-  RStop -> Replay(r.name, r.live, r.order, r.top, at)
+  RStop -> Replay(r.name, r.live, r.order, r.top, at, r.term)
   RGot(kind, id, body, next) -> j_scan(buf, next, j_apply(r, kind, id, body))
 
 fn j_apply(r: Replay, kind, id, body) =
-  if kind == j_kind_name() then Replay(body, r.live, r.order, r.top, r.upto)
+  if kind == j_kind_term() then Replay(r.name, r.live, r.order, r.top, r.upto, if id > r.term then id else r.term)
+  else if kind == j_kind_name() then Replay(body, r.live, r.order, r.top, r.upto, r.term)
   else if kind == j_kind_pub() then
     # The same message may be written twice: a rewrite puts the live queue in
     # a new file while a publish that was already on its way is still going to
@@ -130,14 +138,14 @@ fn j_apply(r: Replay, kind, id, body) =
     # as it is not counted as a second message.
     fresh = !map_has(r.live, id)
     r.live[id] = body
-    Replay(r.name, r.live, if fresh then Cons(id, r.order) else r.order, if id > r.top then id else r.top, r.upto)
+    Replay(r.name, r.live, if fresh then Cons(id, r.order) else r.order, if id > r.top then id else r.top, r.upto, r.term)
   else
     map_del(r.live, id)
-    Replay(r.name, r.live, r.order, r.top, r.upto)
+    Replay(r.name, r.live, r.order, r.top, r.upto, r.term)
 
 # The order records were written in, with the acknowledged ones dropped. They
 # went on the front as they were read, so this is the reverse of a reverse.
-fn j_finish(r: Replay) = Replay(r.name, r.live, j_keep(r.live, r.order, Nil), r.top, r.upto)
+fn j_finish(r: Replay) = Replay(r.name, r.live, j_keep(r.live, r.order, Nil), r.top, r.upto, r.term)
 
 fn j_keep(live: Map(Int, Str), ids, acc) = match ids
   Nil -> acc
@@ -196,7 +204,7 @@ type Copy
 # somebody else to take the queue over: whatever the old leader is still
 # holding, nobody was told it was safe.
 type Jspec
-  Jspec(name: Str, path: Str, copies: List(Copy), need: Int)
+  Jspec(name: Str, path: Str, copies: List(Copy), need: Int, term: Int)
 
 # The journal's own state. One record rather than seven parameters, because
 # the loop is a tail call and past six arguments a tail call stops being a
@@ -204,7 +212,7 @@ type Jspec
 # them and whatever came back on it past the answer being read; `need` is how
 # many of them have to have a batch before anybody is told it is safe.
 type Js
-  Js(fd: Int, path: Str, pubs: Int, acks: Int, name: Str, copies: List(Copy), need: Int)
+  Js(fd: Int, path: Str, pubs: Int, acks: Int, name: Str, copies: List(Copy), need: Int, term: Int)
 
 # What a batch turned out to contain. `todo` is empty, or holds the one
 # rewrite the batch ended on.
@@ -228,14 +236,14 @@ fn j_compact_floor() = 4096
 fn j_worth_rewriting(js: Js) =
   js.pubs + js.acks >= j_compact_floor() && js.acks * 5 > js.pubs * 3
 
-fn j_run(path, jr: Jr, done) = j_run_spec(Jspec("", path, Nil, 0), jr, done)
+fn j_run(path, jr: Jr, done) = j_run_spec(Jspec("", path, Nil, 0, 0), jr, done)
 
 fn j_run_spec(spec: Jspec, jr: Jr, done) =
   fd = file_open(spec.path, "a")
   if fd < 0 then j_cannot(spec.path, jr, done) else j_begin(fd, spec, jr, done)
 
 fn j_begin(fd, spec: Jspec, jr: Jr, done) =
-  j_loop(Js(fd, spec.path, 0, 0, spec.name, j_dial_all(spec.copies), spec.need), jr, done)
+  j_loop(Js(fd, spec.path, 0, 0, spec.name, j_dial_all(spec.copies), spec.need, spec.term), jr, done)
 
 fn j_dial_all(copies) = match copies
   Nil -> Nil
@@ -270,7 +278,7 @@ fn j_commit(js: Js, jr: Jr, r) =
   # message is safe until a majority has it. One batch is one message on the
   # wire and one wait, however many records are in it, which is what makes this
   # cost a round trip a batch rather than a round trip a publish.
-  after = j_copy(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks, js.name, js.copies, js.need), bytes)
+  after = j_copy(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks, js.name, js.copies, js.need, js.term), bytes)
   j_told(g.ws, after.enough)
   j_maybe_ask(j_do_todo(after.js, g.todo), jr)
 
@@ -312,8 +320,8 @@ fn j_redial(copies, acc) = match copies
 fn j_worth_dialling(c: Copy) = c.fd < 0 && now_millis() - c.tried >= j_redial_ms()
 
 fn j_copy_to(copies, js: Js, bytes) =
-  j_shout(copies, "REPL " + js.name + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes)
-  j_count(Js(js.fd, js.path, js.pubs, js.acks, js.name, copies, js.need), copies, Nil, 0)
+  j_shout(copies, "REPL " + js.name + " " + int_to_str(js.term) + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes)
+  j_count(Js(js.fd, js.path, js.pubs, js.acks, js.name, copies, js.need, js.term), copies, Nil, 0)
 
 fn j_shout(copies, text) = match copies
   Nil -> 0
@@ -328,7 +336,7 @@ fn j_write_to(fd, text) =
   0
 
 fn j_count(js: Js, left, seen, got) = match left
-  Nil -> Copied(Js(js.fd, js.path, js.pubs, js.acks, js.name, reverse(seen), js.need), got >= js.need)
+  Nil -> Copied(Js(js.fd, js.path, js.pubs, js.acks, js.name, reverse(seen), js.need, js.term), got >= js.need)
   Cons(c, rest) -> j_count_one(js, c, rest, seen, got)
 
 fn j_count_one(js: Js, c: Copy, rest, seen, got) =
@@ -521,10 +529,10 @@ fn j_swap(js: Js, tmp, n) =
 # running and stops being durable, which is worth saying out loud.
 fn j_reopened(js: Js, n) =
   fd = file_open(js.path, "a")
-  if fd >= 0 then Js(fd, js.path, n, 0, js.name, js.copies, js.need)
+  if fd >= 0 then Js(fd, js.path, n, 0, js.name, js.copies, js.need, js.term)
   else
     println("rillmq: lost " + js.path + " while rewriting it")
-    Js(fd, js.path, n, 0, js.name, js.copies, js.need)
+    Js(fd, js.path, n, 0, js.name, js.copies, js.need, js.term)
 
 # In chunks rather than one string. A queue holding a million messages would
 # otherwise be asked for a hundred megabytes of contiguous bytes to write a

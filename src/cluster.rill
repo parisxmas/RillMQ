@@ -69,7 +69,7 @@ type Waiting
   WStat(reply: Chan(QCount))
 
 type P
-  P(name: Str, fd: Int, subs: List(Sub), waits: Map(Int, Waiting), head: Int, tail: Int, host: Str, port: Int, tried: Int)
+  P(name: Str, fd: Int, subs: List(Sub), waits: Map(Int, Waiting), head: Int, tail: Int, host: Str, port: Int, tried: Int, reg: Chan(RReq))
 
 # What reaches the proxy.
 type PIn
@@ -83,16 +83,41 @@ fn crlf2() = "\r\n"
 # A proxy is made whether or not the far end is there. A node that is down when
 # this queue is first named is a node that may be up in a moment, and a queue
 # that gave up at that instant would stay given up for the life of the broker.
-fn cl_proxy(name, host, port, inbox, done) =
+fn cl_proxy(name, host, port, reg, inbox, done) =
   ses = channel(256)
   spawn cl_relay(inbox, ses)
-  cl_start(P(name, -1, Nil, map_new(), 0, 0, host, port, 0), ses, done)
+  cl_start(P(name, -1, Nil, map_new(), 0, 0, host, port, 0, reg), ses, done)
 
 fn cl_start(p: P, ses, done) = match connect_to(p.host, p.port)
-  Err(e) -> cl_loop(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis()), ses, done)
+  Err(e) -> cl_start_elsewhere(p, ses, done)
   Ok(fd) ->
     spawn cl_link(fd, ses, "", p.name)
-    cl_resub(P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0), ses, done)
+    cl_resub(P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0, p.reg), ses, done)
+
+# The node the hash names is not there. Somebody may have taken the queue over
+# since, so ask before settling into refusing: a stand-in that finds the new
+# leader on the way up answers the request that made it rather than turning
+# that one away.
+fn cl_start_elsewhere(p: P, ses, done) =
+  peers = cl_peers()
+  said = cl_ask_who(peers, p.name, 0, cl_me())
+  if said < 0 || said == cl_me() then cl_idle(p, ses, done) else cl_start_at(p, ses, done, nth(peers, said))
+
+fn cl_idle(p: P, ses, done) =
+  cl_loop(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis(), p.reg), ses, done)
+
+# One redirection and no more. If the node somebody named is not there either,
+# this settles into refusing and trying again on a clock, which is where a
+# node that keeps missing ends up anyway.
+fn cl_start_at(p: P, ses, done, where) = match where
+  None -> cl_idle(p, ses, done)
+  Some(q) -> cl_start_once(P(p.name, -1, p.subs, p.waits, p.head, p.tail, cl_host(q), cl_port(q), 0, p.reg), ses, done)
+
+fn cl_start_once(p: P, ses, done) = match connect_to(p.host, p.port)
+  Err(e) -> cl_idle(p, ses, done)
+  Ok(fd) ->
+    spawn cl_link(fd, ses, "", p.name)
+    cl_resub(P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0, p.reg), ses, done)
 
 # The far end has no memory of this node's subscribers, so they are asked for
 # again. Everything that was in flight over there has already come back to its
@@ -207,7 +232,7 @@ fn cl_write(fd, text) =
 fn cl_lost(p: P, ses, done) =
   sock_close(p.fd)
   cl_fail_all(p, p.head)
-  cl_loop(P(p.name, -1, p.subs, map_new(), 0, 0, p.host, p.port, now_millis()), ses, done)
+  cl_loop(P(p.name, -1, p.subs, map_new(), 0, 0, p.host, p.port, now_millis(), p.reg), ses, done)
 
 fn cl_fail_all(p: P, at) =
   if at >= p.tail then 0
@@ -219,6 +244,56 @@ fn cl_fail_one(w, name) = match w
   None -> 0
   Some(x) -> cl_give(x, "-ERR the node holding that queue cannot be reached", name)
 
+# -- when the node holding a queue does not come back ---------------------------------
+
+# One question and one answer, on a connection made for it. Everything between
+# nodes that is not a stream of records is this shape: ask, hear, hang up.
+fn cl_one_shot(host, port, text) = match connect_to(host, port)
+  Err(e) -> ""
+  Ok(fd) ->
+    sock_write(fd, text)
+    cl_hear(fd, "")
+
+fn cl_hear(fd, buf) =
+  at = str_find(buf, crlf2())
+  if at >= 0 then cl_hang_up(fd, buf[:at])
+  else
+    more = if sock_wait(fd, 2000) then sock_read(fd) else ""
+    if str_len(more) == 0 then cl_hang_up(fd, "") else cl_hear(fd, buf + more)
+
+fn cl_hang_up(fd, line) =
+  sock_close(fd)
+  line
+
+# Before deciding a queue has no leader, ask whether somebody else knows of
+# one. A node that gave its vote knows who it gave it to.
+fn cl_ask_who(peers, name, i, me) = match peers
+  Nil -> -1
+  Cons(p, rest) -> if i == me then cl_ask_who(rest, name, i + 1, me) else cl_who_said(cl_one_shot(cl_host(p), cl_port(p), "WHO " + name + crlf2()), peers, name, i, me)
+
+fn cl_who_said(line, peers, name, i, me) =
+  if starts_with(line, "+WHO ") then str_to_int(line[5:]) else cl_ask_who_rest(peers, name, i, me)
+
+fn cl_ask_who_rest(peers, name, i, me) = match peers
+  Nil -> -1
+  Cons(p, rest) -> cl_ask_who(rest, name, i + 1, me)
+
+# Standing for the leadership of a queue: a later turn than any this node knows
+# of, and how much of that queue's journal it has. A majority is needed, and
+# this node counts as one of them because it has already voted for itself by
+# asking.
+fn cl_stand(name, term, size, peers, me) =
+  cl_won(cl_count_votes(peers, name, term, size, 0, 1), len(peers))
+
+fn cl_won(votes, n) = votes * 2 > n
+
+fn cl_count_votes(peers, name, term, size, i, got) = match peers
+  Nil -> got
+  Cons(p, rest) -> cl_count_votes(rest, name, term, size, i + 1, got + cl_one_vote(p, name, term, size, i))
+
+fn cl_one_vote(p: Peer, name, term, size, i) =
+  if i == cl_me() then 0 else if starts_with(cl_one_shot(cl_host(p), cl_port(p), "VOTE " + name + " " + int_to_str(term) + " " + int_to_str(size) + " " + int_to_str(cl_me()) + crlf2()), "+VOTE") then 1 else 0
+
 # A request arriving while the link is down is the moment to try the node
 # again, so long as the last try was not a moment ago.
 fn cl_asked(p: P, r, ses, done) =
@@ -228,17 +303,67 @@ fn cl_no(p: P, r) =
   cl_say_no(r)
   p
 
+# The node that had this queue is not answering. Before deciding it has no
+# leader, ask everybody else whether they know of one — somebody who gave a
+# vote does. Failing that, stand for it.
+fn cl_look_around(p: P, r, ses) =
+  peers = cl_peers()
+  said = cl_ask_who(peers, p.name, 0, cl_me())
+  if said >= 0 && said != cl_me() then cl_go_to(p, r, ses, nth(peers, said)) else if said == cl_me() then cl_take_over(p, r) else cl_maybe_stand(p, r, peers)
+
+fn cl_go_to(p: P, r, ses, where) = match where
+  None -> cl_no(p, r)
+  Some(q) -> cl_try_again(P(p.name, -1, p.subs, p.waits, p.head, p.tail, cl_host(q), cl_port(q), 0, p.reg), r, ses)
+
+# Standing for the leadership, and taking it if a majority agrees. The turn
+# asked for is one later than any this node knows of, and what it offers is
+# how much of the queue's journal it has: a majority will not vote for a node
+# that has less than they do, and a majority has everything anybody was told
+# was safe.
+fn cl_maybe_stand(p: P, r, peers) =
+  if len(peers) <= 1 then cl_no(p, r) else if cl_stand(p.name, cl_term_of(p) + 1, cl_size_of(p), peers, cl_me()) then cl_elected(p, r, cl_term_of(p) + 1) else cl_no(p, r)
+
+fn cl_term_of(p: P) =
+  back = channel(1)
+  send(p.reg, RTerm(p.name, back))
+  recv(back)
+
+fn cl_size_of(p: P) =
+  back = channel(1)
+  send(p.reg, RSize(p.name, back))
+  recv(back)
+
+fn cl_elected(p: P, r, term) =
+  println("rillmq: taking over " + p.name + " for turn " + int_to_str(term))
+  cl_note_term(p, term)
+  cl_take_over(p, r)
+
+fn cl_note_term(p: P, term) =
+  back = channel(1)
+  send(p.reg, RVote(p.name, term, cl_size_of(p), cl_me(), back))
+  recv(back)
+  0
+
+# The registry puts a real queue where this stand-in was, and every connection
+# picks it up on its next command. This request is refused, and whoever made it
+# asks again.
+fn cl_take_over(p: P, r) =
+  back = channel(1)
+  send(p.reg, RPromote(p.name, back))
+  recv(back)
+  cl_no(p, r)
+
 fn cl_try_again(p: P, r, ses) = match connect_to(p.host, p.port)
-  Err(e) -> cl_no(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis()), r)
+  Err(e) -> cl_look_around(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis(), p.reg), r, ses)
   Ok(fd) ->
     spawn cl_link(fd, ses, "", p.name)
-    back = P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0)
+    back = P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0, p.reg)
     if len(back.subs) > 0 then cl_send(back, "SUB " + back.name + crlf2()) else 0
     cl_ask(back, r)
 
 fn cl_wait(p: P, w) =
   p.waits[p.tail] = w
-  P(p.name, p.fd, p.subs, p.waits, p.head, p.tail + 1, p.host, p.port, p.tried)
+  P(p.name, p.fd, p.subs, p.waits, p.head, p.tail + 1, p.host, p.port, p.tried, p.reg)
 
 # What the queue would have done, said down the link instead. Everything that
 # expects an answer leaves a note of what to do with it.
@@ -249,7 +374,7 @@ fn cl_ask(p: P, r) = match r
   QSub(s, reply) ->
     cl_send(p, "SUB " + p.name + crlf2())
     send(reply, 1)
-    P(p.name, p.fd, append(p.subs, Cons(s, Nil)), p.waits, p.head, p.tail, p.host, p.port, p.tried)
+    P(p.name, p.fd, append(p.subs, Cons(s, Nil)), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg)
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     cl_unsub(p, sub_id)
@@ -267,10 +392,10 @@ fn cl_ask(p: P, r) = match r
 # stops sending: this node has nobody to give a message to.
 fn cl_unsub(p: P, sub_id) =
   left = cl_without(p.subs, sub_id)
-  if len(left) > 0 then P(p.name, p.fd, left, p.waits, p.head, p.tail, p.host, p.port, p.tried)
+  if len(left) > 0 then P(p.name, p.fd, left, p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg)
   else
     cl_send(p, "UNSUB " + p.name + crlf2())
-    P(p.name, p.fd, left, p.waits, p.head, p.tail, p.host, p.port, p.tried)
+    P(p.name, p.fd, left, p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg)
 
 fn cl_without(subs, sub_id) = match subs
   Nil -> Nil
@@ -283,7 +408,7 @@ fn cl_answer(p: P, line) = match p.waits[p.head]
   Some(w) ->
     cl_give(w, line, p.name)
     map_del(p.waits, p.head)
-    P(p.name, p.fd, p.subs, p.waits, p.head + 1, p.tail, p.host, p.port, p.tried)
+    P(p.name, p.fd, p.subs, p.waits, p.head + 1, p.tail, p.host, p.port, p.tried, p.reg)
 
 fn cl_give(w, line, name) = match w
   WPub(out) ->
@@ -309,7 +434,7 @@ fn cl_hand_on(p: P, id, body) = cl_offer(p, id, body, p.subs)
 fn cl_offer(p: P, id, body, left) = match left
   Nil -> p
   Cons(s, rest) ->
-    if cl_try(q_sub_out(s), ODeliver(p.name, id, body)) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried) else cl_offer(p, id, body, rest)
+    if cl_try(q_sub_out(s), ODeliver(p.name, id, body)) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg) else cl_offer(p, id, body, rest)
 
 fn cl_try(out, what) =
   ok = select

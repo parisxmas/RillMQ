@@ -41,7 +41,9 @@ type Cmd
   CStats
   CQueues
   CQStat(queue: Str)
-  CRepl(queue: Str, bytes: Str)
+  CRepl(queue: Str, term: Int, bytes: Str)
+  CVote(queue: Str, term: Int, size: Int, node: Int)
+  CWho(queue: Str)
   CPromote(queue: Str)
   CXDecl(exchange: Str, kind: Str)
   CBind(exchange: Str, queue: Str, key: Str)
@@ -83,7 +85,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -134,8 +136,32 @@ fn w_promote(parts, rest) =
 
 fn w_take_repl(buf, parts, at) =
   queue = w_name(parts)
-  len = str_to_int(w_second(parts))
-  if str_len(queue) == 0 || len < 0 then Bad("a queue and a length are wanted", at, false) else if len > w_most_body() then Bad("batch too long", 0, true) else if str_len(buf) - at < len then Need else Got(CRepl(queue, buf[at:at + len]), at + len)
+  len = str_to_int(unwrap_or(nth(parts, 3), "-1"))
+  if str_len(queue) == 0 || len < 0 then Bad("a queue, a term and a length are wanted", at, false) else if len > w_most_body() then Bad("batch too long", 0, true) else if str_len(buf) - at < len then Need else Got(CRepl(queue, str_to_int(w_second(parts)), buf[at:at + len]), at + len)
+
+# `VOTE <queue> <term> <size> <node>` is one node asking to lead a queue: which
+# turn it means, how much of that queue's journal it has, and which node it is
+# — the last so that whoever votes knows who to point at afterwards. A vote is given when
+# the turn is later than any this node knows of and the asker's journal is at
+# least as long as its own. That second half is what keeps a node that has
+# fallen behind from being made leader of what it does not have.
+fn w_vote(parts, rest) =
+  queue = w_name(parts)
+  if str_len(queue) == 0 then Bad("a queue, a term and a size are wanted", rest, false) else Got(CVote(queue, str_to_int(w_second(parts)), str_to_int(unwrap_or(nth(parts, 3), "0")), str_to_int(unwrap_or(nth(parts, 4), "-1"))), rest)
+
+# `WHO <queue>` asks a node who it believes leads a queue, so that a node whose
+# proxy has failed can look for a new leader before deciding there is not one.
+fn w_who(parts, rest) =
+  queue = w_name(parts)
+  if str_len(queue) == 0 then Bad("a queue name is wanted", rest, false) else Got(CWho(queue), rest)
+
+fn w_vote_yes() = "+VOTE" + crlf()
+
+fn w_vote_no(term) = "-VOTE " + int_to_str(term) + crlf()
+
+fn w_who_line(node) = "+WHO " + int_to_str(node) + crlf()
+
+fn w_stale() = "-STALE" + crlf()
 
 fn w_qstat_line(ready, inflight, subs, published) =
   "+QSTAT " + int_to_str(ready) + " " + int_to_str(inflight) + " " + int_to_str(subs) + " " + int_to_str(published) + crlf()

@@ -272,7 +272,48 @@ The node keeps trying, about once a second, and picks up again the moment the
 owner is back — with the subscriptions asked for again, because the far end
 has no memory of them.
 
-### Taking a copy over
+### Failing over
+
+A node whose stand-in for a queue cannot reach the node holding it does not
+give up and does not guess. It asks everybody else whether they know of a
+leader — a node that gave its vote does — and only if nobody does, it stands
+for the leadership itself:
+
+```
+VOTE orders <turn> <how much of the journal I have> <which node I am>
++VOTE
+```
+
+A vote is given when the turn asked for is later than any this node knows of
+**and** the asker's journal for that queue is at least as long as its own. The
+second half is the one that matters. A majority of the cluster has every record
+anybody was told was safe, so a candidate a majority will vote for has all of
+them too — and a candidate that has fallen behind is refused by everybody who
+is ahead of it, which is enough of them to matter.
+
+With a majority the candidate writes the turn into the queue's journal and
+starts serving it. Everything it sends from then on says which turn it is for,
+and a node holding an older one is refused:
+
+```
+REPL orders <turn> <len>
+-STALE
+```
+
+which is how a leader that was replaced while it was away finds out. It can no
+longer reach a majority, so it can no longer confirm anything, so nothing it
+takes can be lost by the cluster carrying on without it.
+
+The request that starts an election is refused, and whoever made it asks again
+— by then there is a leader. Nobody decides anything on a clock: an election
+happens when somebody wants a queue and cannot have it.
+
+**Three nodes are the smallest cluster this works in.** A majority of two is
+two, so a two-node cluster cannot lose a node and still confirm, and cannot
+elect anybody either. That is a fact about two-node clusters rather than a
+shortcoming here, and it is why clusters have an odd number of nodes.
+
+### Taking a copy over by hand
 
 ```
 PROMOTE orders
@@ -286,11 +327,9 @@ up on its next command, because a connection asks the registry each time
 rather than remembering. The id it hands out next is the proof: a queue that
 had taken two messages answers `+OK 3` on the node that took it over.
 
-**Nothing decides this on its own.** Deciding that a node is gone rather than
-slow is the problem consensus exists to solve, and doing it without consensus
-is how two nodes end up both believing they own the same queue. What the
-majority rule above buys is that promoting is *safe* when somebody has decided:
-the old leader cannot have confirmed anything the new one does not have.
+`PROMOTE` is what an election does at the end, and it is there on its own for
+the times a person has decided something the cluster cannot: a node that is
+never coming back, in a cluster too small to elect anybody.
 
 ## Routing
 
@@ -560,6 +599,7 @@ sh test/persistence.sh       # 18 checks, most of which stop the broker
 sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
 sh test/cluster.sh           # 7 checks across two nodes
 sh test/majority.sh          # 5 checks across three
+sh test/failover.sh          # 7 checks, one node killed with nobody watching
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -570,7 +610,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All fifty-four pass against a `--parallel` build on four workers, and with or
+All sixty-one pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -582,8 +622,16 @@ without a journal.
 - **A rewrite holds the whole live queue as records at once.** The queue builds
   them and hands them over as a list, which for a large queue is a second copy
   of it in memory for as long as the write takes.
-- **No automatic failover.** `PROMOTE` is a person's decision, or a script's.
-  Nothing here notices a node is gone and acts on it.
+- **An election is one round and no heartbeats.** Nothing notices a node is
+  gone until somebody wants a queue it held. A cluster nobody is using does
+  not notice anything, which is the right amount of noticing for a cluster
+  nobody is using and the wrong amount for one about to be.
+- **A term is per queue, and there is no log to catch up on.** A candidate
+  that is behind is refused and stays behind; nothing copies it the records it
+  is missing. In a cluster that has been up long enough for a majority to have
+  everything this is a distinction without a difference, and in one that has
+  not, it means the election waits for a node that is ahead to be asked for
+  the queue.
 - **A copy is a file, not a queue.** The node keeping it does not serve it,
   count it, or list it. Making it serve is a restart with a different
   `peers`.

@@ -30,6 +30,16 @@ type RReq
   # Serve a queue this node has only been keeping a copy of. What was a stand-in
   # for somebody else's queue becomes the queue.
   RPromote(name: Str, reply: Chan(Int))
+  # A vote asked for, and who this node believes leads a queue. Both are the
+  # registry's to answer because it is the one thing that knows what this node
+  # is holding and what it has already promised.
+  RVote(name: Str, term: Int, size: Int, from: Int, reply: Chan(Int))
+  RWho(name: Str, reply: Chan(Int))
+  # The term a batch arriving from another node claims to be for.
+  RTerm(name: Str, reply: Chan(Int))
+  # How much of a queue's journal this node has, which is what a candidate for
+  # its leadership has to say when it asks for votes.
+  RSize(name: Str, reply: Chan(Int))
 
 type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
@@ -55,25 +65,32 @@ type Conn
 # nobody has ever been glad of.
 # The routing table's own journal, made once. Exchanges and bindings are few
 # and change rarely, so they share one file rather than having one each.
+# What the registry is, apart from its tables: where things are kept, the
+# journal the routing table goes in, and a way to hand itself to a stand-in —
+# which needs it, because a stand-in that finds its node gone has to ask the
+# registry for a vote and may end up asking it to make the queue local.
+type Reg
+  Reg(dir: Str, jr: Jr, self: Chan(RReq))
+
 fn r_run(dir, inbox, done) =
   jr = Jr(channel(256), channel(1))
   if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
-  r_loop(map_new(), map_new(), map_new(), map_new(), dir, Cons(jr, Nil), inbox, done)
+  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox), inbox, done)
 
-fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), dir, jr, inbox, done) =
+fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(r_handle(qs, xs, cs, mine, dir, jr, r, done))
+    r = recv(inbox) -> Some(r_handle(qs, xs, cs, mine, ts, ld, g, r, done))
     recv(done) -> None
   match step
     None -> 0
-    Some(_) -> r_loop(qs, xs, cs, mine, dir, jr, inbox, done)
+    Some(_) -> r_loop(qs, xs, cs, mine, ts, ld, g, inbox, done)
 
-fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), dir, jr, r, done) = match r
+fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, r, done) = match r
   RFind(name, reply) ->
-    send(reply, r_queue(qs, mine, dir, name, done))
+    send(reply, r_queue(qs, mine, g.dir, g.self, name, done))
     0
   RExchange(name, kind, quiet, reply) ->
-    send(reply, r_exchange(xs, jr, name, kind, quiet, done))
+    send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, done))
     0
   RTotals(reply) ->
     send(reply, r_totals(qs, map_keys(qs), 0, 0))
@@ -82,10 +99,26 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     send(reply, r_rows(qs, map_keys(qs), Nil))
     0
   RCopy(name, reply) ->
-    send(reply, r_copy(cs, dir, name, done))
+    send(reply, r_copy(cs, g.dir, name, done))
     0
   RPromote(name, reply) ->
-    send(reply, r_promote(qs, cs, mine, dir, name, done))
+    send(reply, r_promote(qs, cs, mine, ts, g.dir, name, done))
+    0
+  RVote(name, term, size, from, reply) ->
+    send(reply, r_vote(ts, ld, g.dir, name, term, size, from))
+    0
+  RWho(name, reply) ->
+    # Only an elected leader, and -1 for not knowing of one. Answering with the
+    # node the hash names would be answering with the node that has just been
+    # found not to be answering, and everybody would go on pointing at it
+    # instead of one of them standing for it.
+    send(reply, if map_has(mine, name) then cl_me() else map_or(ld, name, -1))
+    0
+  RTerm(name, reply) ->
+    send(reply, r_known_term(ts, g.dir, name))
+    0
+  RSize(name, reply) ->
+    send(reply, r_journal_size(g.dir, name))
     0
 
 fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, done) = match xs[name]
@@ -110,6 +143,43 @@ fn r_copy(cs: Map(Str, Jr), dir, name, done) = match cs[name]
     cs[name] = j
     j
 
+# A vote is given when the turn asked for is later than any this node knows of
+# and the asker's journal for that queue is at least as long as this node's.
+#
+# The second half is the one that matters. A majority of the cluster has every
+# record anybody was told was safe, so a candidate that a majority will vote
+# for has all of them too — and a candidate that has fallen behind is refused
+# by everybody who is ahead of it, which is enough of them to matter.
+# The turn this node knows of: what it has voted for, or what the queue's own
+# journal says, whichever is later. A node restarted after voting has the
+# journal to go on, and a node holding the queue has voted for nobody.
+fn r_known_term(ts: Map(Str, Int), dir, name) =
+  voted = map_or(ts, name, 0)
+  written = r_written_term(dir, name)
+  if voted > written then voted else written
+
+fn r_written_term(dir, name) =
+  if str_len(dir) == 0 then 0 else j_replay(dir + "/" + j_file(name)).term
+
+fn r_vote(ts: Map(Str, Int), ld: Map(Str, Int), dir, name, term, size, from) =
+  if term <= r_known_term(ts, dir, name) then 0
+  else if size < r_journal_size(dir, name) then 0
+  else
+    ts[name] = term
+    ld[name] = from
+    1
+
+fn r_journal_size(dir, name) =
+  if str_len(dir) == 0 then 0
+  else
+    fd = file_open(dir + "/" + j_file(name), "r")
+    if fd < 0 then 0 else r_size_of(fd)
+
+fn r_size_of(fd) =
+  n = file_size(fd)
+  file_close(fd)
+  n
+
 fn r_note_x(jr: Jr, name, kind) =
   send(jr.puts, JNote(rt_x_record(name, kind)))
   0
@@ -123,11 +193,11 @@ fn r_only(jr) = match jr
 # A queue is made here, or stood in for. Which of the two is the name's hash
 # over the list of nodes, so this node does not have to ask anybody and cannot
 # disagree with anybody: every node runs the same arithmetic on the same list.
-fn r_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, done) = match qs[name]
+fn r_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, reg, name, done) = match qs[name]
   Some(ch) -> ch
   None ->
     ch = channel()
-    if map_has(mine, name) then spawn q_run(name, dir, ch, done) else r_start(name, dir, ch, done, cl_peers())
+    if map_has(mine, name) then spawn q_run(name, dir, ch, done) else r_start(name, dir, reg, ch, done, cl_peers())
     qs[name] = ch
     ch
 
@@ -139,9 +209,14 @@ fn r_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, done) = mat
 #
 # Nothing here decides that the other node is gone. Something else has to have
 # decided that, and it is not a decision this can make on its own.
-fn r_promote(qs: Map(Str, Chan(QReq)), cs: Map(Str, Jr), mine: Map(Str, Int), dir, name, done) =
+fn r_promote(qs: Map(Str, Chan(QReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), dir, name, done) =
   if map_has(mine, name) then 1
   else
+    # The turn this node is taking over for goes into the journal before the
+    # queue is started from it, so that everything this leader sends afterwards
+    # says which turn it is for — and a node still holding an older one is
+    # refused by anybody who has heard of this.
+    r_write_term(cs, dir, name, map_or(ts, name, 0), done)
     mine[name] = 1
     map_del(cs, name)
     ch = channel()
@@ -149,8 +224,16 @@ fn r_promote(qs: Map(Str, Chan(QReq)), cs: Map(Str, Jr), mine: Map(Str, Int), di
     qs[name] = ch
     1
 
-fn r_start(name, dir, ch, done, peers) =
-  if len(peers) <= 1 then spawn q_run(name, dir, ch, done) else if cl_owner(name, len(peers)) == cl_me() then r_hold(name, dir, ch, done, peers) else r_stand_in(name, ch, done, nth(peers, cl_owner(name, len(peers))))
+fn r_write_term(cs: Map(Str, Jr), dir, name, term, done) =
+  if term <= 0 then 0
+  else
+    back = channel(1)
+    send(r_puts(r_copy(cs, dir, name, done)), JPut(j_term_record(term), back, OFrame("")))
+    recv(back)
+    0
+
+fn r_start(name, dir, reg, ch, done, peers) =
+  if len(peers) <= 1 then spawn q_run(name, dir, ch, done) else if cl_owner(name, len(peers)) == cl_me() then r_hold(name, dir, ch, done, peers) else r_stand_in(name, reg, ch, done, nth(peers, cl_owner(name, len(peers))))
 
 # Everybody else keeps a copy, and a majority of them has to have a record
 # before a publisher is told it is safe. Nobody is singled out as the one
@@ -159,9 +242,9 @@ fn r_start(name, dir, ch, done, peers) =
 fn r_hold(name, dir, ch, done, peers) =
   spawn q_run_copied(name, dir, cl_others(peers, cl_me(), 0, Nil), len(peers) / 2, ch, done)
 
-fn r_stand_in(name, ch, done, where) = match where
+fn r_stand_in(name, reg, ch, done, where) = match where
   None -> spawn q_run(name, "", ch, done)
-  Some(p) -> spawn cl_proxy(name, cl_host(p), cl_port(p), ch, done)
+  Some(p) -> spawn cl_proxy(name, cl_host(p), cl_port(p), reg, ch, done)
 
 # Asking a queue how it is doing is the one thing the registry does that can
 # be slow, and the registry is on the path of every publish: `b_find` goes
@@ -326,16 +409,22 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
   CXPub(ex, key, body) ->
     send(b_exchange(c, ex, x_direct()), XPub(key, body, c.out))
     b_read(c, buf, next, subs, 0)
-  CRepl(qname, bytes) ->
-    back = channel(1)
-    send(c.reg, RCopy(qname, back))
-    send(r_puts(recv(back)), JPut(bytes, c.out, OFrame(w_ok())))
-    b_read(c, buf, next, subs, 0)
+  CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs), qname, term, bytes)
   CPromote(qname) ->
     back = channel(1)
     send(c.reg, RPromote(qname, back))
     recv(back)
     send(c.out, OFrame(w_ok()))
+    b_read(c, buf, next, subs, 0)
+  CVote(qname, term, size, node) ->
+    back = channel(1)
+    send(c.reg, RVote(qname, term, size, node, back))
+    send(c.out, OFrame(if recv(back) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
+    b_read(c, buf, next, subs, 0)
+  CWho(qname) ->
+    back = channel(1)
+    send(c.reg, RWho(qname, back))
+    send(c.out, OFrame(w_who_line(recv(back))))
     b_read(c, buf, next, subs, 0)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))
@@ -395,6 +484,34 @@ fn b_queues(t: Totals) = t.queues
 fn b_ready(t: Totals) = t.ready
 
 fn b_inflight(t: Totals) = t.inflight
+
+# A batch from a node leading an earlier turn than this one knows of is
+# refused. That is how a leader that was replaced while it was away finds out:
+# it can no longer reach a majority, so it can no longer confirm anything, so
+# nothing it takes can be lost by somebody else carrying on without it.
+# Where the reader had got to, in one value, so that this can be a jump: past
+# six arguments a tail call spills to the stack and stops being one, and a
+# connection taking copies is a loop that runs as long as the node does.
+type Where
+  Where(buf: Str, next: Int, subs: List(Str))
+
+fn b_take_copy(c: Conn, w: Where, qname, term, bytes) =
+  if term < b_term(c, qname) then b_refuse_copy(c, w) else b_keep_copy(c, w, qname, bytes)
+
+fn b_keep_copy(c: Conn, w: Where, qname, bytes) =
+  back = channel(1)
+  send(c.reg, RCopy(qname, back))
+  send(r_puts(recv(back)), JPut(bytes, c.out, OFrame(w_ok())))
+  b_read(c, w.buf, w.next, w.subs, 0)
+
+fn b_refuse_copy(c: Conn, w: Where) =
+  send(c.out, OFrame(w_stale()))
+  b_read(c, w.buf, w.next, w.subs, 0)
+
+fn b_term(c: Conn, name) =
+  back = channel(1)
+  send(c.reg, RTerm(name, back))
+  recv(back)
 
 fn r_puts(j: Jr) = j.puts
 
