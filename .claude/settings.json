@@ -27,7 +27,14 @@
       "Bash(od /tmp/*)",
       "Bash(grep /tmp/*)",
       "Bash(tail /tmp/*)",
-      "Bash(head /tmp/*)"
+      "Bash(head /tmp/*)",
+      "Bash(cat /dev/*)",
+      "Bash(head /dev/*)",
+      "Bash(ls /dev/*)",
+      "Bash(od /dev/*)",
+      "Bash(wc /dev/*)",
+      "Bash(cp /dev/*)",
+      "Bash(dd if=/dev/*)"
     ]
   }
 }
