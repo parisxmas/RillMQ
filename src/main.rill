@@ -1,7 +1,8 @@
 # RillMQ: a message broker that keeps everything in memory.
 #
 #     rill build src/main.rill -o rillmq
-#     ./rillmq 6789          # the port, and optionally the ack deadline in ms
+#     ./rillmq 6789 data     # port, and a directory to keep messages in
+#     ./rillmq 6789 -        # or `-` for a broker that keeps nothing
 #
 # One strand per queue, two per connection, and one registry. Nothing is
 # shared and nothing is locked. It stops on SIGINT or SIGTERM by closing one
@@ -12,18 +13,26 @@ fn default_port() = 6789
 
 fn main() =
   port = if arg_count() > 1 then str_to_int(arg(1)) else default_port()
+  dir = where_to_keep_it()
   match listen_on(port)
     Err(e) ->
       println(e)
       0
-    Ok(server) -> serve(server)
+    Ok(server) -> serve(server, dir)
 
-fn serve(server) =
+# The second argument, or nothing. `-` says so out loud, for a test or a cache
+# that would rather not touch the disk at all.
+fn where_to_keep_it() =
+  raw = if arg_count() > 2 then arg(2) else ""
+  if str_cmp(raw, "-") == 0 then "" else raw
+
+fn serve(server, dir) =
   done = channel()
   reg = channel()
-  spawn r_run(reg, done)
+  spawn r_run(dir, reg, done)
+  restored = bring_back(reg, dir)
   spawn accept_loop(server, reg, done, 1)
-  println("rillmq on port " + int_to_str(sock_port(server)))
+  println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) restored)"))
 
   # `main` is the strand that waits for the signal, and closing `done` is how
   # it tells every other strand in the program at once. Nothing has to be
@@ -46,6 +55,27 @@ fn serve(server) =
   sleep_ms(150)
   println("stopped")
   0
+
+# Every journal in the directory is a queue that existed, so naming each one
+# to the registry is the whole of starting up again: the registry makes the
+# queue, the queue reads its own journal, and whatever was published and never
+# acknowledged is ready again.
+fn bring_back(reg, dir) =
+  if str_len(dir) == 0 then 0
+  else
+    dir_make(dir)
+    open_each(reg, dir, dir_names(dir), 0)
+
+fn open_each(reg, dir, files, n) = match files
+  Nil -> n
+  Cons(f, rest) ->
+    name = if ends_with_log(f) then j_name_of(dir + "/" + f) else ""
+    if str_len(name) == 0 then open_each(reg, dir, rest, n)
+    else
+      b_find(reg, name)
+      open_each(reg, dir, rest, n + 1)
+
+fn ends_with_log(f) = str_len(f) > 4 && str_cmp(f[str_len(f) - 4:], ".log") == 0
 
 fn accept_loop(server, reg, done, cid) =
   conn = tcp_accept(server)

@@ -1,10 +1,13 @@
 # RillMQ
 
-A message broker written in [Rill](../funclang), keeping everything in memory.
+A message broker written in [Rill](../funclang). Messages are kept in memory
+and written to a journal, so a broker that is killed comes back with what it
+had answered for.
 
 ```sh
 rill build src/main.rill -o rillmq
-./rillmq 6789
+./rillmq 6789 data     # a directory to keep messages in
+./rillmq 6789 -        # or `-` for a broker that keeps nothing
 ```
 
 ```
@@ -24,8 +27,9 @@ ACK jobs 1
 
 Queues that fan out to competing consumers, with acknowledgements, redelivery
 of anything that goes unanswered, and a prefetch window so a fast queue cannot
-bury a slow consumer. It stops cleanly on `SIGINT` or `SIGTERM`. It keeps
-nothing on disk, so a restart starts empty.
+bury a slow consumer. Messages are written down before a publisher is told they
+are safe, and a broker that is killed comes back with everything it had
+answered for. It stops cleanly on `SIGINT` or `SIGTERM`.
 
 ## The design is the concurrency model
 
@@ -54,6 +58,48 @@ Stopping is one `close(ch)`. Every queue, the registry and every connection
 writer is parked on a `select` that watches the same `done` channel, so
 closing it reaches all of them at once and nothing has to be counted or
 joined.
+
+## The journal
+
+One file per queue, appended to and never written over. Three kinds of record
+go in it — the queue's name once at the front, a message published, a message
+acknowledged — and a queue is rebuilt by reading them in order and keeping
+whatever was published and not acknowledged.
+
+```
+kind  1 byte    'Q' the name, 'P' published, 'A' acknowledged
+id    8 bytes   little-endian
+len   4 bytes   little-endian, the body that follows
+body  len bytes
+sum   4 bytes   little-endian, FNV-1a over everything above in this record
+```
+
+The checksum is not there for corruption, which is the disk's business. It is
+there for the *last* record: a machine that loses power in the middle of an
+append leaves a record half written, and the reader has to be able to say so
+rather than believing whatever the length field happened to contain. What
+follows a record that does not add up is not read, and the file is cut back to
+where it did.
+
+**A publisher is answered after the sync, and not before.** That is the only
+promise a broker can make about the disk, and it is what the `+OK` means. An
+acknowledgement is written down but nothing waits for it: losing one costs a
+redelivery, which at-least-once already allows, and it can never overtake the
+message it acknowledges because the file is written in order.
+
+**Syncs are batched, and the batching is not a timer.** A sync takes about a
+millisecond, and Rill's `file_sync` parks the strand rather than holding the
+worker — so while one batch is going to the disk, everything arriving queues up
+behind it and goes out together on the next turn. A disk that costs a
+millisecond a sync therefore costs a millisecond a *batch*, and the batch is as
+big as the publisher is fast.
+
+That only works if nothing waits in between, and getting it wrong is
+instructive: the connection strand originally waited for each publish to be
+answered before reading the next command, which meant one message per sync
+however many the publisher had sent at once — four hundred a second, with a
+batch size of one. The queue is handed the connection's writer instead, and the
+`+OK` is written by whoever makes the message durable.
 
 ## The wire
 
@@ -120,15 +166,27 @@ what stands between a broker and that deadlock.
 
 ## Numbers
 
-Apple M4, one worker, 200,000 messages of 64 bytes on one connection, three
-runs. Publishes are pipelined; deliveries are acknowledged one at a time.
+Apple M4, one worker, 200,000 messages of 64 bytes on one connection.
+Publishes are pipelined a thousand at a time; deliveries are acknowledged one
+at a time. `file_sync` on macOS is `F_FULLFSYNC`, which waits for the drive
+rather than for the cache.
+
+| | with a journal | keeping nothing |
+|---|---:|---:|
+| publish | 88,000/sec | 209,000/sec |
+| deliver and acknowledge | 166,000/sec | 165,000/sec |
 
 | | |
 |---|---:|
-| publish | 215,000/sec |
-| deliver and acknowledge | 155,000/sec |
-| binary | 215 KB |
+| binary | 220 KB |
 | idle | 1.4 MB |
+
+A pipelining client has to bound its depth. A client that writes a hundred
+thousand requests and reads none of the answers deadlocks against any broker
+with a finite amount of room in it: the replies fill the socket, the broker
+stops being able to write and therefore stops reading, and the client is still
+writing. `test/bench.rill` writes a thousand and reads a thousand, which is
+what every pipelining client does and for this reason.
 
 Memory with messages actually queued is the honest weak spot: about 600 to 900
 bytes per 64-byte message while a large queue is draining. A message is a boxed
@@ -145,22 +203,32 @@ rill build src/main.rill  -o rillmq
 rill build test/client.rill -o rillmq-test
 rill build test/bench.rill  -o rillmq-bench
 
-./rillmq 7700 300 &          # port, and a 300 ms ack deadline for the tests
+./rillmq 7700 - 300 &        # port, no journal, a 300 ms ack deadline
 ./rillmq-test 7700           # 9 checks
 ./rillmq-bench 7700 200000 64
+
+sh test/persistence.sh       # 10 checks, each of which stops the broker
 ```
 
-`rillmq <port> [ack_ms] [prefetch]`. The test client has its own parser rather
-than the broker's, because a wire format that only ever reads itself has not
-been tested.
+`rillmq <port> [dir|-] [ack_ms] [prefetch]`. The test client has its own parser
+rather than the broker's, because a wire format that only ever reads itself has
+not been tested. The persistence checks are a shell script because they need
+the broker itself to end, including once by `kill -9` and once with half a
+record appended by hand.
 
-The same nine checks pass against a `--parallel` build on four workers.
+All nineteen pass against a `--parallel` build on four workers, and with or
+without a journal.
 
 ## What it deliberately is not, yet
 
-- **Nothing is written down.** A restart starts empty. The language has the
-  file calls for a journal — appends, `file_sync` off the worker, `dir_sync`
-  for the name — and this does not use them.
+- **A journal is never compacted.** It grows by one record per publish and one
+  per acknowledgement, for ever. A queue that has moved a billion messages has
+  a journal of a billion records and takes as long to start as it takes to read
+  them. Rewriting it to hold only what is live — write a new file, sync it,
+  rename it over, `dir_sync` the directory — is the obvious next thing and is
+  not here.
+- **Replay is one pass and no more.** Starting up reads every journal from the
+  front. There is no snapshot and no index.
 - **One node.** No clustering, no replication, and no way to name a peer:
   Rill's sockets are IPv4 addresses with no name resolution.
 - **No TLS, and no authentication.** Do not put this on a network you do not

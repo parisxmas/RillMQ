@@ -37,29 +37,29 @@ type Conn
 # A queue is made the first time it is named, by a publisher or a subscriber
 # alike. There is no declare step, which is the one thing about AMQP that
 # nobody has ever been glad of.
-fn r_run(inbox, done) = r_loop(map_new(), inbox, done)
+fn r_run(dir, inbox, done) = r_loop(map_new(), dir, inbox, done)
 
-fn r_loop(qs: Map(Str, Chan(QReq)), inbox, done) =
+fn r_loop(qs: Map(Str, Chan(QReq)), dir, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(r_handle(qs, r, done))
+    r = recv(inbox) -> Some(r_handle(qs, dir, r, done))
     recv(done) -> None
   match step
     None -> 0
-    Some(_) -> r_loop(qs, inbox, done)
+    Some(_) -> r_loop(qs, dir, inbox, done)
 
-fn r_handle(qs: Map(Str, Chan(QReq)), r, done) = match r
+fn r_handle(qs: Map(Str, Chan(QReq)), dir, r, done) = match r
   RFind(name, reply) ->
-    send(reply, r_queue(qs, name, done))
+    send(reply, r_queue(qs, dir, name, done))
     0
   RTotals(reply) ->
     send(reply, r_totals(qs, map_keys(qs), 0, 0))
     0
 
-fn r_queue(qs: Map(Str, Chan(QReq)), name, done) = match qs[name]
+fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
   Some(ch) -> ch
   None ->
     ch = channel()
-    spawn q_run(name, ch, done)
+    spawn q_run(name, dir, ch, done)
     qs[name] = ch
     ch
 
@@ -137,9 +137,11 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     send(c.out, w_stats(b_queues(t), b_ready(t), b_inflight(t)))
     b_read(c, buf, next, subs)
   CPub(qname, body) ->
-    back = channel()
-    send(b_find(c.reg, qname), QPub(body, back))
-    send(c.out, w_ok_id(recv(back)))
+    # Nothing is waited for. The queue is given this connection's writer, and
+    # the `+OK` is put there by whoever makes the message durable; this strand
+    # goes straight back to reading, which is what lets a pipelining publisher
+    # fill a batch.
+    send(b_find(c.reg, qname), QPub(body, c.out))
     b_read(c, buf, next, subs)
   CSub(qname) ->
     # The answer goes into the writer's queue before the subscription is made,

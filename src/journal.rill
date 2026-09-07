@@ -1,0 +1,297 @@
+# The journal: what makes a message survive the broker.
+#
+# One file per queue, appended to and never written over. Three kinds of
+# record go in it — the queue's name, once, at the front; a message that was
+# published; and a message that was acknowledged — and a queue is rebuilt by
+# reading them in order and keeping whatever was published and not
+# acknowledged.
+#
+#   kind  1 byte    'Q' the name, 'P' published, 'A' acknowledged
+#   id    8 bytes   little-endian
+#   len   4 bytes   little-endian, the body that follows
+#   body  len bytes
+#   sum   4 bytes   little-endian, FNV-1a over everything above in this record
+#
+# The sum is not there for corruption, which is the disk's business. It is
+# there for the last record: a machine that loses power in the middle of an
+# append leaves a record that is half written, and the reader has to be able to
+# say so rather than believing whatever the length field happened to contain.
+# What follows a record that does not add up is not read, and the file is cut
+# back to where it did.
+
+fn j_kind_name() = 81
+
+fn j_kind_pub() = 80
+
+fn j_kind_ack() = 65
+
+fn j_head() = 13
+
+fn j_overhead() = 17
+
+# -- writing bytes ----------------------------------------------------------------
+
+fn j_u32(b: StrBuf, n) =
+  b += bit_and(n, 255)
+  b += bit_and(shr(n, 8), 255)
+  b += bit_and(shr(n, 16), 255)
+  b += bit_and(shr(n, 24), 255)
+
+fn j_u64(b: StrBuf, n) =
+  j_u32(b, n)
+  j_u32(b, shr(n, 32))
+
+# `kind` is said out loud because nothing else in the body says which of the
+# two `+=` means: a number goes into a builder as one byte and a string goes in
+# as itself, and a parameter used only there could be either.
+fn j_record(kind: Int, id, body) =
+  b = strbuf()
+  b += kind
+  j_u64(b, id)
+  j_u32(b, str_len(body))
+  b += body
+  head = strbuf_str(b)
+  c = strbuf()
+  c += head
+  j_u32(c, j_sum(head, 0, str_len(head), 2166136261))
+  strbuf_str(c)
+
+fn j_name_record(name) = j_record(j_kind_name(), 0, name)
+
+fn j_pub_record(id, body) = j_record(j_kind_pub(), id, body)
+
+fn j_ack_record(id) = j_record(j_kind_ack(), id, "")
+
+# -- reading bytes ----------------------------------------------------------------
+
+fn j_read_u32(s, at) =
+  bit_or(bit_or(str_get(s, at), shl(str_get(s, at + 1), 8)), bit_or(shl(str_get(s, at + 2), 16), shl(str_get(s, at + 3), 24)))
+
+fn j_read_u64(s, at) = bit_or(j_read_u32(s, at), shl(j_read_u32(s, at + 4), 32))
+
+# FNV-1a, kept to thirty-two bits. Enough to notice a record that stops in the
+# middle, which is the only thing it is asked to notice.
+fn j_sum(s, at, upto, h) =
+  if at >= upto then h else j_sum(s, at + 1, upto, bit_and(bit_xor(h, str_get(s, at)) * 16777619, 4294967295))
+
+# What one record at `at` turns out to be.
+type Rec
+  RGot(kind: Int, id: Int, body: Str, next: Int)
+  RStop
+
+fn j_take(s, at) =
+  if at + j_overhead() > str_len(s) then RStop
+  else
+    len = j_read_u32(s, at + 9)
+    if len < 0 || at + j_overhead() + len > str_len(s) then RStop else j_check(s, at, len)
+
+fn j_check(s, at, len) =
+  upto = at + j_head() + len
+  want = j_read_u32(s, upto)
+  if j_sum(s, at, upto, 2166136261) != want then RStop else RGot(str_get(s, at), j_read_u64(s, at + 1), s[at + j_head():upto], upto + 4)
+
+# -- replaying --------------------------------------------------------------------
+
+# What a journal turned out to hold. `upto` is the offset of the first byte
+# that was not part of a whole record, which is where the file is cut back to
+# and where appending starts again.
+type Replay
+  Replay(name: Str, live: Map(Int, Str), order: List(Int), top: Int, upto: Int)
+
+fn j_replay(path) =
+  fd = file_open(path, "r")
+  if fd < 0 then Replay("", map_new(), Nil, 0, 0)
+  else
+    r = j_walk(fd, "", 0, Replay("", map_new(), Nil, 0, 0))
+    file_close(fd)
+    j_finish(r)
+
+# Read in blocks and carry whatever is left of a record into the next one, so
+# that a journal larger than memory is still only a walk through it.
+fn j_walk(fd, buf, base, r: Replay) =
+  step = j_scan(buf, 0, r)
+  more = file_read(fd, j_block())
+  if str_len(more) == 0 then Replay(step.name, step.live, step.order, step.top, base + step.upto) else j_walk(fd, buf[step.upto:] + more, base + step.upto, Replay(step.name, step.live, step.order, step.top, 0))
+
+fn j_block() = 262144
+
+fn j_scan(buf, at, r: Replay) = match j_take(buf, at)
+  RStop -> Replay(r.name, r.live, r.order, r.top, at)
+  RGot(kind, id, body, next) -> j_scan(buf, next, j_apply(r, kind, id, body))
+
+fn j_apply(r: Replay, kind, id, body) =
+  if kind == j_kind_name() then Replay(body, r.live, r.order, r.top, r.upto)
+  else if kind == j_kind_pub() then
+    r.live[id] = body
+    Replay(r.name, r.live, Cons(id, r.order), if id > r.top then id else r.top, r.upto)
+  else
+    map_del(r.live, id)
+    Replay(r.name, r.live, r.order, r.top, r.upto)
+
+# The order records were written in, with the acknowledged ones dropped. They
+# went on the front as they were read, so this is the reverse of a reverse.
+fn j_finish(r: Replay) = Replay(r.name, r.live, j_keep(r.live, r.order, Nil), r.top, r.upto)
+
+fn j_keep(live: Map(Int, Str), ids, acc) = match ids
+  Nil -> acc
+  Cons(id, rest) -> j_keep(live, rest, if map_has(live, id) then Cons(id, acc) else acc)
+
+# -- the strand that owns the file --------------------------------------------------
+
+type JReq
+  # Appended, and the reply is sent once it is on the disk. This is what a
+  # publisher waits for.
+  JPut(rec: Str, reply: Chan(Str), value: Str)
+  # Appended, and nothing waits. An acknowledgement is this: losing one costs
+  # a redelivery, which at-least-once delivery already allows, so it is not
+  # worth a wait of its own. It goes to the disk with whatever is synced next,
+  # and it can never overtake the message it acknowledges, because the file is
+  # written in order.
+  JNote(rec: Str)
+
+type JWait
+  JWait(reply: Chan(Str), value: Str)
+
+# How many records may go into one sync. The point is not the number: it is
+# that while one batch is being synced — off the worker, so nothing else in
+# the program stops — everything arriving queues up behind it and goes out
+# together. A disk that takes a millisecond an sync therefore costs a
+# millisecond a *batch* rather than a millisecond a message.
+fn j_batch() = 4096
+
+fn j_run(path, inbox, done) =
+  fd = file_open(path, "a")
+  if fd < 0 then j_cannot(path, inbox, done) else j_loop(fd, inbox, done)
+
+fn j_cannot(path, inbox, done) =
+  println("rillmq: cannot write " + path + ", this queue is memory only")
+  j_run_memory(inbox, done)
+
+fn j_loop(fd, inbox, done) =
+  first = select
+    r = recv(inbox) -> Some(r)
+    recv(done) -> None
+  match first
+    None ->
+      file_sync(fd)
+      file_close(fd)
+      0
+    Some(r) ->
+      b = strbuf()
+      ws = j_gather(b, inbox, j_add(b, r, Nil), j_batch())
+      file_write(fd, strbuf_str(b))
+      file_sync(fd)
+      j_tell_all(ws)
+      j_loop(fd, inbox, done)
+
+# Everything already waiting, without waiting for any more of it.
+fn j_gather(b: StrBuf, inbox, ws, left) =
+  if left <= 0 then ws
+  else
+    got = select
+      r = recv(inbox) -> Some(r)
+      default -> None
+    match got
+      None -> ws
+      Some(r) -> j_gather(b, inbox, j_add(b, r, ws), left - 1)
+
+fn j_add(b: StrBuf, r, ws) = match r
+  JPut(rec, reply, value) ->
+    b += rec
+    Cons(JWait(reply, value), ws)
+  JNote(rec) ->
+    b += rec
+    ws
+
+# In the order the records went in. `j_add` puts each on the front as it
+# arrives, so a batch is back to front until this turns it round — and a
+# publisher pipelining a thousand messages would otherwise be answered for the
+# thousandth first.
+fn j_tell_all(ws) = j_tell(reverse(ws))
+
+fn j_tell(ws) = match ws
+  Nil -> 0
+  Cons(w, rest) ->
+    j_answer(w)
+    j_tell(rest)
+
+fn j_answer(w: JWait) =
+  send(w.reply, w.value)
+  0
+
+# The same shape with no file behind it, for a broker started without a
+# directory to write in. A publisher still waits for the journal, and the
+# journal still answers; there is simply nothing between the two.
+fn j_run_memory(inbox, done) =
+  first = select
+    r = recv(inbox) -> Some(r)
+    recv(done) -> None
+  match first
+    None -> 0
+    Some(r) ->
+      j_tell_all(j_add(strbuf(), r, Nil))
+      j_run_memory(inbox, done)
+
+# -- files ---------------------------------------------------------------------------
+
+# A queue name is whatever a client sent and a filename is not, so anything
+# outside the safe set is written as an underscore and two hex digits. The
+# real name is not recovered from this: it is the first record in the file, so
+# the encoding only has to be unique, not reversible.
+fn j_file(name) = j_safe(name, 0, strbuf()) + ".log"
+
+fn j_safe(name, i, b: StrBuf) =
+  if i >= str_len(name) then strbuf_str(b)
+  else
+    c = str_get(name, i)
+    j_put(b, c)
+    j_safe(name, i + 1, b)
+
+fn j_put(b: StrBuf, c) =
+  if j_plain(c) then
+    b += c
+    0
+  else j_hex(b, c)
+
+fn j_plain(c) =
+  c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 45
+
+fn j_hex(b: StrBuf, c) =
+  b += 95
+  b += j_nibble(shr(c, 4))
+  b += j_nibble(bit_and(c, 15))
+  0
+
+fn j_nibble(n) = if n < 10 then 48 + n else 87 + n
+
+# The queue's own name, out of the front of its journal, so that a directory
+# of files can be turned back into a broker without the filenames having to
+# mean anything.
+fn j_name_of(path) =
+  fd = file_open(path, "r")
+  if fd < 0 then ""
+  else
+    head = file_read(fd, 1024)
+    file_close(fd)
+    j_name_in(head)
+
+fn j_name_in(head) = match j_take(head, 0)
+  RStop -> ""
+  RGot(kind, id, body, next) -> if kind == j_kind_name() then body else ""
+
+# Everything a journal is cut back to after a replay: whatever came after the
+# last whole record was half a write, and is not part of the queue.
+fn j_trim(path, upto) =
+  fd = file_open(path, "r+")
+  if fd < 0 then 0
+  else
+    j_cut(fd, upto)
+    file_close(fd)
+    0
+
+fn j_cut(fd, upto) =
+  if file_size(fd) <= upto then 0
+  else
+    file_truncate(fd, upto)
+    file_sync(fd)
+    0

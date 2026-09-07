@@ -8,6 +8,7 @@
 # only the tidy way to write it, it is the only way that stays correct when
 # the program is given more than one worker.
 import "wire"
+import "journal"
 
 type Msg
   Msg(id: Int, body: Str)
@@ -34,13 +35,13 @@ type Flight
 # early only costs a timer that fires and finds nothing, which then puts it
 # right.
 type Q
-  Q(name: Str, ready: Map(Int, Msg), head: Int, tail: Int, subs: List(Sub), inflight: Map(Int, Flight), turn: Int, next_id: Int, next_due: Int, held: Map(Int, Int))
+  Q(name: Str, ready: Map(Int, Msg), head: Int, tail: Int, subs: List(Sub), inflight: Map(Int, Flight), turn: Int, next_id: Int, next_due: Int, held: Map(Int, Int), jr: Chan(JReq))
 
 type QCount
   QCount(ready: Int, inflight: Int)
 
 type QReq
-  QPub(body: Str, reply: Chan(Int))
+  QPub(body: Str, out: Chan(Str))
   QSub(sub: Sub, reply: Chan(Int))
   QUnsub(sub_id: Int, reply: Chan(Int))
   QAck(id: Int, reply: Chan(Int))
@@ -51,7 +52,7 @@ type QReq
 # coming back with an answer. Five seconds unless the second argument on the
 # command line says otherwise, which is there for tests that would rather not
 # take five seconds to find out that redelivery works.
-fn q_ack_ms() = if arg_count() > 2 then str_to_int(arg(2)) else 5000
+fn q_ack_ms() = if arg_count() > 3 then str_to_int(arg(3)) else 5000
 
 # How many messages one consumer may be holding unacknowledged. This is the
 # thing a broker cannot be written without, and it is not obvious until it is
@@ -65,18 +66,60 @@ fn q_ack_ms() = if arg_count() > 2 then str_to_int(arg(2)) else 5000
 # Neither side is at fault and neither can move. AMQP calls the cure prefetch
 # and Kafka calls it max.poll.records; it is the same limit, and it is the
 # only thing standing between a broker and that deadlock.
-fn q_prefetch() = if arg_count() > 3 then str_to_int(arg(3)) else 64
+fn q_prefetch() = if arg_count() > 4 then str_to_int(arg(4)) else 64
 
 # What the loop waits when nothing is in flight. Not forever, because a queue
 # that is idle should still notice a shutdown promptly; not short, because a
 # queue that is idle should cost nothing.
 fn q_idle_ms() = 30000
 
-fn q_new(name) = Q(name, map_new(), 0, 0, Nil, map_new(), 0, 1, 0, map_new())
+fn q_new(name, jr) = Q(name, map_new(), 0, 0, Nil, map_new(), 0, 1, 0, map_new(), jr)
+
+# What a publisher can have waiting on the disk at once. A backlog rather than
+# a rendezvous because a sync takes a millisecond and a publisher should be
+# able to write the next message before the last one has landed; a queue that
+# fills this is publishing faster than the disk will take it, and then waiting
+# is the right answer.
+fn q_journal_backlog() = 4096
 
 # -- the loop ------------------------------------------------------------------
 
-fn q_run(name, inbox, done) = q_loop(q_new(name), inbox, done)
+# Starting a queue is reading whatever it already was. A directory makes it
+# durable; without one the journal strand is the same shape with no file
+# behind it, and the queue starts empty.
+fn q_run(name, dir, inbox, done) =
+  jr = channel(q_journal_backlog())
+  if str_len(dir) == 0 then q_run_memory(name, jr, inbox, done) else q_run_durable(name, dir + "/" + j_file(name), jr, inbox, done)
+
+fn q_run_memory(name, jr, inbox, done) =
+  spawn j_run_memory(jr, done)
+  q_loop(q_new(name, jr), inbox, done)
+
+fn q_run_durable(name, path, jr, inbox, done) =
+  r = j_replay(path)
+  j_trim(path, r.upto)
+  spawn j_run(path, jr, done)
+  q_name_it(name, r, jr)
+  q_loop(q_from(name, r, jr), inbox, done)
+
+# A journal that did not already say whose it is gets told, once, at the front.
+fn q_name_it(name, r: Replay, jr) =
+  if str_len(r.name) > 0 then 0
+  else
+    send(jr, JNote(j_name_record(name)))
+    0
+
+fn q_from(name, r: Replay, jr) =
+  known = if str_len(r.name) == 0 then name else r.name
+  q_seed(Q(known, map_new(), 0, 0, Nil, map_new(), 0, r.top + 1, 0, map_new(), jr), r.live, r.order)
+
+fn q_seed(q: Q, live: Map(Int, Str), ids) = match ids
+  Nil -> q
+  Cons(id, rest) -> match live[id]
+    None -> q_seed(q, live, rest)
+    Some(body) ->
+      q.ready[q.tail] = Msg(id, body)
+      q_seed(Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr), live, rest)
 
 fn q_loop(q: Q, inbox, done) =
   step = select
@@ -116,22 +159,38 @@ fn q_soonest(m: Map(Int, Flight), ks, best) = match ks
 # -- what a request does --------------------------------------------------------
 
 fn q_handle(q: Q, r) = match r
-  QPub(body, reply) ->
+  QPub(body, out) ->
     id = q.next_id
+    # The message is ready at once, and the `+OK` is written by the journal
+    # rather than from here — once the record is on the disk.
+    #
+    # The connection is handed straight to the journal, and that is the whole
+    # of what makes a durable broker fast. Waiting here for the answer would
+    # mean the strand reading the connection handled one publish per sync, and
+    # a sync is a millisecond: four hundred messages a second, with a batch
+    # size of one, however many the publisher sent at once. Not waiting, a
+    # thousand publishes arrive while the last sync is in flight and go to the
+    # disk together.
+    #
+    # So a consumer may see a message a moment before its publisher is told it
+    # is safe. That is the right way round: the publisher has been promised
+    # nothing yet, and a message delivered twice is what at-least-once means.
     q.ready[q.tail] = Msg(id, body)
-    send(reply, id)
-    Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held)
+    send(q.jr, JPut(j_pub_record(id, body), out, w_ok_id(id)))
+    Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held, q.jr)
   QSub(s, reply) ->
     send(reply, 1)
-    Q(q.name, q.ready, q.head, q.tail, append(q.subs, Cons(s, Nil)), q.inflight, q.turn, q.next_id, q.next_due, q.held)
+    Q(q.name, q.ready, q.head, q.tail, append(q.subs, Cons(s, Nil)), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr)
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     # Whatever that subscriber was holding goes back to the front of the
     # queue at once rather than waiting out its deadline: the consumer is
     # gone, and there is nothing to wait for.
-    q_requeue_all(Q(q.name, q.ready, q.head, q.tail, q_without(q.subs, sub_id), q.inflight, q.turn, q.next_id, q.next_due, q.held))
+    q_requeue_all(Q(q.name, q.ready, q.head, q.tail, q_without(q.subs, sub_id), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr))
   QAck(id, reply) ->
-    send(reply, if map_has(q.inflight, id) then 1 else 0)
+    had = map_has(q.inflight, id)
+    send(reply, if had then 1 else 0)
+    q_note_ack(q, id, had)
     q_forget(q, id)
     q_clear_due(q)
   QNack(id, reply) ->
@@ -147,6 +206,16 @@ fn q_forget(q: Q, id) = match q.inflight[id]
   Some(f) ->
     map_del(q.inflight, id)
     q_hold(q, f.sub, -1)
+
+# An acknowledgement is written down but nothing waits for it to land. Losing
+# one costs a redelivery, which at-least-once delivery already allows, and it
+# can never overtake the message it acknowledges because the file is written
+# in order.
+fn q_note_ack(q: Q, id, had) =
+  if !had then 0
+  else
+    send(q.jr, JNote(j_ack_record(id)))
+    0
 
 fn q_without(subs, sub_id) = match subs
   Nil -> Nil
@@ -165,7 +234,7 @@ fn q_requeue(q: Q, id) = match q.inflight[id]
     map_del(q.inflight, id)
     q_hold(q, f.sub, -1)
     q.ready[q.head - 1] = f.msg
-    q_clear_due(Q(q.name, q.ready, q.head - 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held))
+    q_clear_due(Q(q.name, q.ready, q.head - 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr))
 
 fn q_requeue_all(q: Q) = q_requeue_each(q, map_keys(q.inflight))
 
@@ -182,11 +251,11 @@ fn q_requeue_each(q: Q, ks) = match ks
 fn q_sweep(q: Q) = q_after_sweep(q_sweep_each(q, map_keys(q.inflight), now_millis()))
 
 fn q_after_sweep(q: Q) =
-  Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, q_soonest(q.inflight, map_keys(q.inflight), 0), q.held)
+  Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, q_soonest(q.inflight, map_keys(q.inflight), 0), q.held, q.jr)
 
 # Nothing in flight means nothing to wake up for.
 fn q_clear_due(q: Q) =
-  if #q.inflight > 0 then q else Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, 0, q.held)
+  if #q.inflight > 0 then q else Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, 0, q.held, q.jr)
 
 fn q_sweep_each(q: Q, ks, now) = match ks
   Nil -> q
@@ -201,7 +270,7 @@ fn q_sweep_each(q: Q, ks, now) = match ks
 # for everybody: the message simply stays ready and goes to whoever asks next.
 fn q_pump(q: Q) =
   if q.head >= q.tail || len(q.subs) == 0 then q else match q.ready[q.head]
-    None -> Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held)
+    None -> Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr)
     Some(m) -> q_offer(q, m, 0)
 
 fn q_offer(q: Q, m: Msg, tried) =
@@ -211,7 +280,7 @@ fn q_offer(q: Q, m: Msg, tried) =
     match nth(q.subs, at)
       None -> q
       Some(s) ->
-        moved = Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, at + 1, q.next_id, q.next_due, q.held)
+        moved = Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, at + 1, q.next_id, q.next_due, q.held, q.jr)
         # Two reasons to pass a subscriber by, and they are different reasons.
         # Its window being full means it has as much as it is allowed; its
         # buffer being full means it is not keeping up with what it already
@@ -230,4 +299,4 @@ fn q_took(q: Q, m: Msg, sub_id) =
   map_del(q.ready, q.head)
   q.inflight[m.id] = Flight(m, due, sub_id)
   q_hold(q, sub_id, 1)
-  q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, if q.next_due == 0 then due else q.next_due, q.held))
+  q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, if q.next_due == 0 then due else q.next_due, q.held, q.jr))

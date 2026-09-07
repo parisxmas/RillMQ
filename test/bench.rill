@@ -24,9 +24,7 @@ fn bench(fd, count, body) =
   queue = "bench" + int_to_str(now_millis())
   sock_buffered(fd)
   t0 = now_nanos()
-  write_pubs(fd, queue, body, count)
-  sock_flush(fd)
-  read_oks(fd, "", count)
+  pipeline(fd, queue, body, count, "")
   t1 = now_nanos()
   report("publish", count, str_len(body), t1 - t0)
 
@@ -38,6 +36,22 @@ fn bench(fd, count, body) =
   report("deliver and acknowledge", count - left, str_len(body), t3 - t2)
   sock_close(fd)
   0
+
+# In batches rather than all at once. A client that writes a hundred thousand
+# requests and reads none of the answers will deadlock against any broker with
+# a finite amount of room in it — the broker's replies fill the socket, the
+# broker stops being able to write, and it stops reading; the client is still
+# writing and never gets to the read that would let go. Every pipelining client
+# bounds its depth for this reason, and this is that bound.
+fn depth() = 1000
+
+fn pipeline(fd, queue, body, left, buf) =
+  if left <= 0 then buf
+  else
+    n = if left < depth() then left else depth()
+    write_pubs(fd, queue, body, n)
+    sock_flush(fd)
+    pipeline(fd, queue, body, left - n, read_oks(fd, buf, n))
 
 fn write_pubs(fd, queue, body, n) =
   if n <= 0 then 0
