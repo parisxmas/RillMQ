@@ -27,6 +27,9 @@ type RReq
   # It is the same file that queue would have here, so promoting the copy is
   # starting a queue from a journal that is already in place.
   RCopy(name: Str, reply: Chan(Jr))
+  # Serve a queue this node has only been keeping a copy of. What was a stand-in
+  # for somebody else's queue becomes the queue.
+  RPromote(name: Str, reply: Chan(Int))
 
 type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
@@ -55,19 +58,19 @@ type Conn
 fn r_run(dir, inbox, done) =
   jr = Jr(channel(256), channel(1))
   if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
-  r_loop(map_new(), map_new(), map_new(), dir, Cons(jr, Nil), inbox, done)
+  r_loop(map_new(), map_new(), map_new(), map_new(), dir, Cons(jr, Nil), inbox, done)
 
-fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), dir, jr, inbox, done) =
+fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), dir, jr, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(r_handle(qs, xs, cs, dir, jr, r, done))
+    r = recv(inbox) -> Some(r_handle(qs, xs, cs, mine, dir, jr, r, done))
     recv(done) -> None
   match step
     None -> 0
-    Some(_) -> r_loop(qs, xs, cs, dir, jr, inbox, done)
+    Some(_) -> r_loop(qs, xs, cs, mine, dir, jr, inbox, done)
 
-fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), dir, jr, r, done) = match r
+fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), dir, jr, r, done) = match r
   RFind(name, reply) ->
-    send(reply, r_queue(qs, dir, name, done))
+    send(reply, r_queue(qs, mine, dir, name, done))
     0
   RExchange(name, kind, quiet, reply) ->
     send(reply, r_exchange(xs, jr, name, kind, quiet, done))
@@ -80,6 +83,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RCopy(name, reply) ->
     send(reply, r_copy(cs, dir, name, done))
+    0
+  RPromote(name, reply) ->
+    send(reply, r_promote(qs, cs, mine, dir, name, done))
     0
 
 fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, done) = match xs[name]
@@ -117,13 +123,31 @@ fn r_only(jr) = match jr
 # A queue is made here, or stood in for. Which of the two is the name's hash
 # over the list of nodes, so this node does not have to ask anybody and cannot
 # disagree with anybody: every node runs the same arithmetic on the same list.
-fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
+fn r_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, done) = match qs[name]
   Some(ch) -> ch
   None ->
     ch = channel()
-    r_start(name, dir, ch, done, cl_peers())
+    if map_has(mine, name) then spawn q_run(name, dir, ch, done) else r_start(name, dir, ch, done, cl_peers())
     qs[name] = ch
     ch
+
+# Taking a queue over. The copy's journal is already the queue's journal — the
+# same file, the same bytes — so starting a queue from it is all there is to
+# do. What was a stand-in for somebody else's queue is replaced in the table,
+# and every connection picks the new one up on its next command, because a
+# connection asks the registry each time rather than remembering.
+#
+# Nothing here decides that the other node is gone. Something else has to have
+# decided that, and it is not a decision this can make on its own.
+fn r_promote(qs: Map(Str, Chan(QReq)), cs: Map(Str, Jr), mine: Map(Str, Int), dir, name, done) =
+  if map_has(mine, name) then 1
+  else
+    mine[name] = 1
+    map_del(cs, name)
+    ch = channel()
+    spawn q_run(name, dir, ch, done)
+    qs[name] = ch
+    1
 
 fn r_start(name, dir, ch, done, peers) =
   if len(peers) <= 1 then spawn q_run(name, dir, ch, done) else if cl_owner(name, len(peers)) == cl_me() then r_hold(name, dir, ch, done, peers) else r_stand_in(name, ch, done, nth(peers, cl_owner(name, len(peers))))
@@ -306,6 +330,12 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     back = channel(1)
     send(c.reg, RCopy(qname, back))
     send(r_puts(recv(back)), JPut(bytes, c.out, OFrame(w_ok())))
+    b_read(c, buf, next, subs, 0)
+  CPromote(qname) ->
+    back = channel(1)
+    send(c.reg, RPromote(qname, back))
+    recv(back)
+    send(c.out, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))

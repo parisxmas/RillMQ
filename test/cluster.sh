@@ -99,6 +99,25 @@ except Exception: print('(no answer)')
 ")
 say "and works again when it comes back" "$BACK" "+OK"
 
+# Taking over a copy. The node that has been keeping alpha's journal starts
+# serving it, and the messages that were published before are in it — the id
+# it hands out next says so.
+kill -9 "$NB" 2>/dev/null
+wait "$NB" 2>/dev/null
+sleep 2
+TOOK=$(python3 -c "
+import socket
+def cmd(t, wait=6):
+    s = socket.create_connection(('127.0.0.1', $A)); s.settimeout(wait)
+    s.sendall(t.encode())
+    try: return s.recv(400).decode().strip()
+    except Exception: return '(no answer)'
+    finally: s.close()
+cmd('PROMOTE alpha\r\n')
+print(cmd('PUB alpha 4\r\ntook'))
+")
+say "a copy taken over carries on where the queue left off" "$(echo "$TOOK" | grep -o '^+OK [0-9]*' | grep -c 'OK')" "1"
+
 kill -TERM "$NA" "$NB" 2>/dev/null
 wait "$NA" "$NB" 2>/dev/null
 rm -rf "$DIR"
