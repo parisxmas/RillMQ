@@ -166,6 +166,7 @@ fn b_put(fd, out, done, stopping, text) =
 fn b_bytes(what) = match what
   OFrame(text) -> text
   ODeliver(queue, id, body) -> w_msg(id, queue, body)
+  OPublished(queue, id) -> w_ok_id(id)
 
 fn b_next(out, done) =
   f = select

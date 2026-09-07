@@ -250,7 +250,7 @@ fn q_handle_rest(q: Q, r) = match r
     # is safe. That is the right way round: the publisher has been promised
     # nothing yet, and a message delivered twice is what at-least-once means.
     q.ready[q.tail] = Msg(id, body)
-    send(q.jr.puts, JPut(j_pub_record(id, body), out, OFrame(w_ok_id(id))))
+    send(q.jr.puts, JPut(j_pub_record(id, body), out, OPublished(q.name, id)))
     Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held, q.jr)
   QSub(s, reply) ->
     send(reply, 1)

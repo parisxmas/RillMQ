@@ -62,16 +62,26 @@ What is implemented is what a client actually uses: the connection handshake,
 channels, `Queue.Declare` (which is also how a client asks how many are
 waiting), `Exchange.Declare` and `Queue.Bind` accepted as no-ops, `Basic.Qos`,
 `Basic.Publish`, `Basic.Consume` and `Basic.Deliver`, `Basic.Ack`,
-`Basic.Nack` and `Basic.Reject`, `Basic.Get`, `Basic.Cancel`, and closing a
-channel or a connection.
+`Basic.Nack` and `Basic.Reject`, `Basic.Get`, `Basic.Cancel`,
+`Confirm.Select`, and closing a channel or a connection.
 
-Two things are worth knowing. There is only the default exchange: publishing
-routes by the routing key, taken as a queue name, and a declared exchange is
-answered politely and forgotten. And **a publish over AMQP is not waiting for
-the disk** — `Basic.Publish` has no reply unless publisher confirms are on,
-and they are not implemented, so the client is told nothing and the journal
-catches up behind it. RillMQ's own protocol answers `+OK` after the sync,
-which is the difference between the two publish numbers below.
+**Publisher confirms are the interesting one.** A `Basic.Publish` has no reply,
+so an AMQP client cannot otherwise learn when its message reached the disk —
+which is exactly what RillMQ's own protocol tells a publisher as a matter of
+course. `ConfirmSelect()` turns that on, and then the journal's answer becomes
+the `Basic.Ack` the client is waiting for:
+
+```csharp
+ch.ConfirmSelect();
+for (int i = 0; i < 200; i++) ch.BasicPublish("", q, null, body);
+ch.WaitForConfirms(TimeSpan.FromSeconds(20));   // every one is on the disk
+```
+
+Confirms are numbered in publish order and the journal answers in the order it
+was asked, so counting is enough and nothing has to be remembered per message.
+
+There is only the default exchange: publishing routes by the routing key, taken
+as a queue name, and a declared exchange is answered politely and forgotten.
 
 The offsets are the part to get right and the part that fails quietly.
 Arguments begin four bytes into a method payload, past the class and the
@@ -333,9 +343,12 @@ Over AMQP, through `RabbitMQ.Client`, 50,000 messages of 64 bytes:
 | deliver and acknowledge | 134,000/sec | 146,000/sec |
 
 The AMQP publish figure is higher than the native one and it is not a better
-number: a publish there has no reply to wait for, so it measures the rate at
-which the broker takes messages rather than the rate at which it makes them
-durable. That is also why having a journal does not slow it down.
+number: with confirms off — which is how the measurement above was taken, and
+how most publishing is done — there is no reply to wait for, so it measures
+the rate at which the broker takes messages rather than the rate at which it
+makes them durable. That is also why having a journal does not slow it down.
+`ConfirmSelect()` puts the wait back and brings the number down to the native
+protocol's, which is the same wait for the same disk.
 
 Delivery is slower with a journal than without because draining a queue is
 what makes its journal worth rewriting, so the rewrite happens during the
@@ -385,7 +398,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 15 checks, most of which stop the broker
-sh test/amqp.sh              # 8 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 10 checks through RabbitMQ's own .NET client
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -396,7 +409,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All twenty-five pass against a `--parallel` build on four workers, and with or
+All thirty-five pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -415,9 +428,6 @@ without a journal.
 - **No exchanges, routing keys or topics.** One queue, by name, fanning out to
   competing consumers. Over AMQP that is the default exchange and nothing else:
   a declared exchange is answered and forgotten, and a binding with it.
-- **No publisher confirms.** A publish over AMQP is answered by nothing, so a
-  client cannot learn when its message became durable. RillMQ's own protocol
-  can, and does.
 - **One virtual host, and any password.** `Connection.Open` takes whatever
   virtual host it is given and `PLAIN` takes whatever credentials it is given.
 - **No flow control back to publishers, only a wall.** A publisher that

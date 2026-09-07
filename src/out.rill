@@ -11,3 +11,7 @@
 type Out
   OFrame(text: Str)
   ODeliver(queue: Str, id: Int, body: Str)
+  # A message that is now on the disk. RillMQ's own protocol says `+OK <id>`;
+  # AMQP says `Basic.Ack` and only when the client asked for confirms. Both
+  # are the same event, so the event is what travels.
+  OPublished(queue: Str, id: Int)

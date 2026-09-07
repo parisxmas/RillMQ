@@ -132,6 +132,18 @@ class Program
         var one = ch.BasicGet(g, autoAck: true);
         Check("BasicGet takes one", one == null ? "(nothing)" : Encoding.UTF8.GetString(one.Body.ToArray()), "just one");
 
+        // Publisher confirms: the broker says when a message is on the disk,
+        // which is the one thing an AMQP publisher cannot otherwise learn.
+        using var cch = conn.CreateModel();
+        string cq = q + "-confirm";
+        cch.QueueDeclare(cq, true, false, false, null);
+        cch.ConfirmSelect();
+        for (int i = 0; i < 200; i++)
+            cch.BasicPublish("", cq, null, Encoding.UTF8.GetBytes("durable " + i));
+        bool all = cch.WaitForConfirms(TimeSpan.FromSeconds(20));
+        Check("every publish is confirmed once it is durable", all, true);
+        Check("and the queue holds them", cch.QueueDeclare(cq, true, false, false, null).MessageCount, 200u);
+
         Console.WriteLine();
         Console.WriteLine($"{passed} of {passed + failed} passed");
         return failed == 0 ? 0 : 1;

@@ -37,6 +37,8 @@ fn a_class_queue() = 50
 
 fn a_class_basic() = 60
 
+fn a_class_confirm() = 85
+
 # -- writing ------------------------------------------------------------------
 
 fn a_u8(b: StrBuf, n: Int) =
