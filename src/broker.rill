@@ -30,7 +30,7 @@ type Frame
 # commands would run out of stack. The compiler says so, by name, at the call
 # it cannot promise.
 type Conn
-  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Str))
+  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Str), gone: Chan(Int))
 
 # -- the registry ---------------------------------------------------------------
 
@@ -83,11 +83,31 @@ fn q_count_inflight(c: QCount) = c.inflight
 # behind is skipped rather than waited for; see `q_pump`.
 fn b_backlog() = 128
 
-fn b_serve(fd, reg, done, cid) =
+# How long a connection that has asked for nothing may say nothing.
+#
+# A client that opens a socket and never speaks holds a strand, a descriptor
+# and a buffer for as long as it likes, and opening several thousand of those
+# costs the opener nothing. A subscriber is a different matter: saying nothing
+# is exactly what it is supposed to do between messages, so the clock only runs
+# for a connection with no subscriptions.
+fn b_idle_secs() = opt_int("idle", 60)
+
+# How many connections at once. Strands are cheap — this is not about them —
+# but descriptors are not, and the number a process may have open is decided
+# elsewhere and is lower than people expect. Refusing the thousand-and-first
+# with a sentence is better than failing to accept it with none.
+fn b_max_conns() = opt_int("conns", 1024)
+
+# What the accept loop carries: how many connections are up, what to number
+# the next one, and where the ones that end say so.
+type Gate
+  Gate(live: Int, next: Int, gone: Chan(Int))
+
+fn b_serve(fd, reg, done, cid, gone) =
   sock_nodelay(fd)
   out = channel(b_backlog())
   spawn b_writer(fd, out, done, false)
-  b_read(Conn(fd, reg, done, cid, out), "", 0, Nil)
+  b_read(Conn(fd, reg, done, cid, out, gone), "", 0, Nil, 0)
 
 # The writer owns the socket. It watches `done` as well as its own channel, so
 # that a broker being shut down can reach a connection that is saying nothing:
@@ -111,17 +131,35 @@ fn b_next(out, done) =
     recv(done) -> Shutdown
   f
 
-fn b_read(c: Conn, buf, from, subs) = match w_take(buf, from)
+fn b_read(c: Conn, buf, from, subs, idle) = match w_take(buf, from)
   Got(cmd, next) -> b_do(c, buf, next, subs, cmd)
   Bad(why, next, fatal) ->
     send(c.out, w_err(why))
-    if fatal then b_bye(c, subs) else b_read(c, buf, next, subs)
-  Need ->
-    # The one place the front is thrown away: once per read from the socket
-    # rather than once per command in it.
-    kept = if from == 0 then buf else buf[from:]
-    more = sock_read(c.fd)
-    if str_len(more) == 0 then b_bye(c, subs) else b_read(c, kept + more, 0, subs)
+    if fatal then b_bye(c, subs) else b_read(c, buf, next, subs, 0)
+  Need -> b_fill(c, buf, from, subs, idle)
+
+# A second at a time, rather than until something arrives. The wait costs one
+# cheap look at the socket when there is something there, and it is what gives
+# a connection that has gone quiet somewhere to be counted.
+fn b_fill(c: Conn, buf, from, subs, idle) =
+  # A subscriber has no deadline to keep, so it does not pay for one. This is
+  # not only tidiness: a consumer acknowledging one message at a time makes
+  # many small reads, and a look at the socket before each of them costs about
+  # a tenth of the delivery rate.
+  if len(subs) > 0 then b_take(c, buf, from, subs) else if !sock_wait(c.fd, 1000) then b_quiet(c, buf, from, subs, idle + 1) else b_take(c, buf, from, subs)
+
+fn b_take(c: Conn, buf, from, subs) =
+  # The one place the front is thrown away: once per read from the socket
+  # rather than once per command in it.
+  kept = if from == 0 then buf else buf[from:]
+  more = sock_read(c.fd)
+  if str_len(more) == 0 then b_bye(c, subs) else b_read(c, kept + more, 0, subs, 0)
+
+fn b_quiet(c: Conn, buf, from, subs, idle) =
+  if len(subs) > 0 || idle < b_idle_secs() then b_read(c, buf, from, subs, idle)
+  else
+    send(c.out, w_err("said nothing for " + int_to_str(b_idle_secs()) + " seconds"))
+    b_bye(c, subs)
 
 fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
   CQuit ->
@@ -129,20 +167,20 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     b_bye(c, subs)
   CPing ->
     send(c.out, w_pong())
-    b_read(c, buf, next, subs)
+    b_read(c, buf, next, subs, 0)
   CStats ->
     back = channel()
     send(c.reg, RTotals(back))
     t = recv(back)
     send(c.out, w_stats(b_queues(t), b_ready(t), b_inflight(t)))
-    b_read(c, buf, next, subs)
+    b_read(c, buf, next, subs, 0)
   CPub(qname, body) ->
     # Nothing is waited for. The queue is given this connection's writer, and
     # the `+OK` is put there by whoever makes the message durable; this strand
     # goes straight back to reading, which is what lets a pipelining publisher
     # fill a batch.
     send(b_find(c.reg, qname), QPub(body, c.out))
-    b_read(c, buf, next, subs)
+    b_read(c, buf, next, subs, 0)
   CSub(qname) ->
     # The answer goes into the writer's queue before the subscription is made,
     # so that it is written before any message the subscription brings. Both
@@ -153,21 +191,21 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     back = channel()
     send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out), back))
     recv(back)
-    b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs))
+    b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0)
   CUnsub(qname) ->
     b_drop(c.reg, c.cid, qname)
     send(c.out, w_ok())
-    b_read(c, buf, next, without_name(subs, qname))
+    b_read(c, buf, next, without_name(subs, qname), 0)
   CAck(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QAck(id, back))
     send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
-    b_read(c, buf, next, subs)
+    b_read(c, buf, next, subs, 0)
   CNack(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QNack(id, back))
     send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
-    b_read(c, buf, next, subs)
+    b_read(c, buf, next, subs, 0)
 
 fn b_queues(t: Totals) = t.queues
 
@@ -190,6 +228,9 @@ fn b_bye(c: Conn, subs) =
   # subscriber would be asking nobody, and the ask would never come back.
   if closed(c.done) then 0 else b_drop_all(c.reg, c.cid, subs)
   send(c.out, "")
+  # And the doorman is told, so that the next one may come in. The channel is
+  # as large as the limit, so this never waits.
+  send(c.gone, 1)
   0
 
 fn b_drop_all(reg, cid, subs) = match subs

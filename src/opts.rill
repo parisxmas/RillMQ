@@ -1,0 +1,15 @@
+# Settings, as `name=value` after the port.
+#
+#     rillmq 6789 dir=data ack=5000 prefetch=64 mem=1024 idle=60 conns=1024
+#
+# Positional arguments ran out of room at four: nobody can be asked to
+# remember that the fifth number is megabytes and the sixth is seconds, and a
+# program that wants the sixth should not have to write the four before it.
+fn opt(name, fallback) = opt_from(name, fallback, 1)
+
+fn opt_from(name, fallback, i) =
+  if i >= arg_count() then fallback else if starts_with(arg(i), name + "=") then arg(i)[str_len(name) + 1:] else opt_from(name, fallback, i + 1)
+
+fn opt_int(name, fallback) =
+  raw = opt(name, "")
+  if str_len(raw) == 0 then fallback else str_to_int(raw)

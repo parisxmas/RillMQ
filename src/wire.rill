@@ -21,6 +21,8 @@
 #
 # Anything the broker will not do answers `-ERR <what>`.
 
+import "opts"
+
 # What a client asked for, once a whole command has arrived.
 type Cmd
   CPub(queue: Str, body: Str)

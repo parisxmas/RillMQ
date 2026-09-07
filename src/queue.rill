@@ -52,7 +52,7 @@ type QReq
 # coming back with an answer. Five seconds unless the second argument on the
 # command line says otherwise, which is there for tests that would rather not
 # take five seconds to find out that redelivery works.
-fn q_ack_ms() = if arg_count() > 3 then str_to_int(arg(3)) else 5000
+fn q_ack_ms() = opt_int("ack", 5000)
 
 # How many messages one consumer may be holding unacknowledged. This is the
 # thing a broker cannot be written without, and it is not obvious until it is
@@ -66,7 +66,7 @@ fn q_ack_ms() = if arg_count() > 3 then str_to_int(arg(3)) else 5000
 # Neither side is at fault and neither can move. AMQP calls the cure prefetch
 # and Kafka calls it max.poll.records; it is the same limit, and it is the
 # only thing standing between a broker and that deadlock.
-fn q_prefetch() = if arg_count() > 4 then str_to_int(arg(4)) else 64
+fn q_prefetch() = opt_int("prefetch", 64)
 
 # What the loop waits when nothing is in flight. Not forever, because a queue
 # that is idle should still notice a shutdown promptly; not short, because a
@@ -85,7 +85,7 @@ fn q_idle_ms() = 30000
 # messages, because a count is not what runs out. It is taken every so often
 # rather than every time: asking the operating system how big you are costs
 # more than accepting a message does.
-fn q_max_bytes() = (if arg_count() > 5 then str_to_int(arg(5)) else 1024) * 1048576
+fn q_max_bytes() = opt_int("mem", 1024) * 1048576
 
 fn q_check_every() = 512
 

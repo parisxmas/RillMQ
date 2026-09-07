@@ -6,9 +6,15 @@ had answered for.
 
 ```sh
 rill build src/main.rill -o rillmq
-./rillmq 6789 data     # a directory to keep messages in
-./rillmq 6789 -        # or `-` for a broker that keeps nothing
+./rillmq 6789                  # keeps nothing
+./rillmq 6789 dir=data         # keeps messages in ./data
 ```
+
+Everything else is optional and named: `ack=<ms>` how long a message may be
+out unanswered, `prefetch=<n>` how much one consumer may hold, `mem=<MB>` how
+big the broker may get before it refuses publishes, `idle=<s>` how long a
+connection that has asked for nothing may say nothing, `conns=<n>` how many
+connections at once.
 
 ```
 $ nc localhost 6789
@@ -133,6 +139,26 @@ Three floods of two hundred thousand messages at a thirty megabyte limit leave
 the broker at thirty-one megabytes with a hundred and ninety-seven thousand
 messages held. It does not grow.
 
+## Who is allowed to stay
+
+A client that opens a socket and never speaks holds a strand, a descriptor and
+a buffer for as long as it likes, and opening several thousand of those costs
+the opener nothing. So a connection that has asked for nothing and said nothing
+for a minute is let go.
+
+A subscriber is a different matter: saying nothing is exactly what it is
+supposed to do between messages, so the clock only runs for a connection with
+no subscriptions. That is also why a subscriber's reads carry no deadline at
+all — a consumer acknowledging one message at a time makes many small reads,
+and a look at the socket before each of them costs about a tenth of the
+delivery rate for a limit it was never going to reach.
+
+The accept loop counts what is up and hears from each connection as it ends,
+so the thousand-and-first is turned away with a sentence rather than by a
+descriptor that could not be opened. Counting there rather than in a strand of
+its own is what keeps it off the path a message takes: nothing asks it
+anything.
+
 ## Rewriting a journal
 
 A journal grows by one record per publish and one per acknowledgement, so a
@@ -235,8 +261,8 @@ rather than for the cache.
 
 | | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 85,000/sec | 184,000/sec |
-| deliver and acknowledge | 141,000/sec | 140,000/sec |
+| publish | 85,000/sec | 182,000/sec |
+| deliver and acknowledge | 131,000/sec | 131,000/sec |
 
 Delivery is slower with a journal than without because draining a queue is
 what makes its journal worth rewriting, so the rewrite happens during the
@@ -281,20 +307,19 @@ rill build src/main.rill  -o rillmq
 rill build test/client.rill -o rillmq-test
 rill build test/bench.rill  -o rillmq-bench
 
-./rillmq 7700 - 300 &        # port, no journal, a 300 ms ack deadline
+./rillmq 7700 ack=300 &      # no journal, a 300 ms ack deadline
 ./rillmq-test 7700           # 9 checks
 ./rillmq-bench 7700 200000 64
 
-sh test/persistence.sh       # 12 checks, each of which stops the broker
+sh test/persistence.sh       # 15 checks, most of which stop the broker
 ```
 
-`rillmq <port> [dir|-] [ack_ms] [prefetch] [max_mb]`. The test client has its own parser
-rather than the broker's, because a wire format that only ever reads itself has
-not been tested. The persistence checks are a shell script because they need
+The test client has its own parser rather than the broker's, because a wire
+format that only ever reads itself has not been tested. The persistence checks are a shell script because they need
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All twenty-one pass against a `--parallel` build on four workers, and with or
+All twenty-four pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -315,8 +340,5 @@ without a journal.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.
-- **No idle deadline on a connection.** A client that opens a socket and says
-  nothing holds a strand and a descriptor for as long as it likes, and nothing
-  counts how many of those there are.
 - **`STATS` is three numbers for the whole broker.** There is no way to ask
   which queue is the one backing up.

@@ -22,7 +22,7 @@ say() {
 }
 
 start() {
-  ./rillmq "$PORT" "$DIR" "${1:-5000}" >/dev/null 2>&1 &
+  ./rillmq "$PORT" "dir=$DIR" "ack=${1:-5000}" >/dev/null 2>&1 &
   BROKER=$!
   sleep 1
 }
@@ -80,12 +80,39 @@ start 60000
 ./rillmq-compact "$PORT" bulk 6000 5000 >/dev/null
 sleep 2
 BULK=$(wc -c < "$DIR/bulk.log" | tr -d ' ')
-LEFT=$(stats | sed 's/.*STATS [0-9]* \([0-9]*\) .*/\1/')
+# Ready and in flight together: a hard kill gives the in-flight ones back as
+# ready, so counting only what is ready would be counting a different thing on
+# either side of the crash.
+LEFT=$(stats | awk '{print $3 + $4}')
 say "the journal was rewritten to about what is left" "$([ "$BULK" -lt 40000 ] && echo small || echo "$BULK")" "small"
 crash
 
 start 60000
-say "and a hard kill after a rewrite loses nothing" "$(stats)" "+STATS 3 $LEFT 0"
+say "and a hard kill after a rewrite loses nothing" "$(stats | awk '{print $3 + $4}')" "$LEFT"
+stop
+
+# -- who is allowed to stay, and how many ------------------------------------------
+
+./rillmq "$PORT" idle=2 conns=4 >/dev/null 2>&1 &
+BROKER=$!
+sleep 1
+QUIET=$( (sleep 5) | nc 127.0.0.1 "$PORT" | tr -d '\r\n' )
+say "a connection that says nothing is let go" "$QUIET" "-ERR said nothing for 2 seconds"
+SUBBED=$( (printf 'SUB q\r\n'; sleep 4) | nc -w 6 127.0.0.1 "$PORT" | tr -d '\r\n' )
+say "a subscriber may say nothing for as long as it likes" "$SUBBED" "+OK"
+NTH=$(python3 -c "
+import socket
+socks=[]
+last=''
+for i in range(5):
+    s=socket.create_connection(('127.0.0.1', $PORT)); s.settimeout(2)
+    s.sendall(b'SUB k\r\n')
+    try: last=s.recv(200).decode().strip()
+    except Exception: last='(nothing)'
+    socks.append(s)
+print(last)
+")
+say "the one past the limit is turned away" "$NTH" "-ERR too many connections"
 stop
 
 rm -rf "$DIR"

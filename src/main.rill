@@ -1,8 +1,10 @@
 # RillMQ: a message broker that keeps everything in memory.
 #
 #     rill build src/main.rill -o rillmq
-#     ./rillmq 6789 data     # port, and a directory to keep messages in
-#     ./rillmq 6789 -        # or `-` for a broker that keeps nothing
+#     ./rillmq 6789                 # keeps nothing
+#     ./rillmq 6789 dir=data        # keeps messages in ./data
+#
+# and, all optional: ack=<ms> prefetch=<n> mem=<MB> idle=<s> conns=<n>
 #
 # One strand per queue, two per connection, and one registry. Nothing is
 # shared and nothing is locked. It stops on SIGINT or SIGTERM by closing one
@@ -20,18 +22,16 @@ fn main() =
       0
     Ok(server) -> serve(server, dir)
 
-# The second argument, or nothing. `-` says so out loud, for a test or a cache
-# that would rather not touch the disk at all.
-fn where_to_keep_it() =
-  raw = if arg_count() > 2 then arg(2) else ""
-  if str_cmp(raw, "-") == 0 then "" else raw
+# `dir=` names somewhere to keep messages. Without one the broker keeps
+# nothing, which is a thing to want rather than a thing to be warned about.
+fn where_to_keep_it() = opt("dir", "")
 
 fn serve(server, dir) =
   done = channel()
   reg = channel()
   spawn r_run(dir, reg, done)
   restored = bring_back(reg, dir)
-  spawn accept_loop(server, reg, done, 1)
+  spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())))
   println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) restored)"))
 
   # `main` is the strand that waits for the signal, and closing `done` is how
@@ -77,12 +77,34 @@ fn open_each(reg, dir, files, n) = match files
 
 fn ends_with_log(f) = str_len(f) > 4 && str_cmp(f[str_len(f) - 4:], ".log") == 0
 
-fn accept_loop(server, reg, done, cid) =
+# The doorman. It counts what is up, hears from each connection as it ends,
+# and turns people away rather than opening a descriptor it may not be able to
+# open. Counting here rather than in a strand of its own is what keeps it off
+# the path a message takes: nothing asks it anything.
+fn accept_loop(server, reg, done, g: Gate) =
   conn = tcp_accept(server)
-  if conn < 0 then 0
+  if conn < 0 then 0 else b_admit(server, reg, done, settle(g), conn)
+
+fn b_admit(server, reg, done, g: Gate, conn) =
+  if g.live >= b_max_conns() then
+    turn_away(conn)
+    accept_loop(server, reg, done, g)
   else
-    spawn b_serve(conn, reg, done, cid)
-    accept_loop(server, reg, done, cid + 1)
+    spawn b_serve(conn, reg, done, g.next, g.gone)
+    accept_loop(server, reg, done, Gate(g.live + 1, g.next + 1, g.gone))
+
+# Everyone who has left since the last time anyone looked, without waiting for
+# anyone who has not.
+fn settle(g: Gate) =
+  got = select
+    recv(g.gone) -> true
+    default -> false
+  if !got then g else settle(Gate(g.live - 1, g.next, g.gone))
+
+fn turn_away(conn) =
+  sock_write(conn, "-ERR too many connections" + "\r\n")
+  sock_close(conn)
+  0
 
 fn name_of(sig) =
   if sig == sig_hup() then "SIGHUP" else if sig == sig_int() then "SIGINT" else if sig == sig_term() then "SIGTERM" else "signal " + int_to_str(sig)
