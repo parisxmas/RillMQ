@@ -10,9 +10,15 @@
 # Only the writer writes. That is what makes the socket safe without a lock:
 # it is one strand's, exactly as a queue's messages are one strand's.
 import "queue"
+import "exchange"
 
 type RReq
   RFind(name: Str, reply: Chan(Chan(QReq)))
+  # An exchange, made the first time it is named, like a queue. The kind is
+  # settled by whoever names it first; naming it again with another kind is
+  # answered with the one it already is rather than refused, which is friendlier
+  # than the specification and no less safe.
+  RExchange(name: Str, kind: Str, reply: Chan(Chan(XReq)))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
 
@@ -38,19 +44,22 @@ type Conn
 # A queue is made the first time it is named, by a publisher or a subscriber
 # alike. There is no declare step, which is the one thing about AMQP that
 # nobody has ever been glad of.
-fn r_run(dir, inbox, done) = r_loop(map_new(), dir, inbox, done)
+fn r_run(dir, inbox, done) = r_loop(map_new(), map_new(), dir, inbox, done)
 
-fn r_loop(qs: Map(Str, Chan(QReq)), dir, inbox, done) =
+fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(r_handle(qs, dir, r, done))
+    r = recv(inbox) -> Some(r_handle(qs, xs, dir, r, done))
     recv(done) -> None
   match step
     None -> 0
-    Some(_) -> r_loop(qs, dir, inbox, done)
+    Some(_) -> r_loop(qs, xs, dir, inbox, done)
 
-fn r_handle(qs: Map(Str, Chan(QReq)), dir, r, done) = match r
+fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, r, done) = match r
   RFind(name, reply) ->
     send(reply, r_queue(qs, dir, name, done))
+    0
+  RExchange(name, kind, reply) ->
+    send(reply, r_exchange(xs, name, kind, done))
     0
   RTotals(reply) ->
     send(reply, r_totals(qs, map_keys(qs), 0, 0))
@@ -58,6 +67,14 @@ fn r_handle(qs: Map(Str, Chan(QReq)), dir, r, done) = match r
   RRows(reply) ->
     send(reply, r_rows(qs, map_keys(qs), Nil))
     0
+
+fn r_exchange(xs: Map(Str, Chan(XReq)), name, kind, done) = match xs[name]
+  Some(ch) -> ch
+  None ->
+    ch = channel()
+    spawn x_run(name, kind, ch, done)
+    xs[name] = ch
+    ch
 
 fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
   Some(ch) -> ch
@@ -217,6 +234,19 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     t = recv(back)
     send(c.out, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
     b_read(c, buf, next, subs, 0)
+  CXDecl(ex, kind) ->
+    b_exchange(c, ex, kind)
+    send(c.out, OFrame(w_ok()))
+    b_read(c, buf, next, subs, 0)
+  CBind(ex, qname, key) ->
+    back = channel(1)
+    send(b_exchange(c, ex, x_direct()), XBind(qname, key, b_find(c.reg, qname), back))
+    recv(back)
+    send(c.out, OFrame(w_ok()))
+    b_read(c, buf, next, subs, 0)
+  CXPub(ex, key, body) ->
+    send(b_exchange(c, ex, x_direct()), XPub(key, body, c.out))
+    b_read(c, buf, next, subs, 0)
   CQueues ->
     rows = channel()
     send(c.reg, RRows(rows))
@@ -271,6 +301,11 @@ fn b_queues(t: Totals) = t.queues
 fn b_ready(t: Totals) = t.ready
 
 fn b_inflight(t: Totals) = t.inflight
+
+fn b_exchange(c: Conn, name, kind) =
+  back = channel(1)
+  send(c.reg, RExchange(name, kind, back))
+  recv(back)
 
 fn b_find(reg, name) =
   back = channel()

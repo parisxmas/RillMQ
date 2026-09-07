@@ -11,6 +11,9 @@
 #   UNSUB <queue>                   ->  +OK
 #   ACK <queue> <id>                ->  +OK
 #   NACK <queue> <id>               ->  +OK
+#   XDECL <exchange> <kind>         ->  +OK      direct, fanout or topic
+#   BIND <exchange> <queue> <key>   ->  +OK
+#   XPUB <exchange> <key> <len>\r\n<body>  ->  +OK
 #   STATS                           ->  +STATS <queues> <ready> <inflight>
 #   QUEUES                          ->  +QUEUES <n>, then n rows of
 #                                       Q <name> <ready> <inflight> <subs> <published>
@@ -34,6 +37,9 @@ type Cmd
   CNack(queue: Str, id: Int)
   CStats
   CQueues
+  CXDecl(exchange: Str, kind: Str)
+  CBind(exchange: Str, queue: Str, key: Str)
+  CXPub(exchange: Str, key: Str, body: Str)
   CPing
   CQuit
 
@@ -71,7 +77,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -95,6 +101,27 @@ fn w_nack(parts, rest) =
   name = w_name(parts)
   raw = w_second(parts)
   if str_len(name) == 0 || str_len(raw) == 0 then Bad("a queue and a message id are wanted", rest, false) else Got(CNack(name, str_to_int(raw)), rest)
+
+# `XDECL <exchange> <kind>` makes one; `BIND <exchange> <queue> <key>` ties a
+# queue to it; `XPUB <exchange> <key> <len>` publishes through it. The same
+# three things AMQP calls `Exchange.Declare`, `Queue.Bind` and a `Basic.Publish`
+# that names an exchange.
+fn w_xdecl(parts, rest) =
+  ex = w_name(parts)
+  kind = w_second(parts)
+  if str_len(ex) == 0 || str_len(kind) == 0 then Bad("an exchange and a kind are wanted", rest, false) else Got(CXDecl(ex, kind), rest)
+
+fn w_bind(parts, rest) =
+  ex = w_name(parts)
+  queue = w_second(parts)
+  key = unwrap_or(nth(parts, 3), "")
+  if str_len(ex) == 0 || str_len(queue) == 0 then Bad("an exchange, a queue and a key are wanted", rest, false) else Got(CBind(ex, queue, key), rest)
+
+fn w_take_xpub(buf, parts, at) =
+  ex = w_name(parts)
+  key = w_second(parts)
+  len = str_to_int(unwrap_or(nth(parts, 3), "-1"))
+  if str_len(ex) == 0 then Bad("an exchange is wanted", at, false) else if len < 0 then Bad("a body length is wanted", at, false) else if len > w_most_body() then Bad("body too long", 0, true) else if str_len(buf) - at < len then Need else Got(CXPub(ex, key, buf[at:at + len]), at + len)
 
 fn w_name(parts) = unwrap_or(nth(parts, 1), "")
 

@@ -1,0 +1,137 @@
+# An exchange is a strand, like a queue, and for the same reason: its bindings
+# are its own and nothing else touches them.
+#
+# The default exchange is not one of these. Publishing to `""` means the
+# routing key is a queue name, and a connection goes straight to that queue —
+# no hop, no bindings, nothing to look up. That is the path most messages take
+# and it costs exactly what it costs now. Named exchanges are the ones that
+# have something to decide.
+import "queue"
+
+type Bind
+  Bind(queue: Str, key: Str, ch: Chan(QReq))
+
+type X
+  X(name: Str, kind: Str, binds: List(Bind))
+
+type XReq
+  XPub(key: Str, body: Str, out: Chan(Out))
+  XBind(queue: Str, key: Str, ch: Chan(QReq), reply: Chan(Int))
+  XUnbind(queue: Str, key: Str, reply: Chan(Int))
+
+fn x_direct() = "direct"
+
+fn x_fanout() = "fanout"
+
+fn x_topic() = "topic"
+
+fn x_run(name, kind, inbox, done) = x_loop(X(name, kind, Nil), inbox, done)
+
+fn x_loop(x: X, inbox, done) =
+  step = select
+    r = recv(inbox) -> Some(x_handle(x, r))
+    recv(done) -> None
+  match step
+    None -> 0
+    Some(next) -> x_loop(next, inbox, done)
+
+fn x_handle(x: X, r) = match r
+  XPub(key, body, out) ->
+    x_send(x, x_route(x, x.binds, key, Nil), body, out)
+    x
+  XBind(queue, key, ch, reply) ->
+    send(reply, 1)
+    if x_bound(x.binds, queue, key) then x else X(x.name, x.kind, Cons(Bind(queue, key, ch), x.binds))
+  XUnbind(queue, key, reply) ->
+    send(reply, 1)
+    X(x.name, x.kind, x_without(x.binds, queue, key))
+
+fn x_bound(binds, queue, key) = match binds
+  Nil -> false
+  Cons(b, rest) -> x_same(b, queue, key) || x_bound(rest, queue, key)
+
+fn x_same(b: Bind, queue, key) = str_cmp(b.queue, queue) == 0 && str_cmp(b.key, key) == 0
+
+fn x_without(binds, queue, key) = match binds
+  Nil -> Nil
+  Cons(b, rest) -> if x_same(b, queue, key) then x_without(rest, queue, key) else Cons(b, x_without(rest, queue, key))
+
+# -- deciding where a message goes -------------------------------------------------
+
+fn x_route(x: X, binds, key, acc) = match binds
+  Nil -> acc
+  Cons(b, rest) -> x_route(x, rest, key, if x_takes(x.kind, x_bind_key(b), key) then Cons(x_bind_ch(b), acc) else acc)
+
+fn x_bind_key(b: Bind) = b.key
+
+fn x_bind_ch(b: Bind) = b.ch
+
+fn x_takes(kind, pattern, key) =
+  str_cmp(kind, x_fanout()) == 0 || (if str_cmp(kind, x_topic()) == 0 then x_topic_takes(pattern, key) else str_cmp(pattern, key) == 0)
+
+# A topic pattern is words separated by dots, where `*` stands for one word and
+# `#` for any number of them, none included. Matching it is the one piece of
+# real algorithm in RillMQ: `#` can swallow any prefix, so the only way to know
+# whether it should is to try.
+fn x_topic_takes(pattern, key) = x_words(split(pattern, "."), split(key, "."))
+
+fn x_words(ps, ks) = match ps
+  Nil -> x_no_more(ks)
+  Cons(p, prest) -> if str_cmp(p, "#") == 0 then x_hash(prest, ks) else x_one(p, prest, ks)
+
+fn x_no_more(ks) = match ks
+  Nil -> true
+  Cons(k, rest) -> false
+
+fn x_one(p, prest, ks) = match ks
+  Nil -> false
+  Cons(k, krest) -> (str_cmp(p, "*") == 0 || str_cmp(p, k) == 0) && x_words(prest, krest)
+
+fn x_hash(prest, ks) =
+  x_words(prest, ks) || x_hash_more(prest, ks)
+
+fn x_hash_more(prest, ks) = match ks
+  Nil -> false
+  Cons(k, krest) -> x_hash(prest, krest)
+
+# -- handing it on ------------------------------------------------------------------
+
+# Nowhere to go is not an error: a message published to a routing key nothing
+# is bound to is dropped, which is what the specification says and what every
+# broker does. The publisher is answered all the same, because it asked and is
+# owed a reply.
+#
+# One queue is the ordinary case and costs nothing extra: the publisher's own
+# channel goes to the queue and the answer comes back from there. More than one
+# needs somebody to wait for all of them and say so once, and that somebody is
+# a strand made for the purpose and gone as soon as it has counted.
+fn x_send(x: X, chans, body, out) = match chans
+  Nil ->
+    send(out, OPublished(x.name, 0))
+    0
+  Cons(ch, rest) -> match rest
+    Nil ->
+      send(ch, QPub(body, out))
+      0
+    _ ->
+      collect = channel(len(chans))
+      x_fan(chans, body, collect)
+      spawn x_wait(collect, len(chans), out, x.name)
+      0
+
+fn x_fan(chans, body, collect) = match chans
+  Nil -> 0
+  Cons(ch, rest) ->
+    send(ch, QPub(body, collect))
+    x_fan(rest, body, collect)
+
+fn x_wait(collect, n, out, name) =
+  x_drain(collect, n)
+  send(out, OPublished(name, 0))
+  0
+
+fn x_drain(collect, n) =
+  if n <= 0 then 0
+  else
+    recv(collect)
+    x_drain(collect, n - 1)

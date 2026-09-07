@@ -80,8 +80,8 @@ ch.WaitForConfirms(TimeSpan.FromSeconds(20));   // every one is on the disk
 Confirms are numbered in publish order and the journal answers in the order it
 was asked, so counting is enough and nothing has to be remembered per message.
 
-There is only the default exchange: publishing routes by the routing key, taken
-as a queue name, and a declared exchange is answered politely and forgotten.
+`Exchange.Declare` makes a real exchange and `Queue.Bind` a real binding; see
+**Routing** above for what the three kinds do.
 
 The offsets are the part to get right and the part that fails quietly.
 Arguments begin four bytes into a method payload, past the class and the
@@ -192,6 +192,47 @@ Three floods of two hundred thousand messages at a thirty megabyte limit leave
 the broker at thirty-one megabytes with a hundred and ninety-seven thousand
 messages held. It does not grow.
 
+## Routing
+
+An exchange is a strand, like a queue, and for the same reason: its bindings
+are its own and nothing else touches them. Three kinds:
+
+| kind | takes a message when |
+|---|---|
+| `direct` | the binding key is the routing key |
+| `fanout` | always — every queue bound to it |
+| `topic` | the binding pattern matches the routing key |
+
+A topic pattern is words separated by dots, where `*` stands for one word and
+`#` for any number of them, none included. `*.error` takes `app.error` and
+`db.error`; `app.#` takes `app.error` and `app.db.warn` and `app` itself.
+Matching it is the one piece of real algorithm in RillMQ, because `#` can
+swallow any prefix and the only way to know whether it should is to try.
+
+```
+XDECL logs topic
+BIND logs errs *.error
+BIND logs under app.#
+XPUB logs app.error 9
+not found
+```
+
+and the same three things over AMQP are `Exchange.Declare`, `Queue.Bind` and a
+`Basic.Publish` that names an exchange.
+
+**The default exchange is not one of these.** Publishing to `""` means the
+routing key is a queue name, and a connection goes straight to that queue — no
+hop, no bindings, nothing to look up. That is the path most messages take and
+it costs what it costs; named exchanges are the ones with something to decide.
+
+Nowhere to go is not an error. A message published to a key nothing is bound
+to is dropped, which is what every broker does, and the publisher is answered
+all the same because it asked. One queue is the ordinary case and costs
+nothing extra: the publisher's own channel goes to the queue and the answer
+comes back from there. More than one needs somebody to wait for all of them
+and confirm once, and that is a strand made for the purpose and gone as soon
+as it has counted.
+
 ## Who is allowed to stay
 
 A client that opens a socket and never speaks holds a strand, a descriptor and
@@ -255,6 +296,9 @@ body is bytes; a Rill string is a byte string, so nothing cares what is in one.
 | `UNSUB <queue>` | `+OK` |
 | `ACK <queue> <id>` | `+OK` |
 | `NACK <queue> <id>` | `+OK`, and the message comes straight back |
+| `XDECL <exchange> <kind>` | `+OK` — `direct`, `fanout` or `topic` |
+| `BIND <exchange> <queue> <key>` | `+OK` |
+| `XPUB <exchange> <key> <len>\r\n<body>` | `+OK` |
 | `STATS` | `+STATS <queues> <ready> <inflight>` |
 | `QUEUES` | `+QUEUES <n>`, then `n` rows of `Q <name> <ready> <inflight> <subs> <published>` |
 | `PING` | `+PONG` |
@@ -394,11 +438,11 @@ rill build test/client.rill -o rillmq-test
 rill build test/bench.rill  -o rillmq-bench
 
 ./rillmq 7700 ack=300 &      # no journal, a 300 ms ack deadline
-./rillmq-test 7700           # 10 checks
+./rillmq-test 7700           # 11 checks
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 15 checks, most of which stop the broker
-sh test/amqp.sh              # 10 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -409,7 +453,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All thirty-five pass against a `--parallel` build on four workers, and with or
+All thirty-nine pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -425,9 +469,12 @@ without a journal.
   Rill's sockets are IPv4 addresses with no name resolution.
 - **No TLS, and no authentication.** Do not put this on a network you do not
   own.
-- **No exchanges, routing keys or topics.** One queue, by name, fanning out to
-  competing consumers. Over AMQP that is the default exchange and nothing else:
-  a declared exchange is answered and forgotten, and a binding with it.
+- **Bindings are not written down.** Queues and their messages survive a
+  restart; the exchanges and bindings that route to them do not, and have to
+  be declared again. That is what RabbitMQ's `durable` flag on an exchange
+  means and RillMQ does not honour it yet.
+- **No `headers` exchange, and no `Queue.Unbind` over AMQP.** The exchange
+  understands unbinding; nothing asks it to.
 - **One virtual host, and any password.** `Connection.Open` takes whatever
   virtual host it is given and `PLAIN` takes whatever credentials it is given.
 - **No flow control back to publishers, only a wall.** A publisher that

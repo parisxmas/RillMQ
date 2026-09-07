@@ -99,7 +99,7 @@ fn main() =
       0
     Ok(fd) -> run_all(fd, port)
 
-fn how_many() = 10
+fn how_many() = 11
 
 fn run_all(fd, port) =
   a = t_ping(fd, "")
@@ -111,7 +111,8 @@ fn run_all(fd, port) =
   g = t_unknown_command_is_not_fatal(fd, f.rest)
   h = t_stats_counts(fd, g.rest)
   i = t_queues_breaks_it_down(fd, h.rest)
-  n = a.passed + b.passed + c.passed + d.passed + e.passed + f.passed + g.passed + h.passed + i.passed + t_a_lost_consumer_gives_it_back(port)
+  j = t_routing_puts_them_where_they_belong(fd, i.rest)
+  n = a.passed + b.passed + c.passed + d.passed + e.passed + f.passed + g.passed + h.passed + i.passed + j.passed + t_a_lost_consumer_gives_it_back(port)
   c_say(fd, "QUIT" + crlf())
   sock_close(fd)
   println("")
@@ -209,6 +210,28 @@ fn read_rows(fd, buf, n, acc) =
 
 fn rows_rest(fd, buf, n) =
   if n <= 0 then buf else rows_rest(fd, c_next_line(fd, buf, 1000).rest, n - 1)
+
+# A topic exchange, two bindings, three keys. `*` is one word and `#` is any
+# number of them, so `app.error` matches both patterns, `db.error` only the
+# first and `app.db.warn` only the second.
+fn t_routing_puts_them_where_they_belong(fd, buf) =
+  c_say(fd, "XDECL logs topic" + crlf())
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "BIND logs errs *.error" + crlf())
+  b = c_next_line(fd, a.rest, 1000)
+  c_say(fd, "BIND logs under app.#" + crlf())
+  c = c_next_line(fd, b.rest, 1000)
+  d = pub_each(fd, c.rest, Cons("app.error", Cons("db.error", Cons("app.db.warn", Nil))))
+  c_say(fd, "QUEUES" + crlf())
+  head = c_next_line(fd, d, 1000)
+  rows = read_rows(fd, head.rest, count_in(c_line(head.reply)), "")
+  check("a topic exchange puts them where they belong", bool_to_str(contains(rows, "Q errs 2 ") && contains(rows, "Q under 2 ")), "true", rows_rest(fd, head.rest, count_in(c_line(head.reply))))
+
+fn pub_each(fd, buf, keys) = match keys
+  Nil -> buf
+  Cons(k, rest) ->
+    c_say(fd, "XPUB logs " + k + " " + int_to_str(str_len(k)) + crlf() + k)
+    pub_each(fd, c_next_line(fd, buf, 1000).rest, rest)
 
 # A consumer that goes away holding a message must not take it with it. Its own
 # two connections, because the whole point is that one of them ends.

@@ -144,6 +144,37 @@ class Program
         Check("every publish is confirmed once it is durable", all, true);
         Check("and the queue holds them", cch.QueueDeclare(cq, true, false, false, null).MessageCount, 200u);
 
+        // Exchanges: a topic exchange with two bindings, and a fanout.
+        string tx = q + "-topic";
+        string qa = q + "-errs";
+        string qb = q + "-app";
+        ch.ExchangeDeclare(tx, ExchangeType.Topic, durable: true);
+        ch.QueueDeclare(qa, true, false, false, null);
+        ch.QueueDeclare(qb, true, false, false, null);
+        ch.QueueBind(qa, tx, "*.error");
+        ch.QueueBind(qb, tx, "app.#");
+        foreach (var key in new[] { "app.error", "db.error", "app.db.warn" })
+            ch.BasicPublish(tx, key, null, Encoding.UTF8.GetBytes(key));
+        Thread.Sleep(700);
+        Check("a topic binding takes the keys it matches",
+            ch.QueueDeclare(qa, true, false, false, null).MessageCount, 2u);
+        Check("and a hash takes everything under a word",
+            ch.QueueDeclare(qb, true, false, false, null).MessageCount, 2u);
+
+        string fx = q + "-fan";
+        string fa = q + "-f1";
+        string fb = q + "-f2";
+        ch.ExchangeDeclare(fx, ExchangeType.Fanout, durable: true);
+        ch.QueueDeclare(fa, true, false, false, null);
+        ch.QueueDeclare(fb, true, false, false, null);
+        ch.QueueBind(fa, fx, "");
+        ch.QueueBind(fb, fx, "");
+        ch.BasicPublish(fx, "ignored", null, Encoding.UTF8.GetBytes("both"));
+        Thread.Sleep(700);
+        Check("a fanout reaches every queue bound to it",
+            ch.QueueDeclare(fa, true, false, false, null).MessageCount + "," + ch.QueueDeclare(fb, true, false, false, null).MessageCount,
+            "1,1");
+
         Console.WriteLine();
         Console.WriteLine($"{passed} of {passed + failed} passed");
         return failed == 0 ? 0 : 1;
