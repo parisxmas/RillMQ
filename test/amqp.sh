@@ -13,7 +13,7 @@ BROKER=$!
 sleep 1
 
 # Builds if it has to. The first run fetches RabbitMQ.Client from nuget.
-( cd test/dotnet && dotnet run -v q --nologo -- "$AMQP" )
+( cd test/dotnet && dotnet run -- "$AMQP" )
 RC=$?
 
 kill -TERM "$BROKER" 2>/dev/null
