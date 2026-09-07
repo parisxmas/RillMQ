@@ -225,10 +225,11 @@ It says `-ERR the node holding that queue cannot be reached`.
 
 ### The copy
 
-A queue's records are on two nodes, not one. The node after the owner in the
-list keeps the copy — worked out the same way by everybody and never asked
-about, exactly as ownership is — and **a publish is not confirmed until it is
-on both disks**.
+Every other node keeps a copy of a queue's journal, and **a publish is not
+confirmed until a majority has it**. With three nodes that is the leader and
+either of the other two, so one node going takes nothing with it; with two it
+is both of them, which is the truth about two-node clusters rather than a
+shortcoming of this one.
 
 What travels is the journal batch itself: the same bytes the leader just
 wrote, with the same checksums, appended by the other node to the file that
@@ -238,10 +239,25 @@ there. One batch is one message on the wire and one wait, however many records
 are in it, which is what makes this cost a round trip a batch rather than a
 round trip a publish.
 
-A queue whose copy cannot be reached keeps running and stops being copied, and
-says so. The alternative is a queue that will not take a message because a
-machine somewhere else is down, which is worse than a queue with one copy of
-itself.
+A leader that cannot reach a majority refuses:
+
+```
+PUB gamma 2
+hi
+-ERR not enough of the cluster has it
+```
+
+That is not politeness, it is the whole safety argument. Whatever an isolated
+leader is still holding, nobody was told it was safe, so somebody else may
+take the queue over without losing anything anyone was promised. A node that
+was down when a queue started is tried again about once a second, so a peer
+coming back is picked up without anyone doing anything.
+
+A refused publish has still been written to the leader's own journal, and will
+be delivered if that leader is the one that carries on. A publisher told no and
+a message delivered anyway is what at-least-once means when the answer went
+missing, and it is why a publisher that cares retries with an idea of its own
+about duplicates.
 
 A queue whose *owner* cannot be reached is a different matter, and is answered
 rather than left waiting:
@@ -256,11 +272,25 @@ The node keeps trying, about once a second, and picks up again the moment the
 owner is back — with the subscriptions asked for again, because the far end
 has no memory of them.
 
-**There is no failover.** The copy exists and nothing promotes it. Deciding
-that a node is gone, rather than slow, is the problem consensus exists to
-solve, and doing it without consensus is how two nodes end up both believing
-they own the same queue. What the copy buys today is that a node's disk dying
-is not a queue dying.
+### Taking a copy over
+
+```
+PROMOTE orders
++OK
+```
+
+The copy's journal is already the queue's journal — the same file, the same
+bytes — so starting a queue from it is all there is to do. What was a stand-in
+for somebody else's queue is replaced, and every connection picks the new one
+up on its next command, because a connection asks the registry each time
+rather than remembering. The id it hands out next is the proof: a queue that
+had taken two messages answers `+OK 3` on the node that took it over.
+
+**Nothing decides this on its own.** Deciding that a node is gone rather than
+slow is the problem consensus exists to solve, and doing it without consensus
+is how two nodes end up both believing they own the same queue. What the
+majority rule above buys is that promoting is *safe* when somebody has decided:
+the old leader cannot have confirmed anything the new one does not have.
 
 ## Routing
 
@@ -528,7 +558,8 @@ rill build test/bench.rill  -o rillmq-bench
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
 sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
-sh test/cluster.sh           # 6 checks across two nodes
+sh test/cluster.sh           # 7 checks across two nodes
+sh test/majority.sh          # 5 checks across three
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -539,7 +570,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All forty-eight pass against a `--parallel` build on four workers, and with or
+All fifty-four pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -551,9 +582,8 @@ without a journal.
 - **A rewrite holds the whole live queue as records at once.** The queue builds
   them and hands them over as a list, which for a large queue is a second copy
   of it in memory for as long as the write takes.
-- **No failover.** Every queue's records are on two nodes, and nothing
-  promotes the copy. Deciding a node is gone rather than slow is what
-  consensus is for, and there is none here.
+- **No automatic failover.** `PROMOTE` is a person's decision, or a script's.
+  Nothing here notices a node is gone and acts on it.
 - **A copy is a file, not a queue.** The node keeping it does not serve it,
   count it, or list it. Making it serve is a restart with a different
   `peers`.

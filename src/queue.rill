@@ -112,12 +112,12 @@ fn q_journal_backlog() = 4096
 # durable; without one the journal strand is the same shape with no file
 # behind it, and the queue starts empty.
 fn q_run(name, dir, inbox, done) =
-  q_run_where(name, dir, Jspec(name, dir + "/" + j_file(name), "", 0), inbox, done)
+  q_run_where(name, dir, Jspec(name, dir + "/" + j_file(name), Nil, 0), inbox, done)
 
 # The same queue, told where its copy is to be kept. A queue with nowhere to
 # keep one is the ordinary single-node case and is what `q_run` asks for.
-fn q_run_copied(name, dir, host, port, inbox, done) =
-  q_run_where(name, dir, Jspec(name, dir + "/" + j_file(name), host, port), inbox, done)
+fn q_run_copied(name, dir, copies, need, inbox, done) =
+  q_run_where(name, dir, Jspec(name, dir + "/" + j_file(name), copies, need), inbox, done)
 
 fn q_run_where(name, dir, spec: Jspec, inbox, done) =
   jr = Jr(channel(q_journal_backlog()), channel(1))

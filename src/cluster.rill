@@ -37,6 +37,11 @@ fn cl_backup(name, n) = if n <= 1 then 0 else cl_next(cl_owner(name, n) + 1, n)
 
 fn cl_next(i, n) = if i >= n then i - n else i
 
+# Everybody but me, as somewhere to send a copy to.
+fn cl_others(peers, me, i, acc) = match peers
+  Nil -> reverse(acc)
+  Cons(p, rest) -> cl_others(rest, me, i + 1, if i == me then acc else Cons(Copy(cl_host(p), cl_port(p), -1, "", 0), acc))
+
 fn cl_peers() = cl_parse(split(opt("peers", ""), ","), Nil)
 
 fn cl_parse(parts, acc) = match parts

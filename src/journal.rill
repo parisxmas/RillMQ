@@ -182,17 +182,29 @@ type JWait
 type Jr
   Jr(puts: Chan(JReq), want: Chan(Int))
 
-# Where a journal lives, and who else is to have a copy of it.
-type Jspec
-  Jspec(name: Str, path: Str, host: Str, port: Int)
+# One other node's copy of this journal, the socket to it, and when it was
+# last tried if there is no socket.
+type Copy
+  Copy(host: Str, port: Int, fd: Int, spill: Str, tried: Int)
 
-# The journal's own state. One record rather than five parameters, because the
-# loop is a tail call and past six arguments a tail call stops being a jump.
-# `link` is the socket to the node keeping a copy, or -1 for a queue that has
-# only this one; `spill` is whatever came back on that link past the answer
-# being read.
+# Where a journal lives, who else is to have a copy of it, and how many of
+# them have to have a record before anybody is told it is safe.
+#
+# A majority, and not one. With three nodes that is the leader and either of
+# the other two, so one node going takes nothing with it. A leader that cannot
+# reach a majority cannot confirm anything, which is what makes it safe for
+# somebody else to take the queue over: whatever the old leader is still
+# holding, nobody was told it was safe.
+type Jspec
+  Jspec(name: Str, path: Str, copies: List(Copy), need: Int)
+
+# The journal's own state. One record rather than seven parameters, because
+# the loop is a tail call and past six arguments a tail call stops being a
+# jump. `copies` is everybody keeping one of these, each with the socket to
+# them and whatever came back on it past the answer being read; `need` is how
+# many of them have to have a batch before anybody is told it is safe.
 type Js
-  Js(fd: Int, path: Str, pubs: Int, acks: Int, name: Str, link: Int, spill: Str)
+  Js(fd: Int, path: Str, pubs: Int, acks: Int, name: Str, copies: List(Copy), need: Int)
 
 # What a batch turned out to contain. `todo` is empty, or holds the one
 # rewrite the batch ended on.
@@ -216,22 +228,22 @@ fn j_compact_floor() = 4096
 fn j_worth_rewriting(js: Js) =
   js.pubs + js.acks >= j_compact_floor() && js.acks * 5 > js.pubs * 3
 
-fn j_run(path, jr: Jr, done) = j_run_spec(Jspec("", path, "", 0), jr, done)
+fn j_run(path, jr: Jr, done) = j_run_spec(Jspec("", path, Nil, 0), jr, done)
 
 fn j_run_spec(spec: Jspec, jr: Jr, done) =
   fd = file_open(spec.path, "a")
-  if fd < 0 then j_cannot(spec.path, jr, done) else j_loop(Js(fd, spec.path, 0, 0, spec.name, j_link(spec), ""), jr, done)
+  if fd < 0 then j_cannot(spec.path, jr, done) else j_begin(fd, spec, jr, done)
 
-# The link to whoever is keeping a copy, opened once. A queue whose copy cannot
-# be reached keeps running and stops being copied, and says so — the
-# alternative is a queue that will not take a message because a machine
-# somewhere else is down, which is worse than a queue with one copy of itself.
-fn j_link(spec: Jspec) =
-  if str_len(spec.host) == 0 then -1 else match connect_to(spec.host, spec.port)
-    Err(e) ->
-      println("rillmq: no copy of " + spec.name + " being kept: " + e)
-      -1
-    Ok(fd) -> fd
+fn j_begin(fd, spec: Jspec, jr: Jr, done) =
+  j_loop(Js(fd, spec.path, 0, 0, spec.name, j_dial_all(spec.copies), spec.need), jr, done)
+
+fn j_dial_all(copies) = match copies
+  Nil -> Nil
+  Cons(c, rest) -> Cons(j_dial(c), j_dial_all(rest))
+
+fn j_dial(c: Copy) = match connect_to(c.host, c.port)
+  Err(e) -> Copy(c.host, c.port, -1, "", now_millis())
+  Ok(fd) -> Copy(c.host, c.port, fd, "", 0)
 
 fn j_cannot(path, jr: Jr, done) =
   println("rillmq: cannot write " + path + ", this queue is memory only")
@@ -254,35 +266,89 @@ fn j_commit(js: Js, jr: Jr, r) =
   bytes = strbuf_str(b)
   file_write(js.fd, bytes)
   file_sync(js.fd)
-  # The same bytes go to whoever is keeping a copy, and nobody is told the
-  # message is safe until they are on both disks. One batch is one message on
-  # the wire and one wait, however many records are in it, which is what makes
-  # this cost a round trip a batch rather than a round trip a publish.
-  after = j_copy(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks, js.name, js.link, js.spill), bytes)
-  j_tell_all(g.ws)
-  j_maybe_ask(j_do_todo(after, g.todo), jr)
+  # The same bytes go to everybody keeping a copy, and nobody is told the
+  # message is safe until a majority has it. One batch is one message on the
+  # wire and one wait, however many records are in it, which is what makes this
+  # cost a round trip a batch rather than a round trip a publish.
+  after = j_copy(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks, js.name, js.copies, js.need), bytes)
+  j_told(g.ws, after.enough)
+  j_maybe_ask(j_do_todo(after.js, g.todo), jr)
 
+# Told what happened, and not before. A record a majority does not have is a
+# record nobody may be told is safe: something else may take this queue over
+# and will not have it.
+fn j_told(ws, enough) =
+  if enough then j_tell_all(ws) else j_tell_none(reverse(ws))
+
+fn j_tell_none(ws) = match ws
+  Nil -> 0
+  Cons(w, rest) ->
+    j_refuse(w)
+    j_tell_none(rest)
+
+fn j_refuse(w: JWait) =
+  send(w.reply, OFrame(w_err("not enough of the cluster has it")))
+  0
+
+# Whether enough of the cluster has the batch, and the links as they now are.
+type Copied
+  Copied(js: Js, enough: Bool)
+
+# The batch to everybody who keeps a copy, then their answers counted. Written
+# to all of them before any of them is read from, so the waiting is one round
+# trip and not one per node.
 fn j_copy(js: Js, bytes) =
-  if js.link < 0 then js
+  if js.need <= 0 then Copied(js, true) else j_copy_to(j_redial(js.copies, Nil), js, bytes)
+
+# A node that was down when this queue started is a node that may be up now.
+# Trying it again is one connection attempt, and only when there is no socket
+# and the last attempt was not a moment ago.
+fn j_redial_ms() = 1000
+
+fn j_redial(copies, acc) = match copies
+  Nil -> reverse(acc)
+  Cons(c, rest) -> j_redial(rest, Cons(if j_worth_dialling(c) then j_dial(c) else c, acc))
+
+fn j_worth_dialling(c: Copy) = c.fd < 0 && now_millis() - c.tried >= j_redial_ms()
+
+fn j_copy_to(copies, js: Js, bytes) =
+  j_shout(copies, "REPL " + js.name + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes)
+  j_count(Js(js.fd, js.path, js.pubs, js.acks, js.name, copies, js.need), copies, Nil, 0)
+
+fn j_shout(copies, text) = match copies
+  Nil -> 0
+  Cons(c, rest) ->
+    if j_fd(c) >= 0 then j_write_to(j_fd(c), text) else 0
+    j_shout(rest, text)
+
+fn j_fd(c: Copy) = c.fd
+
+fn j_write_to(fd, text) =
+  sock_write(fd, text)
+  0
+
+fn j_count(js: Js, left, seen, got) = match left
+  Nil -> Copied(Js(js.fd, js.path, js.pubs, js.acks, js.name, reverse(seen), js.need), got >= js.need)
+  Cons(c, rest) -> j_count_one(js, c, rest, seen, got)
+
+fn j_count_one(js: Js, c: Copy, rest, seen, got) =
+  if c.fd < 0 then j_count(js, rest, Cons(c, seen), got)
   else
-    sock_write(js.link, "REPL " + js.name + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes)
-    j_heard(js)
+    a = j_line(c)
+    if a.fd < 0 then j_count(js, rest, Cons(a, seen), got) else j_count(js, rest, Cons(a, seen), got + 1)
 
-# One line back, and whatever came with it kept for next time. A link that has
-# gone is a link this queue stops having: it says so once and carries on with
-# the copy it can still write, which is its own.
-fn j_heard(js: Js) =
-  at = str_find(js.spill, "\r\n")
-  if at >= 0 then Js(js.fd, js.path, js.pubs, js.acks, js.name, js.link, js.spill[at + 2:]) else j_hear_more(js)
+# One line back from one copy, and whatever came with it kept for next time.
+fn j_line(c: Copy) =
+  at = str_find(c.spill, "\r\n")
+  if at >= 0 then Copy(c.host, c.port, c.fd, c.spill[at + 2:], c.tried) else j_line_more(c)
 
-fn j_hear_more(js: Js) =
-  more = sock_read(js.link)
-  if str_len(more) == 0 then j_link_gone(js) else j_heard(Js(js.fd, js.path, js.pubs, js.acks, js.name, js.link, js.spill + more))
+fn j_line_more(c: Copy) =
+  more = sock_read(c.fd)
+  if str_len(more) == 0 then j_copy_gone(c) else j_line(Copy(c.host, c.port, c.fd, c.spill + more, c.tried))
 
-fn j_link_gone(js: Js) =
-  println("rillmq: the copy of " + js.name + " is no longer being kept")
-  sock_close(js.link)
-  Js(js.fd, js.path, js.pubs, js.acks, js.name, -1, "")
+fn j_copy_gone(c: Copy) =
+  sock_close(c.fd)
+  Copy(c.host, c.port, -1, "", now_millis())
 
 fn j_do_todo(js: Js, todo) = match todo
   Nil -> js
@@ -455,10 +521,10 @@ fn j_swap(js: Js, tmp, n) =
 # running and stops being durable, which is worth saying out loud.
 fn j_reopened(js: Js, n) =
   fd = file_open(js.path, "a")
-  if fd >= 0 then Js(fd, js.path, n, 0, js.name, js.link, js.spill)
+  if fd >= 0 then Js(fd, js.path, n, 0, js.name, js.copies, js.need)
   else
     println("rillmq: lost " + js.path + " while rewriting it")
-    Js(fd, js.path, n, 0, js.name, js.link, js.spill)
+    Js(fd, js.path, n, 0, js.name, js.copies, js.need)
 
 # In chunks rather than one string. A queue holding a million messages would
 # otherwise be asked for a hundred megabytes of contiguous bytes to write a

@@ -152,12 +152,12 @@ fn r_promote(qs: Map(Str, Chan(QReq)), cs: Map(Str, Jr), mine: Map(Str, Int), di
 fn r_start(name, dir, ch, done, peers) =
   if len(peers) <= 1 then spawn q_run(name, dir, ch, done) else if cl_owner(name, len(peers)) == cl_me() then r_hold(name, dir, ch, done, peers) else r_stand_in(name, ch, done, nth(peers, cl_owner(name, len(peers))))
 
-# The node after this one keeps the copy. Which one that is has to be worked
-# out the same way by everybody and never asked about, exactly as ownership is,
-# so it is the next place in the list and wraps round at the end.
-fn r_hold(name, dir, ch, done, peers) = match nth(peers, cl_backup(name, len(peers)))
-  None -> spawn q_run(name, dir, ch, done)
-  Some(p) -> spawn q_run_copied(name, dir, cl_host(p), cl_port(p), ch, done)
+# Everybody else keeps a copy, and a majority of them has to have a record
+# before a publisher is told it is safe. Nobody is singled out as the one
+# backup: with three nodes either of the other two will do, so losing one
+# takes nothing with it.
+fn r_hold(name, dir, ch, done, peers) =
+  spawn q_run_copied(name, dir, cl_others(peers, cl_me(), 0, Nil), len(peers) / 2, ch, done)
 
 fn r_stand_in(name, ch, done, where) = match where
   None -> spawn q_run(name, "", ch, done)
