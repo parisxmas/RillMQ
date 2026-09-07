@@ -35,7 +35,7 @@ type Flight
 # early only costs a timer that fires and finds nothing, which then puts it
 # right.
 type Q
-  Q(name: Str, ready: Map(Int, Msg), head: Int, tail: Int, subs: List(Sub), inflight: Map(Int, Flight), turn: Int, next_id: Int, next_due: Int, held: Map(Int, Int), jr: Chan(JReq))
+  Q(name: Str, ready: Map(Int, Msg), head: Int, tail: Int, subs: List(Sub), inflight: Map(Int, Flight), turn: Int, next_id: Int, next_due: Int, held: Map(Int, Int), jr: Jr)
 
 type QCount
   QCount(ready: Int, inflight: Int)
@@ -88,7 +88,7 @@ fn q_journal_backlog() = 4096
 # durable; without one the journal strand is the same shape with no file
 # behind it, and the queue starts empty.
 fn q_run(name, dir, inbox, done) =
-  jr = channel(q_journal_backlog())
+  jr = Jr(channel(q_journal_backlog()), channel(1))
   if str_len(dir) == 0 then q_run_memory(name, jr, inbox, done) else q_run_durable(name, dir + "/" + j_file(name), jr, inbox, done)
 
 fn q_run_memory(name, jr, inbox, done) =
@@ -103,10 +103,10 @@ fn q_run_durable(name, path, jr, inbox, done) =
   q_loop(q_from(name, r, jr), inbox, done)
 
 # A journal that did not already say whose it is gets told, once, at the front.
-fn q_name_it(name, r: Replay, jr) =
+fn q_name_it(name, r: Replay, jr: Jr) =
   if str_len(r.name) > 0 then 0
   else
-    send(jr, JNote(j_name_record(name)))
+    send(jr.puts, JNote(j_name_record(name)))
     0
 
 fn q_from(name, r: Replay, jr) =
@@ -124,11 +124,43 @@ fn q_seed(q: Q, live: Map(Int, Str), ids) = match ids
 fn q_loop(q: Q, inbox, done) =
   step = select
     r = recv(inbox) -> Some(q_pump(q_handle(q, r)))
+    recv(q.jr.want) -> Some(q_hand_over(q))
     recv(done) -> None
     timeout(q_wait_ms(q)) -> Some(q_pump(q_sweep(q)))
   match step
     None -> 0
     Some(next) -> q_loop(next, inbox, done)
+
+# The journal has decided that most of what it is holding has been
+# acknowledged, and has asked for the queue as it stands. This is the only
+# thing that knows what is still live, so this is where the answer comes from:
+# everything in flight, and everything ready, written out as records.
+#
+# It goes down the same channel as the records, behind everything this queue
+# has already written and in front of everything it has not. That ordering is
+# what makes the snapshot true when it is used rather than when it was taken.
+fn q_hand_over(q: Q) =
+  send(q.jr.puts, JRewriteReq(q_live_records(q), q.name))
+  q
+
+# In flight first, then ready in the order it will go out. A message in flight
+# has already been delivered once and will be delivered again after a restart,
+# which is what at-least-once has always meant; what is lost is only that it
+# keeps its place relative to the ready ones, and redelivery had already given
+# that up.
+fn q_live_records(q: Q) =
+  append(q_flight_recs(q.inflight, map_keys(q.inflight), Nil), q_ready_recs(q, q.tail - 1, Nil))
+
+fn q_flight_recs(fl: Map(Int, Flight), ks, acc) = match ks
+  Nil -> acc
+  Cons(k, rest) -> match fl[k]
+    None -> q_flight_recs(fl, rest, acc)
+    Some(f) -> q_flight_recs(fl, rest, Cons(j_pub_record(f.msg.id, f.msg.body), acc))
+
+fn q_ready_recs(q: Q, i, acc) =
+  if i < q.head then acc else match q.ready[i]
+    None -> q_ready_recs(q, i - 1, acc)
+    Some(m) -> q_ready_recs(q, i - 1, Cons(j_pub_record(m.id, m.body), acc))
 
 # The deadline the `select` above is given. With nothing in flight there is
 # nothing to wake up for, and with something in flight the wait is exactly as
@@ -176,7 +208,7 @@ fn q_handle(q: Q, r) = match r
     # is safe. That is the right way round: the publisher has been promised
     # nothing yet, and a message delivered twice is what at-least-once means.
     q.ready[q.tail] = Msg(id, body)
-    send(q.jr, JPut(j_pub_record(id, body), out, w_ok_id(id)))
+    send(q.jr.puts, JPut(j_pub_record(id, body), out, w_ok_id(id)))
     Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held, q.jr)
   QSub(s, reply) ->
     send(reply, 1)
@@ -214,7 +246,7 @@ fn q_forget(q: Q, id) = match q.inflight[id]
 fn q_note_ack(q: Q, id, had) =
   if !had then 0
   else
-    send(q.jr, JNote(j_ack_record(id)))
+    send(q.jr.puts, JNote(j_ack_record(id)))
     0
 
 fn q_without(subs, sub_id) = match subs

@@ -101,6 +101,36 @@ however many the publisher had sent at once — four hundred a second, with a
 batch size of one. The queue is handed the connection's writer instead, and the
 `+OK` is written by whoever makes the message durable.
 
+## Rewriting a journal
+
+A journal grows by one record per publish and one per acknowledgement, so a
+queue that has moved a million messages and drained has a million records and
+nothing in it. The journal counts what it has written: with `n` published and
+`a` acknowledged the file holds `n + a` records and the queue holds `n - a`
+messages, so "four times as many records as messages" is `5a > 3n`. Past a few
+thousand records, that is when it asks the queue for the queue.
+
+Only the queue knows what is still live, so the queue answers: everything in
+flight and everything ready, as records. Then the journal writes a new file,
+syncs it, renames it over the old one, and syncs the directory — in that order,
+which is the whole of what makes it safe. A machine that stops partway has the
+old journal untouched and a half-written temporary nobody will read. The rename
+is atomic, so a reader sees one file or the other. And the directory is synced
+last, because until it is, the fact that this name now means the new file is
+only in a cache: the bytes being durable does not make the *name* durable.
+
+**The request goes down the same channel as the records**, and that is not an
+implementation detail. On a channel of its own, an acknowledgement written
+after the queue took its snapshot would be appended to the file that is about
+to be replaced, and the message it acknowledged would come back from the dead.
+In the record stream, everything before the request is in the old file and
+accounted for in the snapshot, and everything after it lands in the new one.
+
+Replay tolerates a message appearing twice, because it can: a publish already
+on its way when a rewrite starts is written into the new file by the snapshot
+and again by the append behind it. Reading the second one changes nothing so
+long as it is not counted as a second message.
+
 ## The wire
 
 Text lines with a length-prefixed body, so a person can read a session with
@@ -173,8 +203,13 @@ rather than for the cache.
 
 | | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 88,000/sec | 209,000/sec |
-| deliver and acknowledge | 166,000/sec | 165,000/sec |
+| publish | 85,000/sec | 209,000/sec |
+| deliver and acknowledge | 138,000/sec | 165,000/sec |
+
+Delivery is slower with a journal than without because draining a queue is
+what makes its journal worth rewriting, so the rewrite happens during the
+measurement. Afterwards the two hundred thousand records are eight kilobytes
+on disk.
 
 | | |
 |---|---:|
@@ -207,7 +242,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-test 7700           # 9 checks
 ./rillmq-bench 7700 200000 64
 
-sh test/persistence.sh       # 10 checks, each of which stops the broker
+sh test/persistence.sh       # 12 checks, each of which stops the broker
 ```
 
 `rillmq <port> [dir|-] [ack_ms] [prefetch]`. The test client has its own parser
@@ -216,19 +251,18 @@ not been tested. The persistence checks are a shell script because they need
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All nineteen pass against a `--parallel` build on four workers, and with or
+All twenty-one pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
 
-- **A journal is never compacted.** It grows by one record per publish and one
-  per acknowledgement, for ever. A queue that has moved a billion messages has
-  a journal of a billion records and takes as long to start as it takes to read
-  them. Rewriting it to hold only what is live — write a new file, sync it,
-  rename it over, `dir_sync` the directory — is the obvious next thing and is
-  not here.
 - **Replay is one pass and no more.** Starting up reads every journal from the
-  front. There is no snapshot and no index.
+  front. A rewrite keeps that bounded by the size of the queue rather than by
+  its history, but there is no snapshot and no index, so a broker holding ten
+  million messages reads ten million records to start.
+- **A rewrite holds the whole live queue as records at once.** The queue builds
+  them and hands them over as a list, which for a large queue is a second copy
+  of it in memory for as long as the write takes.
 - **One node.** No clustering, no replication, and no way to name a peer:
   Rill's sockets are IPv4 addresses with no name resolution.
 - **No TLS, and no authentication.** Do not put this on a network you do not

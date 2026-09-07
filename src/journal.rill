@@ -122,8 +122,13 @@ fn j_scan(buf, at, r: Replay) = match j_take(buf, at)
 fn j_apply(r: Replay, kind, id, body) =
   if kind == j_kind_name() then Replay(body, r.live, r.order, r.top, r.upto)
   else if kind == j_kind_pub() then
+    # The same message may be written twice: a rewrite puts the live queue in
+    # a new file while a publish that was already on its way is still going to
+    # be appended to it. Reading the second one again changes nothing, so long
+    # as it is not counted as a second message.
+    fresh = !map_has(r.live, id)
     r.live[id] = body
-    Replay(r.name, r.live, Cons(id, r.order), if id > r.top then id else r.top, r.upto)
+    Replay(r.name, r.live, if fresh then Cons(id, r.order) else r.order, if id > r.top then id else r.top, r.upto)
   else
     map_del(r.live, id)
     Replay(r.name, r.live, r.order, r.top, r.upto)
@@ -148,9 +153,37 @@ type JReq
   # and it can never overtake the message it acknowledges, because the file is
   # written in order.
   JNote(rec: Str)
+  # The whole live queue, to replace a file that is mostly things that have
+  # been acknowledged.
+  #
+  # It comes down the same channel as the records, and that is the whole of
+  # what makes it safe. A separate channel would let an acknowledgement
+  # written after the queue took its snapshot be appended to the file that is
+  # about to be replaced, and the message it acknowledged would come back from
+  # the dead. Here, everything before this request is in the old file and
+  # accounted for in the snapshot, and everything after it lands in the new
+  # one.
+  JRewriteReq(recs: List(Str), name: Str)
 
 type JWait
   JWait(reply: Chan(Str), value: Str)
+
+# Everything the queue needs to reach its journal with. Three channels rather
+# than one because a compaction is not a record: it is the journal asking the
+# queue a question and the queue answering, and neither may sit in the queue
+# of records waiting to be written.
+type Jr
+  Jr(puts: Chan(JReq), want: Chan(Int))
+
+# The journal's own state. One record rather than five parameters, because the
+# loop is a tail call and past six arguments a tail call stops being a jump.
+type Js
+  Js(fd: Int, path: Str, pubs: Int, acks: Int)
+
+# What a batch turned out to contain. `todo` is empty, or holds the one
+# rewrite the batch ended on.
+type JBatch
+  JBatch(ws: List(JWait), pubs: Int, acks: Int, todo: List(JReq))
 
 # How many records may go into one sync. The point is not the number: it is
 # that while one batch is being synced — off the worker, so nothing else in
@@ -159,49 +192,81 @@ type JWait
 # millisecond a *batch* rather than a millisecond a message.
 fn j_batch() = 4096
 
-fn j_run(path, inbox, done) =
+# A journal is worth rewriting when most of what is in it is things that have
+# been acknowledged. With `n` published and `a` acknowledged the file holds
+# `n + a` records and the queue holds `n - a` messages, so "four times as many
+# records as messages" is `5a > 3n`. Under a few thousand records it is not
+# worth the write, however bad the ratio.
+fn j_compact_floor() = 4096
+
+fn j_worth_rewriting(js: Js) =
+  js.pubs + js.acks >= j_compact_floor() && js.acks * 5 > js.pubs * 3
+
+fn j_run(path, jr: Jr, done) =
   fd = file_open(path, "a")
-  if fd < 0 then j_cannot(path, inbox, done) else j_loop(fd, inbox, done)
+  if fd < 0 then j_cannot(path, jr, done) else j_loop(Js(fd, path, 0, 0), jr, done)
 
-fn j_cannot(path, inbox, done) =
+fn j_cannot(path, jr: Jr, done) =
   println("rillmq: cannot write " + path + ", this queue is memory only")
-  j_run_memory(inbox, done)
+  j_run_memory(jr, done)
 
-fn j_loop(fd, inbox, done) =
+fn j_loop(js: Js, jr: Jr, done) =
   first = select
-    r = recv(inbox) -> Some(r)
+    r = recv(jr.puts) -> Some(r)
     recv(done) -> None
   match first
     None ->
-      file_sync(fd)
-      file_close(fd)
+      file_sync(js.fd)
+      file_close(js.fd)
       0
-    Some(r) ->
-      b = strbuf()
-      ws = j_gather(b, inbox, j_add(b, r, Nil), j_batch())
-      file_write(fd, strbuf_str(b))
-      file_sync(fd)
-      j_tell_all(ws)
-      j_loop(fd, inbox, done)
+    Some(r) -> j_loop(j_commit(js, jr, r), jr, done)
+
+fn j_commit(js: Js, jr: Jr, r) =
+  b = strbuf()
+  g = j_gather(b, jr, j_add(b, r, JBatch(Nil, 0, 0, Nil)), j_batch())
+  file_write(js.fd, strbuf_str(b))
+  file_sync(js.fd)
+  j_tell_all(g.ws)
+  j_maybe_ask(j_do_todo(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks), g.todo), jr)
+
+fn j_do_todo(js: Js, todo) = match todo
+  Nil -> js
+  Cons(t, rest) -> j_rewrite(js, t)
+
+# Asking is a send that gives up rather than waits. The queue may be busy, and
+# a journal that waited for it while the queue was waiting to write a record
+# would be two strands each holding what the other wants. There is room for
+# one question, so a second one while the first is unanswered simply does not
+# go.
+fn j_maybe_ask(js: Js, jr: Jr) =
+  if !j_worth_rewriting(js) then js
+  else
+    asked = select
+      send(jr.want, 1) -> true
+      default -> false
+    js
 
 # Everything already waiting, without waiting for any more of it.
-fn j_gather(b: StrBuf, inbox, ws, left) =
-  if left <= 0 then ws
+fn j_gather(b: StrBuf, jr: Jr, g: JBatch, left) =
+  # A rewrite ends the batch: what came before it belongs in the file that is
+  # about to be replaced, and what comes after belongs in the one replacing it.
+  if left <= 0 || len(g.todo) > 0 then g
   else
     got = select
-      r = recv(inbox) -> Some(r)
+      r = recv(jr.puts) -> Some(r)
       default -> None
     match got
-      None -> ws
-      Some(r) -> j_gather(b, inbox, j_add(b, r, ws), left - 1)
+      None -> g
+      Some(r) -> j_gather(b, jr, j_add(b, r, g), left - 1)
 
-fn j_add(b: StrBuf, r, ws) = match r
+fn j_add(b: StrBuf, r, g: JBatch) = match r
   JPut(rec, reply, value) ->
     b += rec
-    Cons(JWait(reply, value), ws)
+    JBatch(Cons(JWait(reply, value), g.ws), g.pubs + 1, g.acks, g.todo)
   JNote(rec) ->
     b += rec
-    ws
+    JBatch(g.ws, g.pubs, g.acks + 1, g.todo)
+  JRewriteReq(recs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
 
 # In the order the records went in. `j_add` puts each on the front as it
 # arrives, so a batch is back to front until this turns it round — and a
@@ -222,15 +287,15 @@ fn j_answer(w: JWait) =
 # The same shape with no file behind it, for a broker started without a
 # directory to write in. A publisher still waits for the journal, and the
 # journal still answers; there is simply nothing between the two.
-fn j_run_memory(inbox, done) =
+fn j_run_memory(jr: Jr, done) =
   first = select
-    r = recv(inbox) -> Some(r)
+    r = recv(jr.puts) -> Some(r)
     recv(done) -> None
   match first
     None -> 0
     Some(r) ->
-      j_tell_all(j_add(strbuf(), r, Nil))
-      j_run_memory(inbox, done)
+      j_tell_all(j_add(strbuf(), r, JBatch(Nil, 0, 0, Nil)).ws)
+      j_run_memory(jr, done)
 
 # -- files ---------------------------------------------------------------------------
 
@@ -295,3 +360,63 @@ fn j_cut(fd, upto) =
     file_truncate(fd, upto)
     file_sync(fd)
     0
+
+# -- rewriting ------------------------------------------------------------------
+
+# The whole live queue into a new file, and that file over the old one.
+#
+# The order is the point. The new file is written and made durable *before*
+# anything is renamed, so a machine that stops in the middle has the old
+# journal untouched and a half-written temporary nobody will read. The rename
+# is atomic on a Unix filesystem, so what a reader sees is one file or the
+# other and never half of either. And the directory is synced last, because
+# until it is, the fact that this name now means the new file is only in a
+# cache — the bytes being durable does not make the *name* durable.
+fn j_rewrite(js: Js, c) = match c
+  JPut(rec, reply, value) -> js
+  JNote(rec) -> js
+  JRewriteReq(recs, name) ->
+    tmp = js.path + ".new"
+    nfd = file_open(tmp, "w")
+    if nfd < 0 then js
+    else
+      file_write(nfd, j_name_record(name))
+      j_write_recs(nfd, recs, strbuf(), 0)
+      file_sync(nfd)
+      file_close(nfd)
+      j_swap(js, tmp, len(recs))
+
+fn j_swap(js: Js, tmp, n) =
+  if !file_rename(tmp, js.path) then js
+  else
+    dir_sync(dir_of(js.path))
+    file_close(js.fd)
+    j_reopened(js, n)
+
+# The descriptor the journal was appending to now points at a file that has
+# been unlinked, so it is opened again by name. If that fails the queue keeps
+# running and stops being durable, which is worth saying out loud.
+fn j_reopened(js: Js, n) =
+  fd = file_open(js.path, "a")
+  if fd >= 0 then Js(fd, js.path, n, 0)
+  else
+    println("rillmq: lost " + js.path + " while rewriting it")
+    Js(fd, js.path, n, 0)
+
+# In chunks rather than one string. A queue holding a million messages would
+# otherwise be asked for a hundred megabytes of contiguous bytes to write a
+# hundred megabytes it already has.
+fn j_write_recs(fd, recs, b: StrBuf, n) = match recs
+  Nil ->
+    file_write(fd, strbuf_str(b))
+    0
+  Cons(r, rest) ->
+    b += r
+    if n < j_chunk() then j_write_recs(fd, rest, b, n + 1) else j_flush_recs(fd, rest, b)
+
+fn j_flush_recs(fd, rest, b: StrBuf) =
+  file_write(fd, strbuf_str(b))
+  strbuf_clear(b)
+  j_write_recs(fd, rest, b, 0)
+
+fn j_chunk() = 1000

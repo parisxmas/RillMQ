@@ -1,0 +1,68 @@
+# Publishes a lot, acknowledges most of it, and leaves the rest — which is the
+# state a journal has to be rewritten from and the one where getting it wrong
+# shows. Prints how many it left behind.
+#
+#     rillmq-compact <port> <queue> <publish> <acknowledge>
+fn crlf() = "\r\n"
+
+fn main() =
+  port = if arg_count() > 1 then str_to_int(arg(1)) else 6789
+  queue = if arg_count() > 2 then arg(2) else "c"
+  n = if arg_count() > 3 then str_to_int(arg(3)) else 6000
+  k = if arg_count() > 4 then str_to_int(arg(4)) else 5000
+  match connect_to("127.0.0.1", port)
+    Err(e) ->
+      println(e)
+      0
+    Ok(fd) -> run(fd, queue, n, k)
+
+fn run(fd, queue, n, k) =
+  pipeline(fd, queue, n, "")
+  sock_write(fd, "SUB " + queue + crlf())
+  left = take(fd, "", queue, k)
+  println("published " + int_to_str(n) + ", acknowledged " + int_to_str(k - left) + ", left " + int_to_str(n - k + left))
+  sock_close(fd)
+  0
+
+fn depth() = 500
+
+fn pipeline(fd, queue, left, buf) =
+  if left <= 0 then buf
+  else
+    m = if left < depth() then left else depth()
+    write_pubs(fd, queue, m)
+    pipeline(fd, queue, left - m, read_lines(fd, buf, m))
+
+fn write_pubs(fd, queue, m) =
+  if m <= 0 then 0
+  else
+    sock_write(fd, "PUB " + queue + " 8" + crlf() + "12345678")
+    write_pubs(fd, queue, m - 1)
+
+fn read_lines(fd, buf, want) =
+  if want <= 0 then buf
+  else
+    at = str_find(buf, crlf())
+    if at < 0 then read_lines(fd, buf + sock_read(fd), want) else read_lines(fd, buf[at + 2:], want - 1)
+
+# Reads messages and acknowledges exactly `left` of them.
+fn take(fd, buf, queue, left) =
+  if left <= 0 then 0
+  else
+    at = str_find(buf, crlf())
+    if at < 0 then
+      if !sock_wait(fd, 2000) then left else take(fd, buf + sock_read(fd), queue, left)
+    else take_frame(fd, buf, at, queue, left)
+
+fn take_frame(fd, buf, at, queue, left) =
+  parts = split(buf[:at], " ")
+  if str_cmp(unwrap_or(nth(parts, 0), ""), "MSG") != 0 then take(fd, buf[at + 2:], queue, left)
+  else
+    id = unwrap_or(nth(parts, 1), "0")
+    n = str_to_int(unwrap_or(nth(parts, 3), "0"))
+    rest = buf[at + 2:]
+    if str_len(rest) < n then
+      if !sock_wait(fd, 2000) then left else take(fd, buf + sock_read(fd), queue, left)
+    else
+      sock_write(fd, "ACK " + queue + " " + id + crlf())
+      take(fd, rest[n:], queue, left - 1)

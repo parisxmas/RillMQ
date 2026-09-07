@@ -74,6 +74,20 @@ start
 say "and both come back" "$(stats)" "+STATS 2 3 0"
 stop
 
+# -- rewriting a journal that is mostly acknowledgements ---------------------------
+
+start 60000
+./rillmq-compact "$PORT" bulk 6000 5000 >/dev/null
+sleep 2
+BULK=$(wc -c < "$DIR/bulk.log" | tr -d ' ')
+LEFT=$(stats | sed 's/.*STATS [0-9]* \([0-9]*\) .*/\1/')
+say "the journal was rewritten to about what is left" "$([ "$BULK" -lt 40000 ] && echo small || echo "$BULK")" "small"
+crash
+
+start 60000
+say "and a hard kill after a rewrite loses nothing" "$(stats)" "+STATS 3 $LEFT 0"
+stop
+
 rm -rf "$DIR"
 printf '\n%s of %s passed\n' "$PASS" "$((PASS + FAIL))"
 [ "$FAIL" -eq 0 ]
