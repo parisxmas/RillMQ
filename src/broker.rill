@@ -21,7 +21,7 @@ type Totals
 
 # What the writer strand is told to do next.
 type Frame
-  Send(text: Str)
+  Send(what: Out)
   Shutdown
 
 # Everything about a connection that does not change while it is up, in one
@@ -31,7 +31,7 @@ type Frame
 # commands would run out of stack. The compiler says so, by name, at the call
 # it cannot promise.
 type Conn
-  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Str), gone: Chan(Int))
+  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), gone: Chan(Int))
 
 # -- the registry ---------------------------------------------------------------
 
@@ -153,11 +153,19 @@ fn b_writer(fd, out, done, stopping) =
     Shutdown ->
       sock_shutdown(fd)
       b_writer(fd, out, done, true)
-    Send(text) ->
-      if str_len(text) == 0 then sock_close(fd)
-      else
-        sock_write(fd, text)
-        b_writer(fd, out, done, stopping)
+    Send(what) -> b_put(fd, out, done, stopping, b_bytes(what))
+
+fn b_put(fd, out, done, stopping, text) =
+  if str_len(text) == 0 then sock_close(fd)
+  else
+    sock_write(fd, text)
+    b_writer(fd, out, done, stopping)
+
+# This protocol's way of saying a message. The empty string is how the reader
+# says it has finished and the socket may go.
+fn b_bytes(what) = match what
+  OFrame(text) -> text
+  ODeliver(queue, id, body) -> w_msg(id, queue, body)
 
 fn b_next(out, done) =
   f = select
@@ -168,7 +176,7 @@ fn b_next(out, done) =
 fn b_read(c: Conn, buf, from, subs, idle) = match w_take(buf, from)
   Got(cmd, next) -> b_do(c, buf, next, subs, cmd)
   Bad(why, next, fatal) ->
-    send(c.out, w_err(why))
+    send(c.out, OFrame(w_err(why)))
     if fatal then b_bye(c, subs) else b_read(c, buf, next, subs, 0)
   Need -> b_fill(c, buf, from, subs, idle)
 
@@ -192,21 +200,21 @@ fn b_take(c: Conn, buf, from, subs) =
 fn b_quiet(c: Conn, buf, from, subs, idle) =
   if len(subs) > 0 || idle < b_idle_secs() then b_read(c, buf, from, subs, idle)
   else
-    send(c.out, w_err("said nothing for " + int_to_str(b_idle_secs()) + " seconds"))
+    send(c.out, OFrame(w_err("said nothing for " + int_to_str(b_idle_secs()) + " seconds")))
     b_bye(c, subs)
 
 fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
   CQuit ->
-    send(c.out, w_ok())
+    send(c.out, OFrame(w_ok()))
     b_bye(c, subs)
   CPing ->
-    send(c.out, w_pong())
+    send(c.out, OFrame(w_pong()))
     b_read(c, buf, next, subs, 0)
   CStats ->
     back = channel()
     send(c.reg, RTotals(back))
     t = recv(back)
-    send(c.out, w_stats(b_queues(t), b_ready(t), b_inflight(t)))
+    send(c.out, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
     b_read(c, buf, next, subs, 0)
   CQueues ->
     rows = channel()
@@ -226,35 +234,35 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     # travel down the one channel and the writer takes them in order, which is
     # what makes this enough; asking first and answering after would let a
     # message overtake the `+OK` that promised it.
-    send(c.out, w_ok())
+    send(c.out, OFrame(w_ok()))
     back = channel()
     send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out), back))
     recv(back)
     b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0)
   CUnsub(qname) ->
     b_drop(c.reg, c.cid, qname)
-    send(c.out, w_ok())
+    send(c.out, OFrame(w_ok()))
     b_read(c, buf, next, without_name(subs, qname), 0)
   CAck(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QAck(id, back))
-    send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
+    send(c.out, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
     b_read(c, buf, next, subs, 0)
   CNack(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QNack(id, back))
-    send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
+    send(c.out, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
     b_read(c, buf, next, subs, 0)
 
 # The count first, then the rows, so a client knows how many to read.
 fn b_say_rows(c: Conn, rows) =
-  send(c.out, w_queues_head(len(rows)))
+  send(c.out, OFrame(w_queues_head(len(rows))))
   b_say_each(c, rows)
 
 fn b_say_each(c: Conn, rows) = match rows
   Nil -> 0
   Cons(r, rest) ->
-    send(c.out, r)
+    send(c.out, OFrame(r))
     b_say_each(c, rest)
 
 fn b_queues(t: Totals) = t.queues
@@ -277,7 +285,7 @@ fn b_bye(c: Conn, subs) =
   # on the same `done` and have already gone, so asking them to forget this
   # subscriber would be asking nobody, and the ask would never come back.
   if closed(c.done) then 0 else b_drop_all(c.reg, c.cid, subs)
-  send(c.out, "")
+  send(c.out, OFrame(""))
   # And the doorman is told, so that the next one may come in. The channel is
   # as large as the limit, so this never waits.
   send(c.gone, 1)

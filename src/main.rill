@@ -10,6 +10,7 @@
 # shared and nothing is locked. It stops on SIGINT or SIGTERM by closing one
 # channel, which every strand in the program is watching.
 import "broker"
+import "amqp_serve"
 
 fn default_port() = 6789
 
@@ -32,6 +33,7 @@ fn serve(server, dir) =
   spawn r_run(dir, reg, done)
   restored = bring_back(reg, dir)
   spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())))
+  amqp_on(reg, done, opt_int("amqp", 0))
   println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) restored)"))
 
   # `main` is the strand that waits for the signal, and closing `done` is how
@@ -105,6 +107,30 @@ fn turn_away(conn) =
   sock_write(conn, "-ERR too many connections" + "\r\n")
   sock_close(conn)
   0
+
+# The same queues, reached by the protocol RabbitMQ speaks, on a port of its
+# own. `amqp=5672` is the port everything that speaks it expects.
+fn amqp_on(reg, done, port) =
+  if port <= 0 then 0 else match listen_on(port)
+    Err(e) ->
+      println("rillmq: " + e)
+      0
+    Ok(server) ->
+      println("rillmq speaking amqp 0-9-1 on port " + int_to_str(sock_port(server)))
+      spawn amqp_accept(server, reg, done, Gate(0, 1, channel(b_max_conns())))
+      0
+
+fn amqp_accept(server, reg, done, g: Gate) =
+  conn = tcp_accept(server)
+  if conn < 0 then 0 else amqp_admit(server, reg, done, settle(g), conn)
+
+fn amqp_admit(server, reg, done, g: Gate, conn) =
+  if g.live >= b_max_conns() then
+    sock_close(conn)
+    amqp_accept(server, reg, done, g)
+  else
+    spawn am_serve(conn, reg, done, g.next, g.gone)
+    amqp_accept(server, reg, done, Gate(g.live + 1, g.next + 1, g.gone))
 
 fn name_of(sig) =
   if sig == sig_hup() then "SIGHUP" else if sig == sig_int() then "SIGINT" else if sig == sig_term() then "SIGTERM" else "signal " + int_to_str(sig)

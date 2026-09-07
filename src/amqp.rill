@@ -1,0 +1,138 @@
+# AMQP 0-9-1 on the wire: frames, fields, and the numbers that name a method.
+#
+# The protocol RabbitMQ speaks, which is why it is here: a client library that
+# has never heard of RillMQ can talk to it. Everything is big-endian, which is
+# the first thing to know and the easiest to get wrong — the rest of RillMQ is
+# little-endian because its own journal chose to be.
+#
+# A frame is
+#
+#   kind     1 byte   1 method, 2 content header, 3 body, 8 heartbeat
+#   channel  2 bytes  0 is the connection itself
+#   size     4 bytes  how much payload follows
+#   payload  size bytes
+#   end      1 byte   0xCE, and it must be exactly that
+#
+# A method payload begins with a class and a method, two bytes each, and the
+# arguments follow in the order the specification lists them.
+import "opts"
+
+fn a_frame_end() = 206
+
+fn a_kind_method() = 1
+
+fn a_kind_header() = 2
+
+fn a_kind_body() = 3
+
+fn a_kind_heartbeat() = 8
+
+fn a_class_connection() = 10
+
+fn a_class_channel() = 20
+
+fn a_class_exchange() = 40
+
+fn a_class_queue() = 50
+
+fn a_class_basic() = 60
+
+# -- writing ------------------------------------------------------------------
+
+fn a_u8(b: StrBuf, n: Int) =
+  b += bit_and(n, 255)
+  0
+
+fn a_u16(b: StrBuf, n) =
+  b += bit_and(shr(n, 8), 255)
+  b += bit_and(n, 255)
+  0
+
+fn a_u32(b: StrBuf, n) =
+  b += bit_and(shr(n, 24), 255)
+  b += bit_and(shr(n, 16), 255)
+  b += bit_and(shr(n, 8), 255)
+  b += bit_and(n, 255)
+  0
+
+fn a_u64(b: StrBuf, n) =
+  a_u32(b, shr(n, 32))
+  a_u32(b, n)
+
+# A short string: one byte of length, then the bytes. Anything longer than 255
+# is not one, and the specification says so rather than growing the field.
+fn a_shortstr(b: StrBuf, s) =
+  a_u8(b, str_len(s))
+  b += s
+  0
+
+fn a_longstr(b: StrBuf, s) =
+  a_u32(b, str_len(s))
+  b += s
+  0
+
+# A field table with nothing in it. The server's properties could say its name
+# and version and no client requires them, so the empty table is the honest
+# minimum and four bytes long.
+fn a_empty_table(b: StrBuf) = a_u32(b, 0)
+
+# A whole frame around a payload that is already built.
+fn a_frame(kind, chan, payload) =
+  b = strbuf()
+  a_u8(b, kind)
+  a_u16(b, chan)
+  a_u32(b, str_len(payload))
+  b += payload
+  a_u8(b, a_frame_end())
+  strbuf_str(b)
+
+fn a_method_head(cls, method) =
+  b = strbuf()
+  a_u16(b, cls)
+  a_u16(b, method)
+  b
+
+# -- reading ------------------------------------------------------------------
+
+fn a_get_u8(s, at) = str_get(s, at)
+
+fn a_get_u16(s, at) = shl(str_get(s, at), 8) + str_get(s, at + 1)
+
+fn a_get_u32(s, at) = shl(a_get_u16(s, at), 16) + a_get_u16(s, at + 2)
+
+fn a_get_u64(s, at) = shl(a_get_u32(s, at), 32) + a_get_u32(s, at + 4)
+
+fn a_get_shortstr(s, at) = s[at + 1:at + 1 + str_get(s, at)]
+
+fn a_after_shortstr(s, at) = at + 1 + str_get(s, at)
+
+fn a_get_longstr(s, at) = s[at + 4:at + 4 + a_get_u32(s, at)]
+
+fn a_after_longstr(s, at) = at + 4 + a_get_u32(s, at)
+
+# A field table is read by being stepped over. Nothing RillMQ does depends on
+# what a client puts in one — the arguments of a queue declaration, the
+# properties of a connection — and a table's own length is in front of it, so
+# skipping is exact rather than approximate.
+fn a_after_table(s, at) = at + 4 + a_get_u32(s, at)
+
+# What came off the front of the buffer.
+type AFrame
+  AGot(kind: Int, chan: Int, payload: Str, next: Int)
+  ANeed
+  ABad(why: Str)
+
+fn a_take(buf, from) =
+  if str_len(buf) - from < 8 then ANeed else a_take_sized(buf, from, a_get_u32(buf, from + 3))
+
+fn a_most_frame() = 1048576
+
+fn a_take_sized(buf, from, size) =
+  if size < 0 || size > a_most_frame() then ABad("frame too large") else if str_len(buf) - from < 8 + size then ANeed else if str_get(buf, from + 7 + size) != a_frame_end() then ABad("frame not ended") else AGot(str_get(buf, from), a_get_u16(buf, from + 1), buf[from + 7:from + 7 + size], from + 8 + size)
+
+# The eight bytes a client sends before anything else: "AMQP" and the version
+# it wants. Answering a version we do not speak is itself a defined reply, and
+# it is the bytes of the version we do.
+fn a_header() = "AMQP" + chr(0) + chr(0) + chr(9) + chr(1)
+
+fn a_is_header(buf) = str_len(buf) >= 8 && str_cmp(buf[:8], a_header()) == 0

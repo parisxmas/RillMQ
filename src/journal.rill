@@ -19,6 +19,8 @@
 # What follows a record that does not add up is not read, and the file is cut
 # back to where it did.
 
+import "out"
+
 fn j_kind_name() = 81
 
 fn j_kind_pub() = 80
@@ -146,7 +148,7 @@ fn j_keep(live: Map(Int, Str), ids, acc) = match ids
 type JReq
   # Appended, and the reply is sent once it is on the disk. This is what a
   # publisher waits for.
-  JPut(rec: Str, reply: Chan(Str), value: Str)
+  JPut(rec: Str, reply: Chan(Out), value: Out)
   # Appended, and nothing waits. An acknowledgement is this: losing one costs
   # a redelivery, which at-least-once delivery already allows, so it is not
   # worth a wait of its own. It goes to the disk with whatever is synced next,
@@ -168,10 +170,10 @@ type JReq
   # through the journal rather than straight to the connection so that it
   # keeps its place — a client pipelining three publishes, the middle one
   # refused, must be answered in the order it asked.
-  JSay(reply: Chan(Str), value: Str)
+  JSay(reply: Chan(Out), value: Out)
 
 type JWait
-  JWait(reply: Chan(Str), value: Str)
+  JWait(reply: Chan(Out), value: Out)
 
 # Everything the queue needs to reach its journal with. Three channels rather
 # than one because a compaction is not a record: it is the journal asking the

@@ -2,16 +2,18 @@
 
 A message broker written in [Rill](../funclang). Messages are kept in memory
 and written to a journal, so a broker that is killed comes back with what it
-had answered for.
+had answered for. It speaks AMQP 0-9-1, so RabbitMQ's own client libraries
+work against it unchanged.
 
 ```sh
 rill build src/main.rill -o rillmq
-./rillmq 6789                  # keeps nothing
-./rillmq 6789 dir=data         # keeps messages in ./data
+./rillmq 6789                          # keeps nothing
+./rillmq 6789 dir=data                 # keeps messages in ./data
+./rillmq 6789 dir=data amqp=5672       # and speaks AMQP as well
 ```
 
-Everything else is optional and named: `ack=<ms>` how long a message may be
-out unanswered, `prefetch=<n>` how much one consumer may hold, `mem=<MB>` how
+Everything else is optional and named: `amqp=<port>` a second port speaking
+AMQP 0-9-1, `ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much one consumer may hold, `mem=<MB>` how
 big the broker may get before it refuses publishes, `idle=<s>` how long a
 connection that has asked for nothing may say nothing, `conns=<n>` how many
 connections at once.
@@ -36,6 +38,47 @@ of anything that goes unanswered, and a prefetch window so a fast queue cannot
 bury a slow consumer. Messages are written down before a publisher is told they
 are safe, and a broker that is killed comes back with everything it had
 answered for. It stops cleanly on `SIGINT` or `SIGTERM`.
+
+## Speaking AMQP
+
+`amqp=5672` opens a second port speaking AMQP 0-9-1, the protocol RabbitMQ
+speaks. The point is not the protocol: it is that a client library which has
+never heard of RillMQ works against it. The acceptance test is RabbitMQ's own
+`RabbitMQ.Client` for .NET, unmodified, doing what anyone would do with it.
+
+```csharp
+var factory = new ConnectionFactory { HostName = "127.0.0.1", Port = 5672 };
+using var conn = factory.CreateConnection();
+using var ch = conn.CreateModel();
+ch.QueueDeclare("orders", durable: true, exclusive: false, autoDelete: false);
+ch.BasicPublish("", "orders", null, Encoding.UTF8.GetBytes("hello"));
+```
+
+The two protocols are two doors into the same queues. A message published by
+the .NET client over AMQP is delivered to a subscriber on RillMQ's own port,
+is written to the same journal, and is there after a restart.
+
+What is implemented is what a client actually uses: the connection handshake,
+channels, `Queue.Declare` (which is also how a client asks how many are
+waiting), `Exchange.Declare` and `Queue.Bind` accepted as no-ops, `Basic.Qos`,
+`Basic.Publish`, `Basic.Consume` and `Basic.Deliver`, `Basic.Ack`,
+`Basic.Nack` and `Basic.Reject`, `Basic.Get`, `Basic.Cancel`, and closing a
+channel or a connection.
+
+Two things are worth knowing. There is only the default exchange: publishing
+routes by the routing key, taken as a queue name, and a declared exchange is
+answered politely and forgotten. And **a publish over AMQP is not waiting for
+the disk** — `Basic.Publish` has no reply unless publisher confirms are on,
+and they are not implemented, so the client is told nothing and the journal
+catches up behind it. RillMQ's own protocol answers `+OK` after the sync,
+which is the difference between the two publish numbers below.
+
+The offsets are the part to get right and the part that fails quietly.
+Arguments begin four bytes into a method payload, past the class and the
+method, and most methods then open with a `reserved-1` short nobody has used
+since 0-9 — so the first field a client filled in is at six. Reading from four
+gives every string as empty and sends every message to the queue named `""`,
+which works perfectly until something asks a queue its name.
 
 ## The design is the concurrency model
 
@@ -277,10 +320,22 @@ Publishes are pipelined a thousand at a time; deliveries are acknowledged one
 at a time. `file_sync` on macOS is `F_FULLFSYNC`, which waits for the drive
 rather than for the cache.
 
-| | with a journal | keeping nothing |
+| RillMQ's own protocol | with a journal | keeping nothing |
 |---|---:|---:|
 | publish | 85,000/sec | 182,000/sec |
 | deliver and acknowledge | 131,000/sec | 131,000/sec |
+
+Over AMQP, through `RabbitMQ.Client`, 50,000 messages of 64 bytes:
+
+| AMQP | with a journal | keeping nothing |
+|---|---:|---:|
+| publish | 373,000/sec | 334,000/sec |
+| deliver and acknowledge | 134,000/sec | 146,000/sec |
+
+The AMQP publish figure is higher than the native one and it is not a better
+number: a publish there has no reply to wait for, so it measures the rate at
+which the broker takes messages rather than the rate at which it makes them
+durable. That is also why having a journal does not slow it down.
 
 Delivery is slower with a journal than without because draining a queue is
 what makes its journal worth rewriting, so the rewrite happens during the
@@ -330,7 +385,11 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 15 checks, most of which stop the broker
+sh test/amqp.sh              # 8 checks through RabbitMQ's own .NET client
 ```
+
+The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
+with a `PackageReference` to `RabbitMQ.Client`, and nothing else.
 
 The test client has its own parser rather than the broker's, because a wire
 format that only ever reads itself has not been tested. The persistence checks are a shell script because they need
@@ -354,7 +413,13 @@ without a journal.
 - **No TLS, and no authentication.** Do not put this on a network you do not
   own.
 - **No exchanges, routing keys or topics.** One queue, by name, fanning out to
-  competing consumers.
+  competing consumers. Over AMQP that is the default exchange and nothing else:
+  a declared exchange is answered and forgotten, and a binding with it.
+- **No publisher confirms.** A publish over AMQP is answered by nothing, so a
+  client cannot learn when its message became durable. RillMQ's own protocol
+  can, and does.
+- **One virtual host, and any password.** `Connection.Open` takes whatever
+  virtual host it is given and `PLAIN` takes whatever credentials it is given.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.

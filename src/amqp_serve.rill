@@ -1,0 +1,429 @@
+# An AMQP 0-9-1 connection, on top of the same queues everything else uses.
+#
+# The shape is two strands, as with RillMQ's own protocol, but the division is
+# different. Here the *session* owns the socket's write side and all the state,
+# and a reader strand does nothing but take frames off the socket and hand them
+# over. That is because a delivery in AMQP carries a tag which counts
+# deliveries on the connection, and acknowledgements arrive naming those tags:
+# one strand has to know both, so one strand does.
+import "broker"
+import "amqp"
+
+# Everything a connection remembers.
+type Am
+  Am(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), tag: Int, whose: Map(Int, Str), which: Map(Int, Int), consumers: Map(Str, Str), subs: List(Str), pub_to: Str, pub_want: Int, pub_body: Str)
+
+# What reaches the session.
+type ASes
+  AIn(kind: Int, chan: Int, payload: Str)
+  AEnd
+
+# -- the handshake ---------------------------------------------------------------
+
+# Read one whole frame, waiting for the rest of it if it is not all here.
+type ARead
+  ARead(kind: Int, chan: Int, payload: Str, rest: Str)
+  ADead
+
+fn am_read_frame(fd, buf) = match a_take(buf, 0)
+  AGot(kind, chan, payload, next) -> ARead(kind, chan, payload, buf[next:])
+  ABad(why) -> ADead
+  ANeed -> am_more(fd, buf)
+
+fn am_more(fd, buf) =
+  more = sock_read(fd)
+  if str_len(more) == 0 then ADead else am_read_frame(fd, buf + more)
+
+fn am_fill_header(fd, buf) =
+  if str_len(buf) >= 8 then buf
+  else
+    more = sock_read(fd)
+    if str_len(more) == 0 then "" else am_fill_header(fd, buf + more)
+
+fn am_serve(fd, reg, done, cid, gone) =
+  sock_nodelay(fd)
+  head = am_fill_header(fd, "")
+  if !a_is_header(head) then am_wrong_version(fd, gone) else am_start(fd, reg, done, cid, gone, head[8:])
+
+# A client asking for a version we do not speak is answered with the bytes of
+# the version we do, which is what the specification says to do and is more
+# use than a closed socket.
+fn am_wrong_version(fd, gone) =
+  sock_write(fd, a_header())
+  sock_close(fd)
+  send(gone, 1)
+  0
+
+fn am_start(fd, reg, done, cid, gone, buf) =
+  sock_write(fd, am_connection_start())
+  match am_read_frame(fd, buf)
+    ADead -> am_hang_up(fd, gone)
+    ARead(kind, chan, payload, rest) -> am_tune(fd, reg, done, cid, gone, rest)
+
+fn am_tune(fd, reg, done, cid, gone, buf) =
+  sock_write(fd, am_connection_tune())
+  match am_read_frame(fd, buf)
+    ADead -> am_hang_up(fd, gone)
+    ARead(kind, chan, payload, rest) -> am_open(fd, reg, done, cid, gone, rest)
+
+fn am_open(fd, reg, done, cid, gone, buf) = match am_read_frame(fd, buf)
+  ADead -> am_hang_up(fd, gone)
+  ARead(kind, chan, payload, rest) ->
+    sock_write(fd, am_connection_open_ok())
+    am_run(fd, reg, done, cid, gone, rest)
+
+fn am_hang_up(fd, gone) =
+  sock_close(fd)
+  send(gone, 1)
+  0
+
+# -- the loop -----------------------------------------------------------------------
+
+fn am_backlog() = 256
+
+fn am_run(fd, reg, done, cid, gone, buf) =
+  ses = channel(am_backlog())
+  out = channel(am_backlog())
+  spawn am_reader(fd, ses, buf, 0)
+  spawn am_pass(out, ses)
+  am_loop(Am(fd, reg, done, cid, out, 1, map_new(), map_new(), map_new(), Nil, "", 0, ""), ses, gone)
+
+# The reader: frames off the socket and nothing else.
+fn am_reader(fd, ses, buf, from) = match a_take(buf, from)
+  AGot(kind, chan, payload, next) ->
+    send(ses, AIn(kind, chan, payload))
+    am_reader(fd, ses, buf, next)
+  ABad(why) ->
+    send(ses, AEnd)
+    0
+  ANeed ->
+    kept = if from == 0 then buf else buf[from:]
+    more = sock_read(fd)
+    if str_len(more) == 0 then am_end(ses) else am_reader(fd, ses, kept + more, 0)
+
+fn am_end(ses) =
+  send(ses, AEnd)
+  0
+
+# A queue delivers into a channel of its own — every subscriber has one — and
+# this carries what arrives there into the session's one inbox, so that the
+# session waits in a single place.
+fn am_pass(out, ses) =
+  what = recv(out)
+  match what
+    ODeliver(queue, id, body) ->
+      send(ses, AIn(0, 0, am_pack(queue, id, body)))
+      am_pass(out, ses)
+    OFrame(text) -> am_pass(out, ses)
+
+# A delivery, flattened into the one shape the session's inbox carries. Frame
+# kind 0 is not a frame kind, so it cannot be mistaken for one off the wire.
+fn am_pack(queue, id, body) =
+  b = strbuf()
+  a_u8(b, str_len(queue))
+  b += queue
+  a_u64(b, id)
+  b += body
+  strbuf_str(b)
+
+fn am_unpack_queue(s) = s[1:1 + str_get(s, 0)]
+
+fn am_unpack_id(s) = a_get_u64(s, 1 + str_get(s, 0))
+
+fn am_unpack_body(s) = s[9 + str_get(s, 0):]
+
+fn am_loop(am: Am, ses, gone) =
+  step = select
+    m = recv(ses) -> Some(m)
+    recv(am.done) -> None
+  match step
+    None -> am_close(am, gone)
+    Some(m) -> am_step(am, ses, gone, m)
+
+fn am_step(am: Am, ses, gone, m) = match m
+  AEnd -> am_close(am, gone)
+  AIn(kind, chan, payload) ->
+    next = am_handle(am, kind, chan, payload)
+    if next.fd < 0 then am_close(next, gone) else am_loop(next, ses, gone)
+
+fn am_close(am: Am, gone) =
+  am_unsub_all(am, am.subs)
+  sock_close(am.fd)
+  send(gone, 1)
+  0
+
+fn am_unsub_all(am: Am, names) = match names
+  Nil -> 0
+  Cons(n, rest) ->
+    am_drop(am, n)
+    am_unsub_all(am, rest)
+
+fn am_drop(am: Am, name) =
+  if closed(am.done) then 0
+  else
+    back = channel(1)
+    send(am_queue(am, name), QUnsub(am.cid, back))
+    recv(back)
+
+fn am_queue(am: Am, name) =
+  back = channel(1)
+  send(am.reg, RFind(name, back))
+  recv(back)
+
+fn am_say(am: Am, bytes) =
+  sock_write(am.fd, bytes)
+  0
+
+# Marking a connection finished: the descriptor is set to -1 and the loop sees
+# it on the way round.
+fn am_finished(am: Am) =
+  Am(-1, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.subs, am.pub_to, am.pub_want, am.pub_body)
+
+# -- what the server says ------------------------------------------------------------
+
+fn am_method(chan, cls, method, args) =
+  b = a_method_head(cls, method)
+  b += args
+  a_frame(a_kind_method(), chan, strbuf_str(b))
+
+fn am_connection_start() =
+  b = strbuf()
+  a_u8(b, 0)
+  a_u8(b, 9)
+  a_empty_table(b)
+  a_longstr(b, "PLAIN")
+  a_longstr(b, "en_US")
+  am_method(0, a_class_connection(), 10, strbuf_str(b))
+
+fn am_connection_tune() =
+  b = strbuf()
+  a_u16(b, 2047)
+  a_u32(b, 131072)
+  a_u16(b, 0)
+  am_method(0, a_class_connection(), 30, strbuf_str(b))
+
+fn am_connection_open_ok() =
+  b = strbuf()
+  a_shortstr(b, "")
+  am_method(0, a_class_connection(), 41, strbuf_str(b))
+
+fn am_connection_close_ok() = am_method(0, a_class_connection(), 51, "")
+
+fn am_channel_open_ok(chan) =
+  b = strbuf()
+  a_longstr(b, "")
+  am_method(chan, a_class_channel(), 11, strbuf_str(b))
+
+fn am_channel_close_ok(chan) = am_method(chan, a_class_channel(), 41, "")
+
+fn am_queue_declare_ok(chan, name, ready, consumers) =
+  b = strbuf()
+  a_shortstr(b, name)
+  a_u32(b, ready)
+  a_u32(b, consumers)
+  am_method(chan, a_class_queue(), 11, strbuf_str(b))
+
+fn am_exchange_declare_ok(chan) = am_method(chan, a_class_exchange(), 11, "")
+
+fn am_queue_bind_ok(chan) = am_method(chan, a_class_queue(), 21, "")
+
+fn am_basic_qos_ok(chan) = am_method(chan, a_class_basic(), 11, "")
+
+fn am_basic_consume_ok(chan, tag) =
+  b = strbuf()
+  a_shortstr(b, tag)
+  am_method(chan, a_class_basic(), 21, strbuf_str(b))
+
+fn am_basic_cancel_ok(chan, tag) =
+  b = strbuf()
+  a_shortstr(b, tag)
+  am_method(chan, a_class_basic(), 31, strbuf_str(b))
+
+fn am_basic_get_empty(chan) =
+  b = strbuf()
+  a_shortstr(b, "")
+  am_method(chan, a_class_basic(), 72, strbuf_str(b))
+
+# A message on the wire is three frames: the method that says who it is for,
+# a header that says how long it is, and the body. They must not be broken up
+# by anything else on the same channel, which is why the session writes all
+# three in one go.
+fn am_content(chan, body) =
+  b = strbuf()
+  a_u16(b, a_class_basic())
+  a_u16(b, 0)
+  a_u64(b, str_len(body))
+  a_u16(b, 0)
+  a_frame(a_kind_header(), chan, strbuf_str(b)) + a_frame(a_kind_body(), chan, body)
+
+fn am_deliver(chan, tag, consumer, queue, body) =
+  b = strbuf()
+  a_shortstr(b, consumer)
+  a_u64(b, tag)
+  a_u8(b, 0)
+  a_shortstr(b, "")
+  a_shortstr(b, queue)
+  am_method(chan, a_class_basic(), 60, strbuf_str(b)) + am_content(chan, body)
+
+fn am_get_ok(chan, tag, queue, left, body) =
+  b = strbuf()
+  a_u64(b, tag)
+  a_u8(b, 0)
+  a_shortstr(b, "")
+  a_shortstr(b, queue)
+  a_u32(b, left)
+  am_method(chan, a_class_basic(), 71, strbuf_str(b)) + am_content(chan, body)
+
+# -- what the client asked for --------------------------------------------------------
+
+fn am_handle(am: Am, kind, chan, payload) =
+  if kind == 0 then am_send_delivery(am, payload) else if kind == a_kind_heartbeat() then am else if kind == a_kind_header() then am_header(am, payload) else if kind == a_kind_body() then am_body(am, chan, payload) else if kind == a_kind_method() then am_dispatch(am, chan, a_get_u16(payload, 0), a_get_u16(payload, 2), payload) else am
+
+fn am_dispatch(am: Am, chan, cls, method, payload) =
+  if cls == a_class_connection() then am_connection(am, method) else if cls == a_class_channel() then am_channel(am, chan, method) else if cls == a_class_exchange() then am_exchange(am, chan, method) else if cls == a_class_queue() then am_queue_method(am, chan, method, payload) else if cls == a_class_basic() then am_basic(am, chan, method, payload) else am
+
+fn am_connection(am: Am, method) =
+  if method != 50 then am
+  else
+    am_say(am, am_connection_close_ok())
+    am_finished(am)
+
+fn am_channel(am: Am, chan, method) =
+  if method == 10 then am_answer(am, am_channel_open_ok(chan)) else if method == 40 then am_answer(am, am_channel_close_ok(chan)) else am
+
+fn am_exchange(am: Am, chan, method) =
+  if method == 10 then am_answer(am, am_exchange_declare_ok(chan)) else am
+
+fn am_answer(am: Am, bytes) =
+  am_say(am, bytes)
+  am
+
+# `Queue.Declare` is how a client both makes a queue and asks how much is in
+# it, so the answer needs the queue's own count.
+# Arguments begin at four: the class and the method are two bytes each. Most
+# of these then open with a `reserved-1` short nobody has used since 0-9, so
+# the first field a client actually filled in is at six. Getting that wrong is
+# quiet rather than loud — every string comes back empty and every queue is
+# the one named "" — which is exactly how it went the first time.
+fn am_args() = 4
+
+fn am_after_reserved() = 6
+
+fn am_queue_method(am: Am, chan, method, payload) =
+  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 20 then am_answer(am, am_queue_bind_ok(chan)) else am
+
+fn am_declare(am: Am, chan, name) =
+  c = am_count(am, name)
+  am_answer(am, am_queue_declare_ok(chan, name, q_count_ready(c) + q_count_inflight(c), q_count_subs(c)))
+
+fn am_count(am: Am, name) =
+  back = channel(1)
+  send(am_queue(am, name), QStat(back))
+  recv(back)
+
+fn am_basic(am: Am, chan, method, payload) =
+  if method == 10 then am_answer(am, am_basic_qos_ok(chan)) else if method == 20 then am_consume(am, chan, payload) else if method == 30 then am_cancel(am, chan, a_get_shortstr(payload, am_args())) else if method == 40 then am_publish(am, payload) else if method == 70 then am_get(am, chan, payload) else if method == 80 then am_ack(am, a_get_u64(payload, am_args())) else if method == 90 then am_requeue(am, a_get_u64(payload, am_args())) else if method == 120 then am_requeue(am, a_get_u64(payload, am_args())) else am
+
+# `Basic.Publish` names a queue and says nothing about how long the message is:
+# that is in the header frame behind it, and the body in the frames behind
+# that. So this only remembers where it is going.
+fn am_publish(am: Am, payload) =
+  at = a_after_shortstr(payload, am_after_reserved())
+  Am(am.fd, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.subs, a_get_shortstr(payload, at), 0, "")
+
+fn am_header(am: Am, payload) =
+  want = a_get_u64(payload, 4)
+  if str_len(am.pub_to) == 0 then am else if want == 0 then am_deposit(am, "") else Am(am.fd, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.subs, am.pub_to, want, "")
+
+fn am_body(am: Am, chan, payload) =
+  whole = am.pub_body + payload
+  if str_len(whole) < am.pub_want then Am(am.fd, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.subs, am.pub_to, am.pub_want, whole) else am_deposit(am, whole)
+
+fn am_deposit(am: Am, body) =
+  send(am_queue(am, am.pub_to), QPub(body, am.out))
+  Am(am.fd, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.subs, "", 0, "")
+
+fn am_consume(am: Am, chan, payload) =
+  at = a_after_shortstr(payload, am_after_reserved())
+  queue = a_get_shortstr(payload, am_after_reserved())
+  given = a_get_shortstr(payload, at)
+  tag = if str_len(given) > 0 then given else "ctag-" + int_to_str(am.cid) + "-" + int_to_str(am.tag)
+  back = channel(1)
+  send(am_queue(am, queue), QSub(Sub(am.cid, am.out), back))
+  recv(back)
+  am.consumers[tag] = queue
+  am_answer(Am(am.fd, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, if am_has(am.subs, queue) then am.subs else Cons(queue, am.subs), am.pub_to, am.pub_want, am.pub_body), am_basic_consume_ok(chan, tag))
+
+fn am_has(names, name) = match names
+  Nil -> false
+  Cons(n, rest) -> str_cmp(n, name) == 0 || am_has(rest, name)
+
+fn am_cancel(am: Am, chan, tag) = match am.consumers[tag]
+  None -> am_answer(am, am_basic_cancel_ok(chan, tag))
+  Some(queue) ->
+    am_drop(am, queue)
+    map_del(am.consumers, tag)
+    am_answer(am, am_basic_cancel_ok(chan, tag))
+
+fn am_ack(am: Am, tag) = match am.whose[tag]
+  None -> am
+  Some(queue) -> am_tell(am, queue, tag, true)
+
+fn am_requeue(am: Am, tag) = match am.whose[tag]
+  None -> am
+  Some(queue) -> am_tell(am, queue, tag, false)
+
+fn am_tell(am: Am, queue, tag, yes) =
+  back = channel(1)
+  send(am_queue(am, queue), if yes then QAck(map_or(am.which, tag, 0), back) else QNack(map_or(am.which, tag, 0), back))
+  recv(back)
+  map_del(am.whose, tag)
+  map_del(am.which, tag)
+  am
+
+# A message the queue handed over. The tag counting deliveries on this
+# connection is minted here, and what it stands for is remembered until the
+# client says it is done with it.
+fn am_send_delivery(am: Am, packed) =
+  queue = am_unpack_queue(packed)
+  id = am_unpack_id(packed)
+  body = am_unpack_body(packed)
+  am.whose[am.tag] = queue
+  am.which[am.tag] = id
+  am_say(am, am_deliver(1, am.tag, am_tag_for(am, queue), queue, body))
+  Am(am.fd, am.reg, am.done, am.cid, am.out, am.tag + 1, am.whose, am.which, am.consumers, am.subs, am.pub_to, am.pub_want, am.pub_body)
+
+fn am_tag_for(am: Am, queue) = am_tag_in(am.consumers, map_keys(am.consumers), queue)
+
+fn am_tag_in(m: Map(Str, Str), ks, queue) = match ks
+  Nil -> ""
+  Cons(k, rest) -> if str_cmp(map_or(m, k, ""), queue) == 0 then k else am_tag_in(m, rest, queue)
+
+# `Basic.Get` takes one without subscribing. It is a poll, so it subscribes,
+# waits a moment for something to arrive, and unsubscribes again.
+fn am_get(am: Am, chan, payload) =
+  queue = a_get_shortstr(payload, am_after_reserved())
+  one = channel(1)
+  back = channel(1)
+  send(am_queue(am, queue), QSub(Sub(am.cid + 1000000, one), back))
+  recv(back)
+  got = select
+    v = recv(one) -> Some(v)
+    timeout(200) -> None
+  am_after_get(am, chan, queue, got)
+
+fn am_after_get(am: Am, chan, queue, got) =
+  back = channel(1)
+  send(am_queue(am, queue), QUnsub(am.cid + 1000000, back))
+  recv(back)
+  match got
+    None -> am_answer(am, am_basic_get_empty(chan))
+    Some(what) -> am_one(am, chan, queue, what)
+
+fn am_one(am: Am, chan, queue, what) = match what
+  OFrame(text) -> am_answer(am, am_basic_get_empty(chan))
+  ODeliver(q, id, body) ->
+    back = channel(1)
+    send(am_queue(am, queue), QAck(id, back))
+    recv(back)
+    am_answer(am, am_get_ok(chan, am.tag, queue, 0, body))

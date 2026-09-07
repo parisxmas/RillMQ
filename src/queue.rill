@@ -13,11 +13,11 @@ import "journal"
 type Msg
   Msg(id: Int, body: Str)
 
-# A subscriber, named by the connection that made it. `out` is where whole
-# frames go; it is buffered, and a subscriber whose buffer is full is a
-# subscriber the queue will skip rather than wait for.
+# A subscriber, named by the connection that made it. `out` is buffered, and a
+# subscriber whose buffer is full is a subscriber the queue will skip rather
+# than wait for.
 type Sub
-  Sub(id: Int, out: Chan(Str))
+  Sub(id: Int, out: Chan(Out))
 
 # A message handed out and not yet acknowledged. `due` is when the queue gives
 # up waiting and hands it to somebody else; `sub` is who is holding it, which
@@ -41,7 +41,7 @@ type QCount
   QCount(ready: Int, inflight: Int, subs: Int, published: Int)
 
 type QReq
-  QPub(body: Str, out: Chan(Str))
+  QPub(body: Str, out: Chan(Out))
   QSub(sub: Sub, reply: Chan(Int))
   QUnsub(sub_id: Int, reply: Chan(Int))
   QAck(id: Int, reply: Chan(Int))
@@ -227,7 +227,7 @@ fn q_handle(q: Q, r, full) = match r
 # The refusal goes down the journal's channel with everything else, so that it
 # arrives in the place the client asked for it. Nothing is written.
 fn q_refuse(q: Q, out) =
-  send(q.jr.puts, JSay(out, w_err("broker is holding all it was told it could")))
+  send(q.jr.puts, JSay(out, OFrame(w_err("broker is holding all it was told it could"))))
   q
 
 fn q_accept(q: Q, body, out) = q_handle_rest(q, QPub(body, out))
@@ -250,7 +250,7 @@ fn q_handle_rest(q: Q, r) = match r
     # is safe. That is the right way round: the publisher has been promised
     # nothing yet, and a message delivered twice is what at-least-once means.
     q.ready[q.tail] = Msg(id, body)
-    send(q.jr.puts, JPut(j_pub_record(id, body), out, w_ok_id(id)))
+    send(q.jr.puts, JPut(j_pub_record(id, body), out, OFrame(w_ok_id(id))))
     Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held, q.jr)
   QSub(s, reply) ->
     send(reply, 1)
@@ -360,7 +360,7 @@ fn q_offer(q: Q, m: Msg, tried) =
         # buffer being full means it is not keeping up with what it already
         # has. Either way the message stays ready and somebody else may take
         # it.
-        if q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), w_msg(m.id, q.name, m.body)) then q_took(moved, m, q_sub_id(s)) else q_offer(moved, m, tried + 1)
+        if q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body)) then q_took(moved, m, q_sub_id(s)) else q_offer(moved, m, tried + 1)
 
 fn q_try_send(out, frame) =
   ok = select

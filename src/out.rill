@@ -1,0 +1,13 @@
+# What goes to a connection.
+#
+# Either bytes that are already what should be written, or a message the
+# connection has to say in its own protocol.
+#
+# The queue rendering a message was fine while there was one protocol. There
+# are two now — RillMQ's own and AMQP — and a delivery in AMQP carries a tag
+# the queue could not know, because the tag counts deliveries on that
+# connection rather than messages in that queue. So the queue says what
+# happened and the connection says it.
+type Out
+  OFrame(text: Str)
+  ODeliver(queue: Str, id: Int, body: Str)
