@@ -1,0 +1,258 @@
+# A queue lives on one node, and every node knows which.
+#
+# The rule is the whole of the design: a queue's owner is its name's hash over
+# however many nodes there are, so no node has to be asked and no node has to
+# be told. Every node is given the same list in the same order and works out
+# the same answer, which is what lets a client connect to any of them.
+#
+# A node that is asked for a queue it does not hold does not redirect the
+# client. It stands in for the queue: a strand that looks exactly like a queue
+# from the inside and is, on the outside, a client connection to the node that
+# has the real one. That is why the link between nodes is RillMQ's own protocol
+# rather than something new — the thing at the far end is already a broker, and
+# already speaks it.
+import "broker"
+
+type Peer
+  Peer(host: Str, port: Int)
+
+# FNV-1a over the name, so that two nodes built from the same source pick the
+# same owner without having agreed on anything but the list.
+fn cl_hash(s, i, h) =
+  if i >= str_len(s) then h else cl_hash(s, i + 1, bit_and(bit_xor(h, str_get(s, i)) * 16777619, 4294967295))
+
+fn cl_owner(name, n) =
+  if n <= 1 then 0
+  else
+    h = cl_hash(name, 0, 2166136261)
+    h - h / n * n
+
+# `peers=host:port,host:port` and `node=<i>`, the same list on every node and
+# each one's own place in it. Nothing is discovered and nothing is negotiated,
+# which is the smallest cluster that can be correct.
+fn cl_peers() = cl_parse(split(opt("peers", ""), ","), Nil)
+
+fn cl_parse(parts, acc) = match parts
+  Nil -> reverse(acc)
+  Cons(p, rest) -> cl_parse(rest, if str_len(trim(p)) == 0 then acc else Cons(cl_one(trim(p)), acc))
+
+fn cl_one(s) =
+  at = str_find(s, ":")
+  if at < 0 then Peer(s, 6789) else Peer(s[:at], str_to_int(s[at + 1:]))
+
+fn cl_me() = opt_int("node", 0)
+
+fn cl_host(p: Peer) = p.host
+
+fn cl_port(p: Peer) = p.port
+
+# -- standing in for a queue that is somewhere else ---------------------------------
+
+# What the proxy is waiting to hear about, in the order it asked. The link
+# answers in the order it was asked, so a queue of these is enough and nothing
+# has to be numbered.
+type Waiting
+  WPub(out: Chan(Out))
+  WNum(reply: Chan(Int))
+  WStat(reply: Chan(QCount))
+
+type P
+  P(name: Str, fd: Int, subs: List(Sub), waits: Map(Int, Waiting), head: Int, tail: Int)
+
+# What reaches the proxy.
+type PIn
+  PReq(req: QReq)
+  PLine(line: Str)
+  PBody(id: Int, body: Str)
+  PDown
+
+fn crlf2() = "\r\n"
+
+fn cl_proxy(name, host, port, inbox, done) = match connect_to(host, port)
+  Err(e) ->
+    println("rillmq: no link to " + host + ":" + int_to_str(port) + " for queue " + name)
+    cl_refuse(name, inbox, done)
+  Ok(fd) ->
+    ses = channel(256)
+    spawn cl_relay(inbox, ses)
+    spawn cl_link(fd, ses, "", name)
+    cl_loop(P(name, fd, Nil, map_new(), 0, 0), ses, done)
+
+# A queue whose node cannot be reached still has to answer, or every publisher
+# that names it waits for ever. It says no.
+fn cl_refuse(name, inbox, done) =
+  step = select
+    r = recv(inbox) -> Some(r)
+    recv(done) -> None
+  match step
+    None -> 0
+    Some(r) ->
+      cl_say_no(r)
+      cl_refuse(name, inbox, done)
+
+fn cl_say_no(r) = match r
+  QPub(body, out) ->
+    send(out, OFrame(w_err("the node holding that queue cannot be reached")))
+    0
+  QSub(s, reply) ->
+    send(reply, 0)
+    0
+  QUnsub(sub_id, reply) ->
+    send(reply, 0)
+    0
+  QAck(id, reply) ->
+    send(reply, 0)
+    0
+  QNack(id, reply) ->
+    send(reply, 0)
+    0
+  QStat(reply) ->
+    send(reply, QCount(0, 0, 0, 0))
+    0
+
+# Local requests and link frames arrive on one inbox, so the proxy waits in one
+# place, as every other strand here does.
+fn cl_relay(inbox, ses) =
+  send(ses, PReq(recv(inbox)))
+  cl_relay(inbox, ses)
+
+# The far end speaks RillMQ's own protocol, so this is its client: lines, and
+# the bodies that follow a `MSG`.
+fn cl_link(fd, ses, buf, name) =
+  at = str_find(buf, crlf2())
+  if at < 0 then cl_link_more(fd, ses, buf, name) else cl_link_line(fd, ses, buf[:at], buf[at + 2:], name)
+
+fn cl_link_more(fd, ses, buf, name) =
+  more = sock_read(fd)
+  if str_len(more) == 0 then cl_link_down(ses) else cl_link(fd, ses, buf + more, name)
+
+fn cl_link_down(ses) =
+  send(ses, PDown)
+  0
+
+fn cl_link_line(fd, ses, line, rest, name) =
+  parts = split(line, " ")
+  if str_cmp(unwrap_or(nth(parts, 0), ""), "MSG") != 0 then cl_link_said(fd, ses, line, rest, name) else cl_link_msg(fd, ses, parts, rest, name)
+
+fn cl_link_said(fd, ses, line, rest, name) =
+  send(ses, PLine(line))
+  cl_link(fd, ses, rest, name)
+
+fn cl_link_msg(fd, ses, parts, rest, name) =
+  n = str_to_int(unwrap_or(nth(parts, 3), "0"))
+  if str_len(rest) < n then cl_link_fill(fd, ses, parts, rest, name) else cl_link_gave(fd, ses, str_to_int(unwrap_or(nth(parts, 1), "0")), rest[:n], rest[n:], name)
+
+fn cl_link_fill(fd, ses, parts, rest, name) =
+  more = sock_read(fd)
+  if str_len(more) == 0 then cl_link_down(ses) else cl_link_msg(fd, ses, parts, rest + more, name)
+
+fn cl_link_gave(fd, ses, id, body, rest, name) =
+  send(ses, PBody(id, body))
+  cl_link(fd, ses, rest, name)
+
+# -- the proxy's own loop ---------------------------------------------------------------
+
+fn cl_loop(p: P, ses, done) =
+  step = select
+    m = recv(ses) -> Some(m)
+    recv(done) -> None
+  match step
+    None -> 0
+    Some(m) -> cl_step(p, ses, done, m)
+
+fn cl_step(p: P, ses, done, m) = match m
+  PDown ->
+    sock_close(p.fd)
+    0
+  PReq(r) -> cl_loop(cl_ask(p, r), ses, done)
+  PLine(line) -> cl_loop(cl_answer(p, line), ses, done)
+  PBody(id, body) -> cl_loop(cl_hand_on(p, id, body), ses, done)
+
+fn cl_send(p: P, text) =
+  sock_write(p.fd, text)
+  0
+
+fn cl_wait(p: P, w) =
+  p.waits[p.tail] = w
+  P(p.name, p.fd, p.subs, p.waits, p.head, p.tail + 1)
+
+# What the queue would have done, said down the link instead. Everything that
+# expects an answer leaves a note of what to do with it.
+fn cl_ask(p: P, r) = match r
+  QPub(body, out) ->
+    cl_send(p, "PUB " + p.name + " " + int_to_str(str_len(body)) + crlf2() + body)
+    cl_wait(p, WPub(out))
+  QSub(s, reply) ->
+    cl_send(p, "SUB " + p.name + crlf2())
+    send(reply, 1)
+    P(p.name, p.fd, append(p.subs, Cons(s, Nil)), p.waits, p.head, p.tail)
+  QUnsub(sub_id, reply) ->
+    send(reply, 1)
+    cl_unsub(p, sub_id)
+  QAck(id, reply) ->
+    cl_send(p, "ACK " + p.name + " " + int_to_str(id) + crlf2())
+    cl_wait(p, WNum(reply))
+  QNack(id, reply) ->
+    cl_send(p, "NACK " + p.name + " " + int_to_str(id) + crlf2())
+    cl_wait(p, WNum(reply))
+  QStat(reply) ->
+    cl_send(p, "QSTAT " + p.name + crlf2())
+    cl_wait(p, WStat(reply))
+
+# The last subscriber leaving takes the subscription with it, so the far end
+# stops sending: this node has nobody to give a message to.
+fn cl_unsub(p: P, sub_id) =
+  left = cl_without(p.subs, sub_id)
+  if len(left) > 0 then P(p.name, p.fd, left, p.waits, p.head, p.tail)
+  else
+    cl_send(p, "UNSUB " + p.name + crlf2())
+    P(p.name, p.fd, left, p.waits, p.head, p.tail + 0)
+
+fn cl_without(subs, sub_id) = match subs
+  Nil -> Nil
+  Cons(s, rest) -> if q_sub_id(s) == sub_id then cl_without(rest, sub_id) else Cons(s, cl_without(rest, sub_id))
+
+# An answer belongs to whoever asked first, because the far end answers in the
+# order it was asked.
+fn cl_answer(p: P, line) = match p.waits[p.head]
+  None -> p
+  Some(w) ->
+    cl_give(w, line, p.name)
+    map_del(p.waits, p.head)
+    P(p.name, p.fd, p.subs, p.waits, p.head + 1, p.tail)
+
+fn cl_give(w, line, name) = match w
+  WPub(out) ->
+    send(out, if starts_with(line, "+OK ") then OPublished(name, str_to_int(line[4:])) else OFrame(line + crlf2()))
+    0
+  WNum(reply) ->
+    send(reply, if starts_with(line, "+OK") then 1 else 0)
+    0
+  WStat(reply) ->
+    send(reply, cl_stat_of(split(line, " ")))
+    0
+
+fn cl_stat_of(parts) =
+  QCount(cl_num(parts, 1), cl_num(parts, 2), cl_num(parts, 3), cl_num(parts, 4))
+
+fn cl_num(parts, i) = str_to_int(unwrap_or(nth(parts, i), "0"))
+
+# A message from the far end goes to one of this node's subscribers, round
+# robin, and is skipped if that one is not keeping up — the same rule a real
+# queue follows, because from here the far end is the queue.
+fn cl_hand_on(p: P, id, body) = cl_offer(p, id, body, p.subs)
+
+fn cl_offer(p: P, id, body, left) = match left
+  Nil -> p
+  Cons(s, rest) ->
+    if cl_try(q_sub_out(s), ODeliver(p.name, id, body)) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail) else cl_offer(p, id, body, rest)
+
+fn cl_try(out, what) =
+  ok = select
+    send(out, what) -> true
+    default -> false
+  ok
+
+fn cl_rotate(subs) = match subs
+  Nil -> Nil
+  Cons(s, rest) -> append(rest, Cons(s, Nil))

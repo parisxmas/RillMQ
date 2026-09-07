@@ -13,7 +13,8 @@ rill build src/main.rill -o rillmq
 ```
 
 Everything else is optional and named: `amqp=<port>` a second port speaking
-AMQP 0-9-1, `ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much one consumer may hold, `mem=<MB>` how
+AMQP 0-9-1, `peers=<host:port,...>` and `node=<i>` for a cluster,
+`ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much one consumer may hold, `mem=<MB>` how
 big the broker may get before it refuses publishes, `idle=<s>` how long a
 connection that has asked for nothing may say nothing, `conns=<n>` how many
 connections at once.
@@ -191,6 +192,43 @@ ordering is what the one channel gives.
 Three floods of two hundred thousand messages at a thirty megabyte limit leave
 the broker at thirty-one megabytes with a hundred and ninety-seven thousand
 messages held. It does not grow.
+
+## More than one node
+
+```sh
+./rillmq 6789 dir=a node=0 peers=10.0.0.1:6789,10.0.0.2:6789
+./rillmq 6789 dir=b node=1 peers=10.0.0.1:6789,10.0.0.2:6789
+```
+
+A queue lives on one node, and the rule for which is the whole of the design:
+its owner is the hash of its name over however many nodes there are. No node
+has to be asked and no node has to be told. Every node is given the same list
+in the same order and works out the same answer, which is what lets a client
+connect to any of them.
+
+A node asked for a queue it does not hold does not redirect the client. It
+stands in for the queue: a strand that looks exactly like a queue from the
+inside, and is on the outside a client connection to the node that has the
+real one. That is why the link between nodes is RillMQ's own protocol rather
+than something new — the thing at the far end is already a broker, and already
+speaks it. Publishing, subscribing, acknowledging and asking for numbers all
+cross that way, and the `.NET` client cannot tell: all thirteen of its checks
+pass against a node where three of the queues are somewhere else.
+
+The far end answers in the order it was asked, so the proxy keeps its
+outstanding questions in a queue and hands each answer to whoever asked first.
+Nothing is numbered and nothing is correlated.
+
+A node whose peer cannot be reached still answers, because a publisher that
+names a queue on a dead node must be told something rather than wait for ever.
+It says `-ERR the node holding that queue cannot be reached`.
+
+**This is sharding, not replication.** A node going down takes its queues with
+it until it comes back — and it does come back with them, because each node
+has its own journal. What it does not have is a copy of anybody else's, so
+there is no failover and no quorum. That is the next thing and it is a
+different order of problem: replication needs agreement, and agreement needs
+Raft or something like it.
 
 ## Routing
 
@@ -443,6 +481,7 @@ rill build test/bench.rill  -o rillmq-bench
 
 sh test/persistence.sh       # 15 checks, most of which stop the broker
 sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
+sh test/cluster.sh           # 3 checks across two nodes
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -453,7 +492,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All thirty-nine pass against a `--parallel` build on four workers, and with or
+All forty-two pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -465,8 +504,16 @@ without a journal.
 - **A rewrite holds the whole live queue as records at once.** The queue builds
   them and hands them over as a list, which for a large queue is a second copy
   of it in memory for as long as the write takes.
-- **One node.** No clustering, no replication, and no way to name a peer:
-  Rill's sockets are IPv4 addresses with no name resolution.
+- **Sharding, not replication.** A node going down takes its queues with it
+  until it comes back. There is no copy anywhere else, no failover and no
+  quorum.
+- **A cluster is a list, not a membership.** Peers are given on the command
+  line, in the same order on every node, and nothing joins or leaves while it
+  is running. Peers are addresses, because Rill's sockets have no name
+  resolution.
+- **A proxy asks one thing at a time.** A queue standing in for a remote one
+  waits for each answer before sending the next question, so one queue's
+  traffic across a link is a round trip deep rather than a pipeline.
 - **No TLS, and no authentication.** Do not put this on a network you do not
   own.
 - **Bindings are not written down.** Queues and their messages survive a

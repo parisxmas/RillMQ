@@ -11,6 +11,7 @@
 # it is one strand's, exactly as a queue's messages are one strand's.
 import "queue"
 import "exchange"
+import "cluster"
 
 type RReq
   RFind(name: Str, reply: Chan(Chan(QReq)))
@@ -76,13 +77,23 @@ fn r_exchange(xs: Map(Str, Chan(XReq)), name, kind, done) = match xs[name]
     xs[name] = ch
     ch
 
+# A queue is made here, or stood in for. Which of the two is the name's hash
+# over the list of nodes, so this node does not have to ask anybody and cannot
+# disagree with anybody: every node runs the same arithmetic on the same list.
 fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
   Some(ch) -> ch
   None ->
     ch = channel()
-    spawn q_run(name, dir, ch, done)
+    r_start(name, dir, ch, done, cl_peers())
     qs[name] = ch
     ch
+
+fn r_start(name, dir, ch, done, peers) =
+  if len(peers) <= 1 || cl_owner(name, len(peers)) == cl_me() then spawn q_run(name, dir, ch, done) else r_stand_in(name, ch, done, nth(peers, cl_owner(name, len(peers))))
+
+fn r_stand_in(name, ch, done, where) = match where
+  None -> spawn q_run(name, "", ch, done)
+  Some(p) -> spawn cl_proxy(name, cl_host(p), cl_port(p), ch, done)
 
 # Asking a queue how it is doing is the one thing the registry does that can
 # be slow, and the registry is on the path of every publish: `b_find` goes
@@ -247,6 +258,10 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
   CXPub(ex, key, body) ->
     send(b_exchange(c, ex, x_direct()), XPub(key, body, c.out))
     b_read(c, buf, next, subs, 0)
+  CQStat(qname) ->
+    st = q_count_of(b_find(c.reg, qname))
+    send(c.out, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st))))
+    b_read(c, buf, next, subs, 0)
   CQueues ->
     rows = channel()
     send(c.reg, RRows(rows))
@@ -301,6 +316,11 @@ fn b_queues(t: Totals) = t.queues
 fn b_ready(t: Totals) = t.ready
 
 fn b_inflight(t: Totals) = t.inflight
+
+fn q_count_of(ch) =
+  back = channel(1)
+  send(ch, QStat(back))
+  recv(back)
 
 fn b_exchange(c: Conn, name, kind) =
   back = channel(1)
