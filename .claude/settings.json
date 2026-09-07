@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill:*)",
+      "Bash(kill:*)",
+      "Bash(./rillmq:*)",
+      "Bash(./rillmq-test:*)",
+      "Bash(./rillmq-bench:*)",
+      "Bash(./rillmq-compact:*)",
+      "Bash(./rillmq-par:*)",
+      "Bash(sh test/persistence.sh:*)",
+      "Bash(sh test/amqp.sh:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet run:*)",
+      "Bash(dotnet restore:*)"
+    ]
+  }
+}

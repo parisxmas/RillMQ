@@ -2,3 +2,6 @@ rillmq
 rillmq-par
 rillmq-test
 rillmq-bench
+test/dotnet/bin
+test/dotnet/obj
+rillmq-compact
