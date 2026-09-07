@@ -12,7 +12,8 @@ DIR="$(mktemp -d)/rillmq"
 BROKER=$!
 sleep 1
 
-( cd test/dotnet && dotnet run --no-build -- "$AMQP" )
+# Builds if it has to. The first run fetches RabbitMQ.Client from nuget.
+( cd test/dotnet && dotnet run -v q --nologo -- "$AMQP" )
 RC=$?
 
 kill -TERM "$BROKER" 2>/dev/null
