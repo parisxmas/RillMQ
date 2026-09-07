@@ -263,6 +263,21 @@ routing key is a queue name, and a connection goes straight to that queue — no
 hop, no bindings, nothing to look up. That is the path most messages take and
 it costs what it costs; named exchanges are the ones with something to decide.
 
+**The table is written down.** Exchanges and bindings go into `_routes.log`,
+the same journal a queue's messages go into — the same record, the same
+checksum, the same rule about what follows a record that does not add up —
+holding what was declared rather than what was published. Reading it back in
+order gives the table as it stood: an exchange declared, a binding made, a
+binding taken away. A client does not have to declare anything again after a
+restart.
+
+Reading it back does not write it out again, which is the one thing that would
+have made the file longer on every restart for a table that had not changed.
+A binding is written and nothing waits for it: it is one small record on a file
+that is synced with the next batch, and a binding lost in that window is one
+the client is about to declare again anyway, because declaring is what a client
+does on the way in.
+
 Nowhere to go is not an error. A message published to a key nothing is bound
 to is dropped, which is what every broker does, and the publisher is answered
 all the same because it asked. One queue is the ordinary case and costs
@@ -479,7 +494,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-test 7700           # 11 checks
 ./rillmq-bench 7700 200000 64
 
-sh test/persistence.sh       # 15 checks, most of which stop the broker
+sh test/persistence.sh       # 18 checks, most of which stop the broker
 sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
 sh test/cluster.sh           # 3 checks across two nodes
 ```
@@ -492,7 +507,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All forty-two pass against a `--parallel` build on four workers, and with or
+All forty-five pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -516,12 +531,14 @@ without a journal.
   traffic across a link is a round trip deep rather than a pipeline.
 - **No TLS, and no authentication.** Do not put this on a network you do not
   own.
-- **Bindings are not written down.** Queues and their messages survive a
-  restart; the exchanges and bindings that route to them do not, and have to
-  be declared again. That is what RabbitMQ's `durable` flag on an exchange
-  means and RillMQ does not honour it yet.
+- **The routing journal is never rewritten.** It gains a record per binding
+  made and per binding taken away, and nothing ever shortens it. A queue's
+  journal is compacted; this one is not, on the grounds that a table which
+  changes as often as messages arrive is not a routing table.
 - **No `headers` exchange, and no `Queue.Unbind` over AMQP.** The exchange
-  understands unbinding; nothing asks it to.
+  understands unbinding, and a replayed journal can ask it; nothing else does.
+- **`durable` is not a choice.** Every exchange and every binding is written
+  down, whatever the flag said, exactly as every queue is.
 - **One virtual host, and any password.** `Connection.Open` takes whatever
   virtual host it is given and `PLAIN` takes whatever credentials it is given.
 - **No flow control back to publishers, only a wall.** A publisher that

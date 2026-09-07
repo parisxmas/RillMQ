@@ -316,7 +316,7 @@ fn am_exchange_method(am: Am, chan, method, payload) =
 
 fn am_exchange(am: Am, name, kind) =
   back = channel(1)
-  send(am.reg, RExchange(name, kind, back))
+  send(am.reg, RExchange(name, kind, false, back))
   recv(back)
 
 fn am_answer(am: Am, bytes) =
@@ -347,13 +347,13 @@ fn am_bind(am: Am, chan, payload) =
   ex = a_get_shortstr(payload, at1)
   key = a_get_shortstr(payload, at2)
   back = channel(1)
-  send(am_named_exchange(am, ex), XBind(queue, key, am_queue(am, queue), back))
+  send(am_named_exchange(am, ex), XBind(queue, key, am_queue(am, queue), false, back))
   recv(back)
   am_answer(am, am_queue_bind_ok(chan))
 
 fn am_named_exchange(am: Am, name) =
   back = channel(1)
-  send(am.reg, RExchange(name, x_direct(), back))
+  send(am.reg, RExchange(name, x_direct(), false, back))
   recv(back)
 
 fn am_declare(am: Am, chan, name) =

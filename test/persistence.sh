@@ -68,7 +68,7 @@ stop
 ask 'PING\r\n' >/dev/null 2>&1                   # nothing listening now
 start
 ask 'PUB other 2\r\nhiQUIT\r\n' >/dev/null
-say "a second queue gets its own journal" "$(ls "$DIR" | sort | tr '\n' ' ')" "orders.log other.log "
+say "a second queue gets its own journal" "$(ls "$DIR" | sort | tr '\n' ' ')" "_routes.log orders.log other.log "
 stop
 start
 say "and both come back" "$(stats)" "+STATS 2 3 0"
@@ -89,6 +89,23 @@ crash
 
 start 60000
 say "and a hard kill after a rewrite loses nothing" "$(stats | awk '{print $3 + $4}')" "$LEFT"
+stop
+
+# -- the routing table is written down too -----------------------------------------
+
+start
+ask 'XDECL logs topic\r\nBIND logs errs *.error\r\nBIND logs under app.#\r\nXPUB logs app.error 5\r\nfirstQUIT\r\n' >/dev/null
+qstat() { printf 'QSTAT %s\r\nQUIT\r\n' "$1" | nc -w 2 127.0.0.1 "$PORT" | head -1 | tr -d '\r'; }
+say "a routed message reaches both bindings" "$(qstat errs)|$(qstat under)" "+QSTAT 1 0 0 1|+QSTAT 1 0 0 1"
+BYTES=$(wc -c < "$DIR/_routes.log" | tr -d ' ')
+stop
+
+start
+# Nothing is declared again: if the bindings did not survive, this goes nowhere.
+ask 'XPUB logs db.error 6\r\nsecondQUIT\r\n' >/dev/null
+sleep 1
+say "and routes again after a restart with nothing redeclared" "$(qstat errs)|$(qstat under)" "+QSTAT 2 0 0 2|+QSTAT 1 0 0 1"
+say "and reading the table back does not write it out again" "$(wc -c < "$DIR/_routes.log" | tr -d ' ')" "$BYTES"
 stop
 
 # -- who is allowed to stay, and how many ------------------------------------------

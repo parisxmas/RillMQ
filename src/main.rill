@@ -32,9 +32,10 @@ fn serve(server, dir) =
   reg = channel()
   spawn r_run(dir, reg, done)
   restored = bring_back(reg, dir)
+  routed = bring_back_routes(reg, dir)
   spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())))
   amqp_on(reg, done, opt_int("amqp", 0))
-  println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) restored)"))
+  println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) and " + int_to_str(routed) + " binding(s) restored)"))
 
   # `main` is the strand that waits for the signal, and closing `done` is how
   # it tells every other strand in the program at once. Nothing has to be
@@ -76,6 +77,38 @@ fn open_each(reg, dir, files, n) = match files
     else
       b_find(reg, name)
       open_each(reg, dir, rest, n + 1)
+
+# The routing table, read in the order it was written: an exchange declared, a
+# binding made, a binding taken away. Applying them in that order gives the
+# table as it stood, and applying them through the registry is the same path a
+# client would have taken, so nothing needs a second way in.
+fn bring_back_routes(reg, dir) =
+  if str_len(dir) == 0 then 0 else apply_routes(reg, rt_replay(dir + "/" + rt_file()).all, 0)
+
+fn apply_routes(reg, rs, n) = match rs
+  Nil -> n
+  Cons(r, rest) -> apply_routes(reg, rest, n + apply_route(reg, r))
+
+fn apply_route(reg, r) = match r
+  RNone -> 0
+  RX(name, kind) ->
+    b_exchange_of(reg, name, kind)
+    0
+  RB(ex, queue, key) ->
+    back = channel(1)
+    send(b_exchange_of(reg, ex, x_direct()), XBind(queue, key, b_find(reg, queue), true, back))
+    recv(back)
+    1
+  RU(ex, queue, key) ->
+    back = channel(1)
+    send(b_exchange_of(reg, ex, x_direct()), XUnbind(queue, key, back))
+    recv(back)
+    0
+
+fn b_exchange_of(reg, name, kind) =
+  back = channel(1)
+  send(reg, RExchange(name, kind, true, back))
+  recv(back)
 
 fn ends_with_log(f) = str_len(f) > 4 && str_cmp(f[str_len(f) - 4:], ".log") == 0
 

@@ -12,6 +12,7 @@
 import "queue"
 import "exchange"
 import "cluster"
+import "routes"
 
 type RReq
   RFind(name: Str, reply: Chan(Chan(QReq)))
@@ -19,7 +20,7 @@ type RReq
   # settled by whoever names it first; naming it again with another kind is
   # answered with the one it already is rather than refused, which is friendlier
   # than the specification and no less safe.
-  RExchange(name: Str, kind: Str, reply: Chan(Chan(XReq)))
+  RExchange(name: Str, kind: Str, quiet: Bool, reply: Chan(Chan(XReq)))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
 
@@ -45,22 +46,27 @@ type Conn
 # A queue is made the first time it is named, by a publisher or a subscriber
 # alike. There is no declare step, which is the one thing about AMQP that
 # nobody has ever been glad of.
-fn r_run(dir, inbox, done) = r_loop(map_new(), map_new(), dir, inbox, done)
+# The routing table's own journal, made once. Exchanges and bindings are few
+# and change rarely, so they share one file rather than having one each.
+fn r_run(dir, inbox, done) =
+  jr = Jr(channel(256), channel(1))
+  if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
+  r_loop(map_new(), map_new(), dir, Cons(jr, Nil), inbox, done)
 
-fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, inbox, done) =
+fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, jr, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(r_handle(qs, xs, dir, r, done))
+    r = recv(inbox) -> Some(r_handle(qs, xs, dir, jr, r, done))
     recv(done) -> None
   match step
     None -> 0
-    Some(_) -> r_loop(qs, xs, dir, inbox, done)
+    Some(_) -> r_loop(qs, xs, dir, jr, inbox, done)
 
-fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, r, done) = match r
+fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, jr, r, done) = match r
   RFind(name, reply) ->
     send(reply, r_queue(qs, dir, name, done))
     0
-  RExchange(name, kind, reply) ->
-    send(reply, r_exchange(xs, name, kind, done))
+  RExchange(name, kind, quiet, reply) ->
+    send(reply, r_exchange(xs, jr, name, kind, quiet, done))
     0
   RTotals(reply) ->
     send(reply, r_totals(qs, map_keys(qs), 0, 0))
@@ -69,13 +75,29 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, r, done) = 
     send(reply, r_rows(qs, map_keys(qs), Nil))
     0
 
-fn r_exchange(xs: Map(Str, Chan(XReq)), name, kind, done) = match xs[name]
+fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, done) = match xs[name]
   Some(ch) -> ch
-  None ->
-    ch = channel()
-    spawn x_run(name, kind, ch, done)
-    xs[name] = ch
-    ch
+  None -> r_make_exchange(xs, r_only(jr), name, kind, quiet, done)
+
+# `quiet` is what startup uses. Reading the table back in and writing every
+# line of it out again would make the file longer every time the broker was
+# restarted, for a table that had not changed.
+fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, done) =
+  ch = channel()
+  spawn x_run(name, kind, jr, ch, done)
+  if quiet then 0 else r_note_x(jr, name, kind)
+  xs[name] = ch
+  ch
+
+fn r_note_x(jr: Jr, name, kind) =
+  send(jr.puts, JNote(rt_x_record(name, kind)))
+  0
+
+# The one journal the registry carries, in a list because a record cannot hold
+# a channel record and be built before it exists.
+fn r_only(jr) = match jr
+  Nil -> Jr(channel(1), channel(1))
+  Cons(j, rest) -> j
 
 # A queue is made here, or stood in for. Which of the two is the name's hash
 # over the list of nodes, so this node does not have to ask anybody and cannot
@@ -251,7 +273,7 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     b_read(c, buf, next, subs, 0)
   CBind(ex, qname, key) ->
     back = channel(1)
-    send(b_exchange(c, ex, x_direct()), XBind(qname, key, b_find(c.reg, qname), back))
+    send(b_exchange(c, ex, x_direct()), XBind(qname, key, b_find(c.reg, qname), false, back))
     recv(back)
     send(c.out, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0)
@@ -324,7 +346,7 @@ fn q_count_of(ch) =
 
 fn b_exchange(c: Conn, name, kind) =
   back = channel(1)
-  send(c.reg, RExchange(name, kind, back))
+  send(c.reg, RExchange(name, kind, false, back))
   recv(back)
 
 fn b_find(reg, name) =

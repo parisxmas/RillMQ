@@ -7,16 +7,17 @@
 # and it costs exactly what it costs now. Named exchanges are the ones that
 # have something to decide.
 import "queue"
+import "routes"
 
 type Bind
   Bind(queue: Str, key: Str, ch: Chan(QReq))
 
 type X
-  X(name: Str, kind: Str, binds: List(Bind))
+  X(name: Str, kind: Str, binds: List(Bind), jr: Jr)
 
 type XReq
   XPub(key: Str, body: Str, out: Chan(Out))
-  XBind(queue: Str, key: Str, ch: Chan(QReq), reply: Chan(Int))
+  XBind(queue: Str, key: Str, ch: Chan(QReq), quiet: Bool, reply: Chan(Int))
   XUnbind(queue: Str, key: Str, reply: Chan(Int))
 
 fn x_direct() = "direct"
@@ -25,7 +26,7 @@ fn x_fanout() = "fanout"
 
 fn x_topic() = "topic"
 
-fn x_run(name, kind, inbox, done) = x_loop(X(name, kind, Nil), inbox, done)
+fn x_run(name, kind, jr: Jr, inbox, done) = x_loop(X(name, kind, Nil, jr), inbox, done)
 
 fn x_loop(x: X, inbox, done) =
   step = select
@@ -39,12 +40,26 @@ fn x_handle(x: X, r) = match r
   XPub(key, body, out) ->
     x_send(x, x_route(x, x.binds, key, Nil), body, out)
     x
-  XBind(queue, key, ch, reply) ->
+  XBind(queue, key, ch, quiet, reply) ->
     send(reply, 1)
-    if x_bound(x.binds, queue, key) then x else X(x.name, x.kind, Cons(Bind(queue, key, ch), x.binds))
+    if x_bound(x.binds, queue, key) then x else x_add(x, queue, key, ch, quiet)
   XUnbind(queue, key, reply) ->
     send(reply, 1)
-    X(x.name, x.kind, x_without(x.binds, queue, key))
+    x_note(x, rt_unbind_record(x.name, queue, key))
+    X(x.name, x.kind, x_without(x.binds, queue, key), x.jr)
+
+fn x_add(x: X, queue, key, ch, quiet) =
+  if quiet then 0 else x_note(x, rt_bind_record(x.name, queue, key))
+  X(x.name, x.kind, Cons(Bind(queue, key, ch), x.binds), x.jr)
+
+# A binding is written down and nothing waits for it to land. It is one small
+# record on a file that is synced with the next batch, which is to say almost
+# at once; and a binding lost in that window is a binding the client is about
+# to declare again anyway, because declaring is what a client does on the way
+# in.
+fn x_note(x: X, rec) =
+  send(x.jr.puts, JNote(rec))
+  0
 
 fn x_bound(binds, queue, key) = match binds
   Nil -> false

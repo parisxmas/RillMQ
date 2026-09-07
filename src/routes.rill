@@ -1,0 +1,92 @@
+# The routing table, written down.
+#
+# Queues and their messages already survive a restart; what routes to them did
+# not, so a client had to declare its exchanges and bindings again every time
+# the broker came back. This is the same journal as a queue's — the same
+# record, the same checksum, the same rule about what follows a record that
+# does not add up — holding what was declared rather than what was published.
+#
+# Three kinds of record, and reading them in order gives the table as it
+# stands: an exchange declared, a binding made, a binding taken away.
+import "journal"
+
+# A name no queue can produce. A queue's file is its name with anything unsafe
+# written as an underscore and two hex digits, so a leading underscore is
+# always followed by hex — and `ro` is not hex.
+fn rt_file() = "_routes.log"
+
+fn rt_kind_x() = 88
+
+fn rt_kind_bind() = 66
+
+fn rt_kind_unbind() = 85
+
+type Route
+  RX(name: Str, kind: Str)
+  RB(exchange: Str, queue: Str, key: Str)
+  RU(exchange: Str, queue: Str, key: Str)
+  RNone
+
+# A field is its length and then its bytes, two bytes for the length, because a
+# queue name is whatever a client sent and nothing says it is short.
+fn rt_field(b: StrBuf, s) =
+  b += bit_and(str_len(s), 255)
+  b += bit_and(shr(str_len(s), 8), 255)
+  b += s
+  0
+
+fn rt_len_at(s, at) = str_get(s, at) + shl(str_get(s, at + 1), 8)
+
+fn rt_field_at(s, at) = s[at + 2:at + 2 + rt_len_at(s, at)]
+
+fn rt_after(s, at) = at + 2 + rt_len_at(s, at)
+
+fn rt_x_record(name, kind) =
+  b = strbuf()
+  rt_field(b, name)
+  rt_field(b, kind)
+  j_record(rt_kind_x(), 0, strbuf_str(b))
+
+fn rt_bind_record(ex, queue, key) = rt_three(rt_kind_bind(), ex, queue, key)
+
+fn rt_unbind_record(ex, queue, key) = rt_three(rt_kind_unbind(), ex, queue, key)
+
+fn rt_three(kind, a, b2, c) =
+  b = strbuf()
+  rt_field(b, a)
+  rt_field(b, b2)
+  rt_field(b, c)
+  j_record(kind, 0, strbuf_str(b))
+
+# -- reading it back -----------------------------------------------------------------
+
+type Routes
+  Routes(all: List(Route), upto: Int)
+
+fn rt_replay(path) =
+  fd = file_open(path, "r")
+  if fd < 0 then Routes(Nil, 0)
+  else
+    r = rt_walk(fd, "", 0, Nil)
+    file_close(fd)
+    r
+
+fn rt_walk(fd, buf, base, acc) =
+  step = rt_scan(buf, 0, acc)
+  more = file_read(fd, 262144)
+  if str_len(more) == 0 then Routes(reverse(step.all), base + step.upto) else rt_walk(fd, buf[step.upto:] + more, base + step.upto, step.all)
+
+fn rt_scan(buf, at, acc) = match j_take(buf, at)
+  RStop -> Routes(acc, at)
+  RGot(kind, id, body, next) -> rt_scan(buf, next, Cons(rt_of(kind, body), acc))
+
+fn rt_of(kind, body) =
+  if kind == rt_kind_x() then RX(rt_field_at(body, 0), rt_field_at(body, rt_after(body, 0))) else if kind == rt_kind_bind() then rt_triple(body, true) else if kind == rt_kind_unbind() then rt_triple(body, false) else RNone
+
+fn rt_triple(body, bind) =
+  at2 = rt_after(body, 0)
+  at3 = rt_after(body, at2)
+  ex = rt_field_at(body, 0)
+  queue = rt_field_at(body, at2)
+  key = rt_field_at(body, at3)
+  if bind then RB(ex, queue, key) else RU(ex, queue, key)
