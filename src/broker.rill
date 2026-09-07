@@ -14,6 +14,7 @@ import "queue"
 type RReq
   RFind(name: Str, reply: Chan(Chan(QReq)))
   RTotals(reply: Chan(Totals))
+  RRows(reply: Chan(List(Str)))
 
 type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
@@ -54,6 +55,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), dir, r, done) = match r
   RTotals(reply) ->
     send(reply, r_totals(qs, map_keys(qs), 0, 0))
     0
+  RRows(reply) ->
+    send(reply, r_rows(qs, map_keys(qs), Nil))
+    0
 
 fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
   Some(ch) -> ch
@@ -63,15 +67,45 @@ fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
     qs[name] = ch
     ch
 
+# Asking a queue how it is doing is the one thing the registry does that can
+# be slow, and the registry is on the path of every publish: `b_find` goes
+# through it. So the ask has a deadline. A queue busy enough not to answer in
+# a fifth of a second is reported as busy rather than waited for, and the room
+# for one answer means its late reply does not leave it stuck sending.
+fn r_ask(ch) =
+  back = channel(1)
+  send(ch, QStat(back))
+  c = select
+    v = recv(back) -> Some(v)
+    timeout(r_patience()) -> None
+  c
+
+fn r_patience() = 200
+
 fn r_totals(qs: Map(Str, Chan(QReq)), ks, ready, inflight) = match ks
   Nil -> Totals(#qs, ready, inflight)
   Cons(k, rest) -> match qs[k]
     None -> r_totals(qs, rest, ready, inflight)
-    Some(ch) ->
-      back = channel()
-      send(ch, QStat(back))
-      c = recv(back)
-      r_totals(qs, rest, ready + q_count_ready(c), inflight + q_count_inflight(c))
+    Some(ch) -> match r_ask(ch)
+      None -> r_totals(qs, rest, ready, inflight)
+      Some(c) -> r_totals(qs, rest, ready + q_count_ready(c), inflight + q_count_inflight(c))
+
+# One rendered row per queue, in whatever order the table holds them. Rendered
+# here because the registry is the only thing that knows both a queue's name
+# and its channel.
+fn r_rows(qs: Map(Str, Chan(QReq)), ks, acc) = match ks
+  Nil -> acc
+  Cons(k, rest) -> match qs[k]
+    None -> r_rows(qs, rest, acc)
+    Some(ch) -> r_rows(qs, rest, Cons(r_row(k, r_ask(ch)), acc))
+
+fn r_row(name, answer) = match answer
+  None -> w_queue_busy(name)
+  Some(c) -> w_queue_row(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c))
+
+fn q_count_subs(c: QCount) = c.subs
+
+fn q_count_published(c: QCount) = c.published
 
 fn q_count_ready(c: QCount) = c.ready
 
@@ -174,6 +208,11 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     t = recv(back)
     send(c.out, w_stats(b_queues(t), b_ready(t), b_inflight(t)))
     b_read(c, buf, next, subs, 0)
+  CQueues ->
+    rows = channel()
+    send(c.reg, RRows(rows))
+    b_say_rows(c, recv(rows))
+    b_read(c, buf, next, subs, 0)
   CPub(qname, body) ->
     # Nothing is waited for. The queue is given this connection's writer, and
     # the `+OK` is put there by whoever makes the message durable; this strand
@@ -206,6 +245,17 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     send(b_find(c.reg, qname), QNack(id, back))
     send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
     b_read(c, buf, next, subs, 0)
+
+# The count first, then the rows, so a client knows how many to read.
+fn b_say_rows(c: Conn, rows) =
+  send(c.out, w_queues_head(len(rows)))
+  b_say_each(c, rows)
+
+fn b_say_each(c: Conn, rows) = match rows
+  Nil -> 0
+  Cons(r, rest) ->
+    send(c.out, r)
+    b_say_each(c, rest)
 
 fn b_queues(t: Totals) = t.queues
 

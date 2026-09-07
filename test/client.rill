@@ -99,7 +99,7 @@ fn main() =
       0
     Ok(fd) -> run_all(fd, port)
 
-fn how_many() = 9
+fn how_many() = 10
 
 fn run_all(fd, port) =
   a = t_ping(fd, "")
@@ -110,7 +110,8 @@ fn run_all(fd, port) =
   f = t_deadline_puts_it_back(fd, e.rest)
   g = t_unknown_command_is_not_fatal(fd, f.rest)
   h = t_stats_counts(fd, g.rest)
-  n = a.passed + b.passed + c.passed + d.passed + e.passed + f.passed + g.passed + h.passed + t_a_lost_consumer_gives_it_back(port)
+  i = t_queues_breaks_it_down(fd, h.rest)
+  n = a.passed + b.passed + c.passed + d.passed + e.passed + f.passed + g.passed + h.passed + i.passed + t_a_lost_consumer_gives_it_back(port)
   c_say(fd, "QUIT" + crlf())
   sock_close(fd)
   println("")
@@ -186,6 +187,28 @@ fn t_stats_counts(fd, buf) =
   c_say(fd, "STATS" + crlf())
   b = c_next_line(fd, a.rest, 1000)
   check("stats answers with three numbers", bool_to_str(starts_with(c_line(b.reply), "+STATS ") && len(split(c_line(b.reply), " ")) == 4), "true", b.rest)
+
+# `STATS` says how much there is; `QUEUES` says whose. The row order is the
+# hash table's, so what is checked is the header and that both queues are in
+# there somewhere.
+fn t_queues_breaks_it_down(fd, buf) =
+  c_pub(fd, "t6", "one")
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "QUEUES" + crlf())
+  head = c_next_line(fd, a.rest, 1000)
+  rows = read_rows(fd, head.rest, count_in(c_line(head.reply)), "")
+  check("QUEUES says which queue is which", bool_to_str(starts_with(c_line(head.reply), "+QUEUES ") && contains(rows, "Q t6 1 0 0 1") && contains(rows, "Q t1 ")), "true", rows_rest(fd, head.rest, count_in(c_line(head.reply))))
+
+fn count_in(line) = str_to_int(unwrap_or(nth(split(line, " "), 1), "0"))
+
+fn read_rows(fd, buf, n, acc) =
+  if n <= 0 then acc
+  else
+    r = c_next_line(fd, buf, 1000)
+    read_rows(fd, r.rest, n - 1, acc + c_line(r.reply) + "|")
+
+fn rows_rest(fd, buf, n) =
+  if n <= 0 then buf else rows_rest(fd, c_next_line(fd, buf, 1000).rest, n - 1)
 
 # A consumer that goes away holding a message must not take it with it. Its own
 # two connections, because the whole point is that one of them ends.

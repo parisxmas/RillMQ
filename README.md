@@ -203,8 +203,26 @@ body is bytes; a Rill string is a byte string, so nothing cares what is in one.
 | `ACK <queue> <id>` | `+OK` |
 | `NACK <queue> <id>` | `+OK`, and the message comes straight back |
 | `STATS` | `+STATS <queues> <ready> <inflight>` |
+| `QUEUES` | `+QUEUES <n>`, then `n` rows of `Q <name> <ready> <inflight> <subs> <published>` |
 | `PING` | `+PONG` |
 | `QUIT` | `+OK`, then the socket closes |
+
+`STATS` says how much there is and `QUEUES` says whose, which is the question
+worth asking when something is wrong:
+
+```
+QUEUES
++QUEUES 2
+Q orders 0 2 1 2
+Q audit 1 0 0 1
+```
+
+The count comes first so a client knows how many rows to read. Asking every
+queue is the one slow thing the registry does, and the registry is on the path
+of every publish, so each ask has a fifth of a second to answer: a queue too
+busy to reply is reported as `Q <name> ? ? ? ?` rather than waited for. There
+is room for one late answer, so a queue that replies afterwards is not left
+stuck sending it.
 
 Anything refused answers `-ERR <what>`. A subscriber is pushed
 `MSG <id> <queue> <len>\r\n<body>` whenever the broker has something for it.
@@ -308,7 +326,7 @@ rill build test/client.rill -o rillmq-test
 rill build test/bench.rill  -o rillmq-bench
 
 ./rillmq 7700 ack=300 &      # no journal, a 300 ms ack deadline
-./rillmq-test 7700           # 9 checks
+./rillmq-test 7700           # 10 checks
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 15 checks, most of which stop the broker
@@ -319,7 +337,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All twenty-four pass against a `--parallel` build on four workers, and with or
+All twenty-five pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -340,5 +358,6 @@ without a journal.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.
-- **`STATS` is three numbers for the whole broker.** There is no way to ask
-  which queue is the one backing up.
+- **Nothing is measured over time.** `QUEUES` says what is true now; there is
+  no rate, no age of the oldest message, and no way to see how big a queue's
+  journal has grown.

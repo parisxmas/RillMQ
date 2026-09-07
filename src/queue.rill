@@ -38,7 +38,7 @@ type Q
   Q(name: Str, ready: Map(Int, Msg), head: Int, tail: Int, subs: List(Sub), inflight: Map(Int, Flight), turn: Int, next_id: Int, next_due: Int, held: Map(Int, Int), jr: Jr)
 
 type QCount
-  QCount(ready: Int, inflight: Int)
+  QCount(ready: Int, inflight: Int, subs: Int, published: Int)
 
 type QReq
   QPub(body: Str, out: Chan(Str))
@@ -271,7 +271,7 @@ fn q_handle_rest(q: Q, r) = match r
     send(reply, if map_has(q.inflight, id) then 1 else 0)
     q_requeue(q, id)
   QStat(reply) ->
-    send(reply, QCount(q.tail - q.head, #q.inflight))
+    send(reply, QCount(q.tail - q.head, #q.inflight, len(q.subs), q.next_id - 1))
     q
 
 # An acknowledged message is gone, and the credit it was using goes back.

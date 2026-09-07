@@ -12,6 +12,8 @@
 #   ACK <queue> <id>                ->  +OK
 #   NACK <queue> <id>               ->  +OK
 #   STATS                           ->  +STATS <queues> <ready> <inflight>
+#   QUEUES                          ->  +QUEUES <n>, then n rows of
+#                                       Q <name> <ready> <inflight> <subs> <published>
 #   PING                            ->  +PONG
 #   QUIT                            ->  closes
 #
@@ -31,6 +33,7 @@ type Cmd
   CAck(queue: Str, id: Int)
   CNack(queue: Str, id: Int)
   CStats
+  CQueues
   CPing
   CQuit
 
@@ -68,7 +71,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -126,6 +129,17 @@ fn w_ok_id(id) = "+OK " + int_to_str(id) + crlf()
 fn w_pong() = "+PONG" + crlf()
 
 fn w_err(why) = "-ERR " + why + crlf()
+
+# One line saying how many rows follow, then that many rows. A count in front
+# is what lets a client read the answer without having to guess where it ends.
+fn w_queues_head(n) = "+QUEUES " + int_to_str(n) + crlf()
+
+fn w_queue_row(name, ready, inflight, subs, published) =
+  "Q " + name + " " + int_to_str(ready) + " " + int_to_str(inflight) + " " + int_to_str(subs) + " " + int_to_str(published) + crlf()
+
+# A queue that did not answer in time. Not an error and not a hang: the queue
+# is busy, and saying so is better than making everybody wait for it.
+fn w_queue_busy(name) = "Q " + name + " ? ? ? ?" + crlf()
 
 fn w_stats(queues, ready, inflight) =
   "+STATS " + int_to_str(queues) + " " + int_to_str(ready) + " " + int_to_str(inflight) + crlf()
