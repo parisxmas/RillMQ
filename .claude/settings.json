@@ -13,15 +13,21 @@
       "Bash(dotnet build:*)",
       "Bash(dotnet run:*)",
       "Bash(dotnet restore:*)",
-      "Bash(rm -rf /tmp/r*)",
-      "Bash(rm -rf /tmp/n*)",
-      "Bash(rm -rf /tmp/c*)",
-      "Bash(rm -rf /tmp/f*)",
-      "Bash(rm -rf /tmp/s*)",
-      "Bash(rm -rf /tmp/a*)",
-      "Bash(rm -rf /tmp/b*)",
-      "Bash(rm -rf /tmp/d*)",
-      "Bash(rm -rf /tmp/e*)"
+      "Bash(rm -rf /tmp/*)",
+      "Bash(rm -r /tmp/*)",
+      "Bash(rm /tmp/*)",
+      "Bash(mkdir -p /tmp/*)",
+      "Bash(cat /tmp/*)",
+      "Bash(ls /tmp/*)",
+      "Bash(sh /tmp/*)",
+      "Bash(cp /tmp/*)",
+      "Bash(mv /tmp/*)",
+      "Bash(chmod /tmp/*)",
+      "Bash(wc /tmp/*)",
+      "Bash(od /tmp/*)",
+      "Bash(grep /tmp/*)",
+      "Bash(tail /tmp/*)",
+      "Bash(head /tmp/*)"
     ]
   }
 }
