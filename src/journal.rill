@@ -164,6 +164,11 @@ type JReq
   # accounted for in the snapshot, and everything after it lands in the new
   # one.
   JRewriteReq(recs: List(Str), name: Str)
+  # Something to say to a client that writes no record: a refusal. It goes
+  # through the journal rather than straight to the connection so that it
+  # keeps its place — a client pipelining three publishes, the middle one
+  # refused, must be answered in the order it asked.
+  JSay(reply: Chan(Str), value: Str)
 
 type JWait
   JWait(reply: Chan(Str), value: Str)
@@ -266,6 +271,7 @@ fn j_add(b: StrBuf, r, g: JBatch) = match r
   JNote(rec) ->
     b += rec
     JBatch(g.ws, g.pubs, g.acks + 1, g.todo)
+  JSay(reply, value) -> JBatch(Cons(JWait(reply, value), g.ws), g.pubs, g.acks, g.todo)
   JRewriteReq(recs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
 
 # In the order the records went in. `j_add` puts each on the front as it
@@ -375,6 +381,7 @@ fn j_cut(fd, upto) =
 fn j_rewrite(js: Js, c) = match c
   JPut(rec, reply, value) -> js
   JNote(rec) -> js
+  JSay(reply, value) -> js
   JRewriteReq(recs, name) ->
     tmp = js.path + ".new"
     nfd = file_open(tmp, "w")

@@ -73,6 +73,30 @@ fn q_prefetch() = if arg_count() > 4 then str_to_int(arg(4)) else 64
 # queue that is idle should cost nothing.
 fn q_idle_ms() = 30000
 
+# The broker's own weight, and what it will not go past.
+#
+# A queue with nobody reading it grows until the machine has no more to give,
+# and the process is killed. Nothing is lost when that happens — everything
+# answered for is in a journal — but the broker is down and has to read all of
+# it back, which is the worst moment for it to be doing that. So a publish is
+# refused once the process is holding more than it was told it could.
+#
+# The measurement is the process's own resident size rather than a count of
+# messages, because a count is not what runs out. It is taken every so often
+# rather than every time: asking the operating system how big you are costs
+# more than accepting a message does.
+fn q_max_bytes() = (if arg_count() > 5 then str_to_int(arg(5)) else 1024) * 1048576
+
+fn q_check_every() = 512
+
+# Carried alongside the queue rather than in it: whether the broker is over
+# its limit, and how long since that was last true or false for a reason.
+type Guard
+  Guard(full: Bool, since: Int)
+
+fn q_look(g: Guard) =
+  if g.since < q_check_every() then Guard(g.full, g.since + 1) else Guard(rss_bytes() > q_max_bytes(), 0)
+
 fn q_new(name, jr) = Q(name, map_new(), 0, 0, Nil, map_new(), 0, 1, 0, map_new(), jr)
 
 # What a publisher can have waiting on the disk at once. A backlog rather than
@@ -121,15 +145,17 @@ fn q_seed(q: Q, live: Map(Int, Str), ids) = match ids
       q.ready[q.tail] = Msg(id, body)
       q_seed(Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr), live, rest)
 
-fn q_loop(q: Q, inbox, done) =
+fn q_loop(q: Q, inbox, done) = q_turn(q, inbox, done, Guard(false, 0))
+
+fn q_turn(q: Q, inbox, done, g: Guard) =
   step = select
-    r = recv(inbox) -> Some(q_pump(q_handle(q, r)))
+    r = recv(inbox) -> Some(q_pump(q_handle(q, r, g.full)))
     recv(q.jr.want) -> Some(q_hand_over(q))
     recv(done) -> None
     timeout(q_wait_ms(q)) -> Some(q_pump(q_sweep(q)))
   match step
     None -> 0
-    Some(next) -> q_loop(next, inbox, done)
+    Some(next) -> q_turn(next, inbox, done, q_look(g))
 
 # The journal has decided that most of what it is holding has been
 # acknowledged, and has asked for the queue as it stands. This is the only
@@ -190,7 +216,23 @@ fn q_soonest(m: Map(Int, Flight), ks, best) = match ks
 
 # -- what a request does --------------------------------------------------------
 
-fn q_handle(q: Q, r) = match r
+fn q_handle(q: Q, r, full) = match r
+  QPub(body, out) -> if full then q_refuse(q, out) else q_accept(q, body, out)
+  QSub(s, reply) -> q_handle_rest(q, r)
+  QUnsub(sub_id, reply) -> q_handle_rest(q, r)
+  QAck(id, reply) -> q_handle_rest(q, r)
+  QNack(id, reply) -> q_handle_rest(q, r)
+  QStat(reply) -> q_handle_rest(q, r)
+
+# The refusal goes down the journal's channel with everything else, so that it
+# arrives in the place the client asked for it. Nothing is written.
+fn q_refuse(q: Q, out) =
+  send(q.jr.puts, JSay(out, w_err("broker is holding all it was told it could")))
+  q
+
+fn q_accept(q: Q, body, out) = q_handle_rest(q, QPub(body, out))
+
+fn q_handle_rest(q: Q, r) = match r
   QPub(body, out) ->
     id = q.next_id
     # The message is ready at once, and the `+OK` is written by the journal

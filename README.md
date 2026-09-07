@@ -101,6 +101,38 @@ however many the publisher had sent at once — four hundred a second, with a
 batch size of one. The queue is handed the connection's writer instead, and the
 `+OK` is written by whoever makes the message durable.
 
+## What stops it filling the machine
+
+A queue with nobody reading it grows until the machine has no more to give and
+the process is killed. Nothing is lost when that happens — everything answered
+for is in a journal — but the broker is down and has to read all of it back,
+which is the worst moment to be doing that.
+
+So a publish is refused once the process is holding more than it was told it
+could. The measurement is the broker's own resident size rather than a count of
+messages, because a count is not what runs out and because it is global by
+construction: one queue or a thousand, the number is the number. It is taken
+every five hundred and twelve requests rather than every one, since asking the
+operating system how big you are costs more than accepting a message does — so
+the limit is soft by about that many messages, which at a hundred and sixty-four
+bytes each is under a hundred kilobytes of overshoot.
+
+```
+$ ./rillmq 6789 data 5000 64 512      # ... and 512 MB
+PUB busy 5
+hello
+-ERR broker is holding all it was told it could
+```
+
+The refusal goes down the journal's channel with everything else rather than
+straight back to the connection. A client that pipelines three publishes and
+has the middle one refused must be answered in the order it asked, and that
+ordering is what the one channel gives.
+
+Three floods of two hundred thousand messages at a thirty megabyte limit leave
+the broker at thirty-one megabytes with a hundred and ninety-seven thousand
+messages held. It does not grow.
+
 ## Rewriting a journal
 
 A journal grows by one record per publish and one per acknowledgement, so a
@@ -203,8 +235,8 @@ rather than for the cache.
 
 | | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 85,000/sec | 209,000/sec |
-| deliver and acknowledge | 138,000/sec | 165,000/sec |
+| publish | 85,000/sec | 184,000/sec |
+| deliver and acknowledge | 141,000/sec | 140,000/sec |
 
 Delivery is slower with a journal than without because draining a queue is
 what makes its journal worth rewriting, so the rewrite happens during the
@@ -223,13 +255,24 @@ stops being able to write and therefore stops reading, and the client is still
 writing. `test/bench.rill` writes a thousand and reads a thousand, which is
 what every pipelining client does and for this reason.
 
-Memory with messages actually queued is the honest weak spot: about 600 to 900
-bytes per 64-byte message while a large queue is draining. A message is a boxed
-record holding a counted string, in a hash table that grows by doubling and
-keeps a tombstone for every entry taken out, and the frame handed to each
-subscriber is built fresh. A ring buffer over one allocation would be a
-different order of magnitude, and Rill does not have a growable array of
-arbitrary values to build one from yet.
+Two hundred thousand 64-byte messages sitting in a queue cost 31 MB, which is
+**164 bytes a message**: the sixty-four of body, a hash table entry, a boxed
+record and a counted string, each rounded up by the allocator.
+
+That number was six hundred to nine hundred until this broker was measured
+carefully, and the difference was not in the broker. A `select` arm that bound
+a value and only read it never released it, so every message left seventeen
+allocations behind. It is a Rill bug and it is fixed there; twenty thousand
+messages published, delivered and acknowledged now leave two allocations at
+exit rather than three hundred and forty thousand. Writing a broker turns out
+to be a good way to find one.
+
+An acknowledged message is freed the moment the acknowledgement is handled —
+out of the ready table on delivery, out of the in-flight table on the `ACK`,
+and that is the last reference, so reference counting takes it there and then.
+Publishing two hundred thousand, acknowledging all of them and publishing two
+hundred thousand more leaves the broker exactly where the first two hundred
+thousand had it.
 
 ## Running the tests
 
@@ -245,7 +288,7 @@ rill build test/bench.rill  -o rillmq-bench
 sh test/persistence.sh       # 12 checks, each of which stops the broker
 ```
 
-`rillmq <port> [dir|-] [ack_ms] [prefetch]`. The test client has its own parser
+`rillmq <port> [dir|-] [ack_ms] [prefetch] [max_mb]`. The test client has its own parser
 rather than the broker's, because a wire format that only ever reads itself has
 not been tested. The persistence checks are a shell script because they need
 the broker itself to end, including once by `kill -9` and once with half a
@@ -269,5 +312,11 @@ without a journal.
   own.
 - **No exchanges, routing keys or topics.** One queue, by name, fanning out to
   competing consumers.
-- **No flow control back to publishers.** A publisher can fill memory faster
-  than consumers drain it, and nothing stops it.
+- **No flow control back to publishers, only a wall.** A publisher that
+  outruns its consumers is refused rather than slowed, so it finds out by
+  being told no rather than by being made to wait.
+- **No idle deadline on a connection.** A client that opens a socket and says
+  nothing holds a strand and a descriptor for as long as it likes, and nothing
+  counts how many of those there are.
+- **`STATS` is three numbers for the whole broker.** There is no way to ask
+  which queue is the one backing up.
