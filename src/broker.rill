@@ -23,6 +23,10 @@ type RReq
   RExchange(name: Str, kind: Str, quiet: Bool, reply: Chan(Chan(XReq)))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
+  # The journal of a queue this node does not hold and is keeping a copy of.
+  # It is the same file that queue would have here, so promoting the copy is
+  # starting a queue from a journal that is already in place.
+  RCopy(name: Str, reply: Chan(Jr))
 
 type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
@@ -51,17 +55,17 @@ type Conn
 fn r_run(dir, inbox, done) =
   jr = Jr(channel(256), channel(1))
   if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
-  r_loop(map_new(), map_new(), dir, Cons(jr, Nil), inbox, done)
+  r_loop(map_new(), map_new(), map_new(), dir, Cons(jr, Nil), inbox, done)
 
-fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, jr, inbox, done) =
+fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), dir, jr, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(r_handle(qs, xs, dir, jr, r, done))
+    r = recv(inbox) -> Some(r_handle(qs, xs, cs, dir, jr, r, done))
     recv(done) -> None
   match step
     None -> 0
-    Some(_) -> r_loop(qs, xs, dir, jr, inbox, done)
+    Some(_) -> r_loop(qs, xs, cs, dir, jr, inbox, done)
 
-fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, jr, r, done) = match r
+fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), dir, jr, r, done) = match r
   RFind(name, reply) ->
     send(reply, r_queue(qs, dir, name, done))
     0
@@ -73,6 +77,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), dir, jr, r, done
     0
   RRows(reply) ->
     send(reply, r_rows(qs, map_keys(qs), Nil))
+    0
+  RCopy(name, reply) ->
+    send(reply, r_copy(cs, dir, name, done))
     0
 
 fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, done) = match xs[name]
@@ -88,6 +95,14 @@ fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, done) =
   if quiet then 0 else r_note_x(jr, name, kind)
   xs[name] = ch
   ch
+
+fn r_copy(cs: Map(Str, Jr), dir, name, done) = match cs[name]
+  Some(j) -> j
+  None ->
+    j = Jr(channel(256), channel(1))
+    if str_len(dir) == 0 then spawn j_run_memory(j, done) else spawn j_run(dir + "/" + j_file(name), j, done)
+    cs[name] = j
+    j
 
 fn r_note_x(jr: Jr, name, kind) =
   send(jr.puts, JNote(rt_x_record(name, kind)))
@@ -111,7 +126,14 @@ fn r_queue(qs: Map(Str, Chan(QReq)), dir, name, done) = match qs[name]
     ch
 
 fn r_start(name, dir, ch, done, peers) =
-  if len(peers) <= 1 || cl_owner(name, len(peers)) == cl_me() then spawn q_run(name, dir, ch, done) else r_stand_in(name, ch, done, nth(peers, cl_owner(name, len(peers))))
+  if len(peers) <= 1 then spawn q_run(name, dir, ch, done) else if cl_owner(name, len(peers)) == cl_me() then r_hold(name, dir, ch, done, peers) else r_stand_in(name, ch, done, nth(peers, cl_owner(name, len(peers))))
+
+# The node after this one keeps the copy. Which one that is has to be worked
+# out the same way by everybody and never asked about, exactly as ownership is,
+# so it is the next place in the list and wraps round at the end.
+fn r_hold(name, dir, ch, done, peers) = match nth(peers, cl_backup(name, len(peers)))
+  None -> spawn q_run(name, dir, ch, done)
+  Some(p) -> spawn q_run_copied(name, dir, cl_host(p), cl_port(p), ch, done)
 
 fn r_stand_in(name, ch, done, where) = match where
   None -> spawn q_run(name, "", ch, done)
@@ -280,6 +302,11 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
   CXPub(ex, key, body) ->
     send(b_exchange(c, ex, x_direct()), XPub(key, body, c.out))
     b_read(c, buf, next, subs, 0)
+  CRepl(qname, bytes) ->
+    back = channel(1)
+    send(c.reg, RCopy(qname, back))
+    send(r_puts(recv(back)), JPut(bytes, c.out, OFrame(w_ok())))
+    b_read(c, buf, next, subs, 0)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))
     send(c.out, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st))))
@@ -338,6 +365,8 @@ fn b_queues(t: Totals) = t.queues
 fn b_ready(t: Totals) = t.ready
 
 fn b_inflight(t: Totals) = t.inflight
+
+fn r_puts(j: Jr) = j.puts
 
 fn q_count_of(ch) =
   back = channel(1)

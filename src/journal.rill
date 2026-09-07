@@ -182,10 +182,17 @@ type JWait
 type Jr
   Jr(puts: Chan(JReq), want: Chan(Int))
 
+# Where a journal lives, and who else is to have a copy of it.
+type Jspec
+  Jspec(name: Str, path: Str, host: Str, port: Int)
+
 # The journal's own state. One record rather than five parameters, because the
 # loop is a tail call and past six arguments a tail call stops being a jump.
+# `link` is the socket to the node keeping a copy, or -1 for a queue that has
+# only this one; `spill` is whatever came back on that link past the answer
+# being read.
 type Js
-  Js(fd: Int, path: Str, pubs: Int, acks: Int)
+  Js(fd: Int, path: Str, pubs: Int, acks: Int, name: Str, link: Int, spill: Str)
 
 # What a batch turned out to contain. `todo` is empty, or holds the one
 # rewrite the batch ended on.
@@ -209,9 +216,22 @@ fn j_compact_floor() = 4096
 fn j_worth_rewriting(js: Js) =
   js.pubs + js.acks >= j_compact_floor() && js.acks * 5 > js.pubs * 3
 
-fn j_run(path, jr: Jr, done) =
-  fd = file_open(path, "a")
-  if fd < 0 then j_cannot(path, jr, done) else j_loop(Js(fd, path, 0, 0), jr, done)
+fn j_run(path, jr: Jr, done) = j_run_spec(Jspec("", path, "", 0), jr, done)
+
+fn j_run_spec(spec: Jspec, jr: Jr, done) =
+  fd = file_open(spec.path, "a")
+  if fd < 0 then j_cannot(spec.path, jr, done) else j_loop(Js(fd, spec.path, 0, 0, spec.name, j_link(spec), ""), jr, done)
+
+# The link to whoever is keeping a copy, opened once. A queue whose copy cannot
+# be reached keeps running and stops being copied, and says so — the
+# alternative is a queue that will not take a message because a machine
+# somewhere else is down, which is worse than a queue with one copy of itself.
+fn j_link(spec: Jspec) =
+  if str_len(spec.host) == 0 then -1 else match connect_to(spec.host, spec.port)
+    Err(e) ->
+      println("rillmq: no copy of " + spec.name + " being kept: " + e)
+      -1
+    Ok(fd) -> fd
 
 fn j_cannot(path, jr: Jr, done) =
   println("rillmq: cannot write " + path + ", this queue is memory only")
@@ -231,10 +251,38 @@ fn j_loop(js: Js, jr: Jr, done) =
 fn j_commit(js: Js, jr: Jr, r) =
   b = strbuf()
   g = j_gather(b, jr, j_add(b, r, JBatch(Nil, 0, 0, Nil)), j_batch())
-  file_write(js.fd, strbuf_str(b))
+  bytes = strbuf_str(b)
+  file_write(js.fd, bytes)
   file_sync(js.fd)
+  # The same bytes go to whoever is keeping a copy, and nobody is told the
+  # message is safe until they are on both disks. One batch is one message on
+  # the wire and one wait, however many records are in it, which is what makes
+  # this cost a round trip a batch rather than a round trip a publish.
+  after = j_copy(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks, js.name, js.link, js.spill), bytes)
   j_tell_all(g.ws)
-  j_maybe_ask(j_do_todo(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks), g.todo), jr)
+  j_maybe_ask(j_do_todo(after, g.todo), jr)
+
+fn j_copy(js: Js, bytes) =
+  if js.link < 0 then js
+  else
+    sock_write(js.link, "REPL " + js.name + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes)
+    j_heard(js)
+
+# One line back, and whatever came with it kept for next time. A link that has
+# gone is a link this queue stops having: it says so once and carries on with
+# the copy it can still write, which is its own.
+fn j_heard(js: Js) =
+  at = str_find(js.spill, "\r\n")
+  if at >= 0 then Js(js.fd, js.path, js.pubs, js.acks, js.name, js.link, js.spill[at + 2:]) else j_hear_more(js)
+
+fn j_hear_more(js: Js) =
+  more = sock_read(js.link)
+  if str_len(more) == 0 then j_link_gone(js) else j_heard(Js(js.fd, js.path, js.pubs, js.acks, js.name, js.link, js.spill + more))
+
+fn j_link_gone(js: Js) =
+  println("rillmq: the copy of " + js.name + " is no longer being kept")
+  sock_close(js.link)
+  Js(js.fd, js.path, js.pubs, js.acks, js.name, -1, "")
 
 fn j_do_todo(js: Js, todo) = match todo
   Nil -> js
@@ -407,10 +455,10 @@ fn j_swap(js: Js, tmp, n) =
 # running and stops being durable, which is worth saying out loud.
 fn j_reopened(js: Js, n) =
   fd = file_open(js.path, "a")
-  if fd >= 0 then Js(fd, js.path, n, 0)
+  if fd >= 0 then Js(fd, js.path, n, 0, js.name, js.link, js.spill)
   else
     println("rillmq: lost " + js.path + " while rewriting it")
-    Js(fd, js.path, n, 0)
+    Js(fd, js.path, n, 0, js.name, js.link, js.spill)
 
 # In chunks rather than one string. A queue holding a million messages would
 # otherwise be asked for a hundred megabytes of contiguous bytes to write a

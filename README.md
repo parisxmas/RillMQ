@@ -223,12 +223,44 @@ A node whose peer cannot be reached still answers, because a publisher that
 names a queue on a dead node must be told something rather than wait for ever.
 It says `-ERR the node holding that queue cannot be reached`.
 
-**This is sharding, not replication.** A node going down takes its queues with
-it until it comes back — and it does come back with them, because each node
-has its own journal. What it does not have is a copy of anybody else's, so
-there is no failover and no quorum. That is the next thing and it is a
-different order of problem: replication needs agreement, and agreement needs
-Raft or something like it.
+### The copy
+
+A queue's records are on two nodes, not one. The node after the owner in the
+list keeps the copy — worked out the same way by everybody and never asked
+about, exactly as ownership is — and **a publish is not confirmed until it is
+on both disks**.
+
+What travels is the journal batch itself: the same bytes the leader just
+wrote, with the same checksums, appended by the other node to the file that
+queue would have if it held it. So the two files are identical, and promoting
+a copy is nothing more than starting a queue from a journal that is already
+there. One batch is one message on the wire and one wait, however many records
+are in it, which is what makes this cost a round trip a batch rather than a
+round trip a publish.
+
+A queue whose copy cannot be reached keeps running and stops being copied, and
+says so. The alternative is a queue that will not take a message because a
+machine somewhere else is down, which is worse than a queue with one copy of
+itself.
+
+A queue whose *owner* cannot be reached is a different matter, and is answered
+rather than left waiting:
+
+```
+PUB alpha 4
+down
+-ERR the node holding that queue cannot be reached
+```
+
+The node keeps trying, about once a second, and picks up again the moment the
+owner is back — with the subscriptions asked for again, because the far end
+has no memory of them.
+
+**There is no failover.** The copy exists and nothing promotes it. Deciding
+that a node is gone, rather than slow, is the problem consensus exists to
+solve, and doing it without consensus is how two nodes end up both believing
+they own the same queue. What the copy buys today is that a node's disk dying
+is not a queue dying.
 
 ## Routing
 
@@ -496,7 +528,7 @@ rill build test/bench.rill  -o rillmq-bench
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
 sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
-sh test/cluster.sh           # 3 checks across two nodes
+sh test/cluster.sh           # 6 checks across two nodes
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -507,7 +539,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All forty-five pass against a `--parallel` build on four workers, and with or
+All forty-eight pass against a `--parallel` build on four workers, and with or
 without a journal.
 
 ## What it deliberately is not, yet
@@ -519,9 +551,12 @@ without a journal.
 - **A rewrite holds the whole live queue as records at once.** The queue builds
   them and hands them over as a list, which for a large queue is a second copy
   of it in memory for as long as the write takes.
-- **Sharding, not replication.** A node going down takes its queues with it
-  until it comes back. There is no copy anywhere else, no failover and no
-  quorum.
+- **No failover.** Every queue's records are on two nodes, and nothing
+  promotes the copy. Deciding a node is gone rather than slow is what
+  consensus is for, and there is none here.
+- **A copy is a file, not a queue.** The node keeping it does not serve it,
+  count it, or list it. Making it serve is a restart with a different
+  `peers`.
 - **A cluster is a list, not a membership.** Peers are given on the command
   line, in the same order on every node, and nothing joins or leaves while it
   is running. Peers are addresses, because Rill's sockets have no name

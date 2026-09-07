@@ -30,6 +30,13 @@ fn cl_owner(name, n) =
 # `peers=host:port,host:port` and `node=<i>`, the same list on every node and
 # each one's own place in it. Nothing is discovered and nothing is negotiated,
 # which is the smallest cluster that can be correct.
+# Where the copy lives: the place after the owner, wrapping round. Two nodes
+# means each keeps the other's copies; more makes a ring. It is worked out the
+# same way by everybody and never asked about, exactly as ownership is.
+fn cl_backup(name, n) = if n <= 1 then 0 else cl_next(cl_owner(name, n) + 1, n)
+
+fn cl_next(i, n) = if i >= n then i - n else i
+
 fn cl_peers() = cl_parse(split(opt("peers", ""), ","), Nil)
 
 fn cl_parse(parts, acc) = match parts
@@ -57,7 +64,7 @@ type Waiting
   WStat(reply: Chan(QCount))
 
 type P
-  P(name: Str, fd: Int, subs: List(Sub), waits: Map(Int, Waiting), head: Int, tail: Int)
+  P(name: Str, fd: Int, subs: List(Sub), waits: Map(Int, Waiting), head: Int, tail: Int, host: Str, port: Int, tried: Int)
 
 # What reaches the proxy.
 type PIn
@@ -68,15 +75,31 @@ type PIn
 
 fn crlf2() = "\r\n"
 
-fn cl_proxy(name, host, port, inbox, done) = match connect_to(host, port)
-  Err(e) ->
-    println("rillmq: no link to " + host + ":" + int_to_str(port) + " for queue " + name)
-    cl_refuse(name, inbox, done)
+# A proxy is made whether or not the far end is there. A node that is down when
+# this queue is first named is a node that may be up in a moment, and a queue
+# that gave up at that instant would stay given up for the life of the broker.
+fn cl_proxy(name, host, port, inbox, done) =
+  ses = channel(256)
+  spawn cl_relay(inbox, ses)
+  cl_start(P(name, -1, Nil, map_new(), 0, 0, host, port, 0), ses, done)
+
+fn cl_start(p: P, ses, done) = match connect_to(p.host, p.port)
+  Err(e) -> cl_loop(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis()), ses, done)
   Ok(fd) ->
-    ses = channel(256)
-    spawn cl_relay(inbox, ses)
-    spawn cl_link(fd, ses, "", name)
-    cl_loop(P(name, fd, Nil, map_new(), 0, 0), ses, done)
+    spawn cl_link(fd, ses, "", p.name)
+    cl_resub(P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0), ses, done)
+
+# The far end has no memory of this node's subscribers, so they are asked for
+# again. Everything that was in flight over there has already come back to its
+# queue: the connection carrying it is the one that just went.
+fn cl_resub(p: P, ses, done) =
+  if len(p.subs) > 0 then cl_send(p, "SUB " + p.name + crlf2()) else 0
+  cl_loop(p, ses, done)
+
+# How often a queue whose node is down tries it again. Often enough that a node
+# coming back is usable in a moment; rarely enough that a node that is not
+# coming back costs a connection attempt per second and not per message.
+fn cl_retry_ms() = 1000
 
 # A queue whose node cannot be reached still has to answer, or every publisher
 # that names it waits for ever. It says no.
@@ -161,20 +184,56 @@ fn cl_loop(p: P, ses, done) =
     Some(m) -> cl_step(p, ses, done, m)
 
 fn cl_step(p: P, ses, done, m) = match m
-  PDown ->
-    sock_close(p.fd)
-    0
-  PReq(r) -> cl_loop(cl_ask(p, r), ses, done)
+  PDown -> cl_lost(p, ses, done)
+  PReq(r) -> cl_loop(cl_asked(p, r, ses, done), ses, done)
   PLine(line) -> cl_loop(cl_answer(p, line), ses, done)
   PBody(id, body) -> cl_loop(cl_hand_on(p, id, body), ses, done)
 
 fn cl_send(p: P, text) =
-  sock_write(p.fd, text)
+  if p.fd < 0 then 0 else cl_write(p.fd, text)
+
+fn cl_write(fd, text) =
+  sock_write(fd, text)
   0
+
+# The link has gone. Everything that was waiting on it is told so — a publisher
+# left waiting for a node that is not coming back is worse than one told no —
+# and the proxy stays, refusing and retrying, because the node may return.
+fn cl_lost(p: P, ses, done) =
+  sock_close(p.fd)
+  cl_fail_all(p, p.head)
+  cl_loop(P(p.name, -1, p.subs, map_new(), 0, 0, p.host, p.port, now_millis()), ses, done)
+
+fn cl_fail_all(p: P, at) =
+  if at >= p.tail then 0
+  else
+    cl_fail_one(p.waits[at], p.name)
+    cl_fail_all(p, at + 1)
+
+fn cl_fail_one(w, name) = match w
+  None -> 0
+  Some(x) -> cl_give(x, "-ERR the node holding that queue cannot be reached", name)
+
+# A request arriving while the link is down is the moment to try the node
+# again, so long as the last try was not a moment ago.
+fn cl_asked(p: P, r, ses, done) =
+  if p.fd >= 0 then cl_ask(p, r) else if now_millis() - p.tried < cl_retry_ms() then cl_no(p, r) else cl_try_again(p, r, ses)
+
+fn cl_no(p: P, r) =
+  cl_say_no(r)
+  p
+
+fn cl_try_again(p: P, r, ses) = match connect_to(p.host, p.port)
+  Err(e) -> cl_no(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis()), r)
+  Ok(fd) ->
+    spawn cl_link(fd, ses, "", p.name)
+    back = P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0)
+    if len(back.subs) > 0 then cl_send(back, "SUB " + back.name + crlf2()) else 0
+    cl_ask(back, r)
 
 fn cl_wait(p: P, w) =
   p.waits[p.tail] = w
-  P(p.name, p.fd, p.subs, p.waits, p.head, p.tail + 1)
+  P(p.name, p.fd, p.subs, p.waits, p.head, p.tail + 1, p.host, p.port, p.tried)
 
 # What the queue would have done, said down the link instead. Everything that
 # expects an answer leaves a note of what to do with it.
@@ -185,7 +244,7 @@ fn cl_ask(p: P, r) = match r
   QSub(s, reply) ->
     cl_send(p, "SUB " + p.name + crlf2())
     send(reply, 1)
-    P(p.name, p.fd, append(p.subs, Cons(s, Nil)), p.waits, p.head, p.tail)
+    P(p.name, p.fd, append(p.subs, Cons(s, Nil)), p.waits, p.head, p.tail, p.host, p.port, p.tried)
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     cl_unsub(p, sub_id)
@@ -203,10 +262,10 @@ fn cl_ask(p: P, r) = match r
 # stops sending: this node has nobody to give a message to.
 fn cl_unsub(p: P, sub_id) =
   left = cl_without(p.subs, sub_id)
-  if len(left) > 0 then P(p.name, p.fd, left, p.waits, p.head, p.tail)
+  if len(left) > 0 then P(p.name, p.fd, left, p.waits, p.head, p.tail, p.host, p.port, p.tried)
   else
     cl_send(p, "UNSUB " + p.name + crlf2())
-    P(p.name, p.fd, left, p.waits, p.head, p.tail + 0)
+    P(p.name, p.fd, left, p.waits, p.head, p.tail, p.host, p.port, p.tried)
 
 fn cl_without(subs, sub_id) = match subs
   Nil -> Nil
@@ -219,7 +278,7 @@ fn cl_answer(p: P, line) = match p.waits[p.head]
   Some(w) ->
     cl_give(w, line, p.name)
     map_del(p.waits, p.head)
-    P(p.name, p.fd, p.subs, p.waits, p.head + 1, p.tail)
+    P(p.name, p.fd, p.subs, p.waits, p.head + 1, p.tail, p.host, p.port, p.tried)
 
 fn cl_give(w, line, name) = match w
   WPub(out) ->
@@ -245,7 +304,7 @@ fn cl_hand_on(p: P, id, body) = cl_offer(p, id, body, p.subs)
 fn cl_offer(p: P, id, body, left) = match left
   Nil -> p
   Cons(s, rest) ->
-    if cl_try(q_sub_out(s), ODeliver(p.name, id, body)) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail) else cl_offer(p, id, body, rest)
+    if cl_try(q_sub_out(s), ODeliver(p.name, id, body)) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried) else cl_offer(p, id, body, rest)
 
 fn cl_try(out, what) =
   ok = select

@@ -65,6 +65,40 @@ sub.close()
 ")
 say "and an acknowledgement goes back the same way" "$ACKED" "+OK"
 
+# -- the copy, and what happens when a node goes ------------------------------------
+
+# Whatever node holds `alpha`, the other one keeps a copy of its journal, and
+# the copy is the same bytes: it is the records as they were written, sent on.
+sleep 1
+SAME=$(cmp -s "$DIR/a/alpha.log" "$DIR/b/alpha.log" && echo same || echo different)
+say "both nodes hold the same journal for a queue" "$SAME" "same"
+
+# A publisher whose queue is on a node that has gone is told so rather than
+# left waiting, and the queue works again when the node comes back.
+kill -9 "$NB" 2>/dev/null
+wait "$NB" 2>/dev/null
+sleep 2
+OUT=$(python3 -c "
+import socket
+s = socket.create_connection(('127.0.0.1', $A)); s.settimeout(6)
+s.sendall(b'PUB alpha 4\r\ndown')
+try: print(s.recv(200).decode().strip())
+except Exception: print('(no answer)')
+")
+say "a queue whose node has gone says so" "$OUT" "-ERR the node holding that queue cannot be reached"
+
+./rillmq "$B" "dir=$DIR/b" node=1 "peers=$PEERS" >/dev/null 2>&1 &
+NB=$!
+sleep 2
+BACK=$(python3 -c "
+import socket
+s = socket.create_connection(('127.0.0.1', $A)); s.settimeout(6)
+s.sendall(b'PUB alpha 4\r\nback')
+try: print(s.recv(200).decode().strip()[:3])
+except Exception: print('(no answer)')
+")
+say "and works again when it comes back" "$BACK" "+OK"
+
 kill -TERM "$NA" "$NB" 2>/dev/null
 wait "$NA" "$NB" 2>/dev/null
 rm -rf "$DIR"

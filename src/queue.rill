@@ -112,17 +112,25 @@ fn q_journal_backlog() = 4096
 # durable; without one the journal strand is the same shape with no file
 # behind it, and the queue starts empty.
 fn q_run(name, dir, inbox, done) =
+  q_run_where(name, dir, Jspec(name, dir + "/" + j_file(name), "", 0), inbox, done)
+
+# The same queue, told where its copy is to be kept. A queue with nowhere to
+# keep one is the ordinary single-node case and is what `q_run` asks for.
+fn q_run_copied(name, dir, host, port, inbox, done) =
+  q_run_where(name, dir, Jspec(name, dir + "/" + j_file(name), host, port), inbox, done)
+
+fn q_run_where(name, dir, spec: Jspec, inbox, done) =
   jr = Jr(channel(q_journal_backlog()), channel(1))
-  if str_len(dir) == 0 then q_run_memory(name, jr, inbox, done) else q_run_durable(name, dir + "/" + j_file(name), jr, inbox, done)
+  if str_len(dir) == 0 then q_run_memory(name, jr, inbox, done) else q_run_durable(name, spec, jr, inbox, done)
 
 fn q_run_memory(name, jr, inbox, done) =
   spawn j_run_memory(jr, done)
   q_loop(q_new(name, jr), inbox, done)
 
-fn q_run_durable(name, path, jr, inbox, done) =
-  r = j_replay(path)
-  j_trim(path, r.upto)
-  spawn j_run(path, jr, done)
+fn q_run_durable(name, spec: Jspec, jr, inbox, done) =
+  r = j_replay(spec.path)
+  j_trim(spec.path, r.upto)
+  spawn j_run_spec(spec, jr, done)
   q_name_it(name, r, jr)
   q_loop(q_from(name, r, jr), inbox, done)
 

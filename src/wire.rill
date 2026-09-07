@@ -16,6 +16,7 @@
 #   XPUB <exchange> <key> <len>\r\n<body>  ->  +OK
 #   STATS                           ->  +STATS <queues> <ready> <inflight>
 #   QSTAT <queue>                   ->  +QSTAT <ready> <inflight> <subs> <published>
+#   REPL <queue> <len>\r\n<records> ->  +OK      one node's journal, to its copy
 #   QUEUES                          ->  +QUEUES <n>, then n rows of
 #                                       Q <name> <ready> <inflight> <subs> <published>
 #   PING                            ->  +PONG
@@ -39,6 +40,7 @@ type Cmd
   CStats
   CQueues
   CQStat(queue: Str)
+  CRepl(queue: Str, bytes: Str)
   CXDecl(exchange: Str, kind: Str)
   CBind(exchange: Str, queue: Str, key: Str)
   CXPub(exchange: Str, key: Str, body: Str)
@@ -79,7 +81,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -114,6 +116,16 @@ fn w_nack(parts, rest) =
 fn w_qstat(parts, rest) =
   name = w_name(parts)
   if str_len(name) == 0 then Bad("a queue name is wanted", rest, false) else Got(CQStat(name), rest)
+
+# `REPL <queue> <len>` is one node handing another the journal records it has
+# just written, exactly as it wrote them — the same bytes, the same checksums.
+# The far end appends them to the file that queue would have if it were the
+# one holding it, which is what makes promoting a copy nothing more than
+# starting a queue from a journal that is already there.
+fn w_take_repl(buf, parts, at) =
+  queue = w_name(parts)
+  len = str_to_int(w_second(parts))
+  if str_len(queue) == 0 || len < 0 then Bad("a queue and a length are wanted", at, false) else if len > w_most_body() then Bad("batch too long", 0, true) else if str_len(buf) - at < len then Need else Got(CRepl(queue, buf[at:at + len]), at + len)
 
 fn w_qstat_line(ready, inflight, subs, published) =
   "+QSTAT " + int_to_str(ready) + " " + int_to_str(inflight) + " " + int_to_str(subs) + " " + int_to_str(published) + crlf()
