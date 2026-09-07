@@ -1,0 +1,210 @@
+# The registry, and what a connection is.
+#
+# Two more kinds of strand. One registry, which is the only thing that knows
+# what queues exist and hands out their channels; and two per connection — a
+# reader that takes commands off the socket and a writer that puts frames on
+# it. Two rather than one because a subscriber is being pushed messages at the
+# same time as it is sending commands, and one strand cannot be parked on a
+# socket read and a channel receive at once.
+#
+# Only the writer writes. That is what makes the socket safe without a lock:
+# it is one strand's, exactly as a queue's messages are one strand's.
+import "queue"
+
+type RReq
+  RFind(name: Str, reply: Chan(Chan(QReq)))
+  RTotals(reply: Chan(Totals))
+
+type Totals
+  Totals(queues: Int, ready: Int, inflight: Int)
+
+# What the writer strand is told to do next.
+type Frame
+  Send(text: Str)
+  Shutdown
+
+# Everything about a connection that does not change while it is up, in one
+# value. It is one record rather than five parameters because the reader is a
+# loop, and a loop in Rill is a tail call: past six arguments they spill to the
+# stack and the call stops being a jump, so a connection that handled enough
+# commands would run out of stack. The compiler says so, by name, at the call
+# it cannot promise.
+type Conn
+  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Str))
+
+# -- the registry ---------------------------------------------------------------
+
+# A queue is made the first time it is named, by a publisher or a subscriber
+# alike. There is no declare step, which is the one thing about AMQP that
+# nobody has ever been glad of.
+fn r_run(inbox, done) = r_loop(map_new(), inbox, done)
+
+fn r_loop(qs: Map(Str, Chan(QReq)), inbox, done) =
+  step = select
+    r = recv(inbox) -> Some(r_handle(qs, r, done))
+    recv(done) -> None
+  match step
+    None -> 0
+    Some(_) -> r_loop(qs, inbox, done)
+
+fn r_handle(qs: Map(Str, Chan(QReq)), r, done) = match r
+  RFind(name, reply) ->
+    send(reply, r_queue(qs, name, done))
+    0
+  RTotals(reply) ->
+    send(reply, r_totals(qs, map_keys(qs), 0, 0))
+    0
+
+fn r_queue(qs: Map(Str, Chan(QReq)), name, done) = match qs[name]
+  Some(ch) -> ch
+  None ->
+    ch = channel()
+    spawn q_run(name, ch, done)
+    qs[name] = ch
+    ch
+
+fn r_totals(qs: Map(Str, Chan(QReq)), ks, ready, inflight) = match ks
+  Nil -> Totals(#qs, ready, inflight)
+  Cons(k, rest) -> match qs[k]
+    None -> r_totals(qs, rest, ready, inflight)
+    Some(ch) ->
+      back = channel()
+      send(ch, QStat(back))
+      c = recv(back)
+      r_totals(qs, rest, ready + q_count_ready(c), inflight + q_count_inflight(c))
+
+fn q_count_ready(c: QCount) = c.ready
+
+fn q_count_inflight(c: QCount) = c.inflight
+
+# -- a connection ---------------------------------------------------------------
+
+# The buffer a subscriber's frames wait in. A consumer that falls this far
+# behind is skipped rather than waited for; see `q_pump`.
+fn b_backlog() = 128
+
+fn b_serve(fd, reg, done, cid) =
+  sock_nodelay(fd)
+  out = channel(b_backlog())
+  spawn b_writer(fd, out, done, false)
+  b_read(Conn(fd, reg, done, cid, out), "", 0, Nil)
+
+# The writer owns the socket. It watches `done` as well as its own channel, so
+# that a broker being shut down can reach a connection that is saying nothing:
+# `sock_shutdown` ends the connection without closing the descriptor, which is
+# the only thing that wakes the reader parked on it.
+fn b_writer(fd, out, done, stopping) =
+  f = if stopping then Send(recv(out)) else b_next(out, done)
+  match f
+    Shutdown ->
+      sock_shutdown(fd)
+      b_writer(fd, out, done, true)
+    Send(text) ->
+      if str_len(text) == 0 then sock_close(fd)
+      else
+        sock_write(fd, text)
+        b_writer(fd, out, done, stopping)
+
+fn b_next(out, done) =
+  f = select
+    t = recv(out) -> Send(t)
+    recv(done) -> Shutdown
+  f
+
+fn b_read(c: Conn, buf, from, subs) = match w_take(buf, from)
+  Got(cmd, next) -> b_do(c, buf, next, subs, cmd)
+  Bad(why, next, fatal) ->
+    send(c.out, w_err(why))
+    if fatal then b_bye(c, subs) else b_read(c, buf, next, subs)
+  Need ->
+    # The one place the front is thrown away: once per read from the socket
+    # rather than once per command in it.
+    kept = if from == 0 then buf else buf[from:]
+    more = sock_read(c.fd)
+    if str_len(more) == 0 then b_bye(c, subs) else b_read(c, kept + more, 0, subs)
+
+fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
+  CQuit ->
+    send(c.out, w_ok())
+    b_bye(c, subs)
+  CPing ->
+    send(c.out, w_pong())
+    b_read(c, buf, next, subs)
+  CStats ->
+    back = channel()
+    send(c.reg, RTotals(back))
+    t = recv(back)
+    send(c.out, w_stats(b_queues(t), b_ready(t), b_inflight(t)))
+    b_read(c, buf, next, subs)
+  CPub(qname, body) ->
+    back = channel()
+    send(b_find(c.reg, qname), QPub(body, back))
+    send(c.out, w_ok_id(recv(back)))
+    b_read(c, buf, next, subs)
+  CSub(qname) ->
+    # The answer goes into the writer's queue before the subscription is made,
+    # so that it is written before any message the subscription brings. Both
+    # travel down the one channel and the writer takes them in order, which is
+    # what makes this enough; asking first and answering after would let a
+    # message overtake the `+OK` that promised it.
+    send(c.out, w_ok())
+    back = channel()
+    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out), back))
+    recv(back)
+    b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs))
+  CUnsub(qname) ->
+    b_drop(c.reg, c.cid, qname)
+    send(c.out, w_ok())
+    b_read(c, buf, next, without_name(subs, qname))
+  CAck(qname, id) ->
+    back = channel()
+    send(b_find(c.reg, qname), QAck(id, back))
+    send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
+    b_read(c, buf, next, subs)
+  CNack(qname, id) ->
+    back = channel()
+    send(b_find(c.reg, qname), QNack(id, back))
+    send(c.out, if recv(back) == 1 then w_ok() else w_err("no such message in flight"))
+    b_read(c, buf, next, subs)
+
+fn b_queues(t: Totals) = t.queues
+
+fn b_ready(t: Totals) = t.ready
+
+fn b_inflight(t: Totals) = t.inflight
+
+fn b_find(reg, name) =
+  back = channel()
+  send(reg, RFind(name, back))
+  recv(back)
+
+# Leaving is not just closing the socket. Every queue this connection was
+# subscribed to has to be told first, so that whatever it was holding goes
+# back to somebody who can still take it — and so that no queue is left
+# offering messages to a channel nobody is reading.
+fn b_bye(c: Conn, subs) =
+  # Not while the broker is stopping. The queues and the registry are parked
+  # on the same `done` and have already gone, so asking them to forget this
+  # subscriber would be asking nobody, and the ask would never come back.
+  if closed(c.done) then 0 else b_drop_all(c.reg, c.cid, subs)
+  send(c.out, "")
+  0
+
+fn b_drop_all(reg, cid, subs) = match subs
+  Nil -> 0
+  Cons(name, rest) ->
+    b_drop(reg, cid, name)
+    b_drop_all(reg, cid, rest)
+
+fn b_drop(reg, cid, name) =
+  back = channel()
+  send(b_find(reg, name), QUnsub(cid, back))
+  recv(back)
+
+fn contains_name(names, name) = match names
+  Nil -> false
+  Cons(n, rest) -> str_cmp(n, name) == 0 || contains_name(rest, name)
+
+fn without_name(names, name) = match names
+  Nil -> Nil
+  Cons(n, rest) -> if str_cmp(n, name) == 0 then without_name(rest, name) else Cons(n, without_name(rest, name))

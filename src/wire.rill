@@ -1,0 +1,141 @@
+# The wire RillMQ speaks.
+#
+# Text lines with a length-prefixed body, which is the shape Redis and the
+# early AMQP drafts both settled on and for the same two reasons: a person can
+# read a session with `nc` and a parser never has to look inside the payload
+# for where it stops. A body is bytes, and a Rill string is a byte string, so
+# nothing here cares what is in one.
+#
+#   PUB <queue> <len>\r\n<body>     ->  +OK <id>
+#   SUB <queue>                     ->  +OK
+#   UNSUB <queue>                   ->  +OK
+#   ACK <queue> <id>                ->  +OK
+#   NACK <queue> <id>               ->  +OK
+#   STATS                           ->  +STATS <queues> <ready> <inflight>
+#   PING                            ->  +PONG
+#   QUIT                            ->  closes
+#
+# and, pushed to a subscriber whenever the broker has something for it:
+#
+#   MSG <id> <queue> <len>\r\n<body>
+#
+# Anything the broker will not do answers `-ERR <what>`.
+
+# What a client asked for, once a whole command has arrived.
+type Cmd
+  CPub(queue: Str, body: Str)
+  CSub(queue: Str)
+  CUnsub(queue: Str)
+  CAck(queue: Str, id: Int)
+  CNack(queue: Str, id: Int)
+  CStats
+  CPing
+  CQuit
+
+# Taking a command out of what has been read, starting at `from`.
+#
+# An offset rather than a fresh string, because slicing the front off after
+# every command is what makes a pipelined publisher quadratic: a read brings
+# sixty-four kilobytes and eight hundred commands, and slicing per command
+# copies the whole remainder eight hundred times. `str_find_from` exists in the
+# language for exactly this, and `Got` answers with where the next one starts.
+#
+# `Need` is not an error. It is the ordinary answer while the rest of a frame
+# is still on its way, and the caller reads more and asks again.
+# `Bad` carries what is left as well, because an unknown command is not a
+# reason to hang up on somebody: the line has been consumed, the next one is
+# still there, and only a frame whose end cannot be found at all — a line with
+# no end in sight — takes the connection down with it.
+type Taken
+  Got(cmd: Cmd, next: Int)
+  Need
+  Bad(why: Str, next: Int, fatal: Bool)
+
+fn crlf() = "\r\n"
+
+# -- reading ------------------------------------------------------------------
+
+fn w_take(buf, from) =
+  at = str_find_from(buf, crlf(), from)
+  if at < 0 then if str_len(buf) - from > w_most_line() then Bad("line too long", 0, true) else Need else w_take_line(buf, buf[from:at], at + 2)
+
+fn w_most_line() = 8192
+
+fn w_most_body() = 1048576
+
+fn w_take_line(buf, line, rest) =
+  parts = split(line, " ")
+  verb = upper(unwrap_or(nth(parts, 0), ""))
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+
+# A constructor is not a value in Rill, so the four commands that differ only
+# in which one they build are written out rather than handed a maker.
+fn w_sub(parts, rest) =
+  name = w_name(parts)
+  if str_len(name) == 0 then Bad("a queue name is wanted", rest, false) else Got(CSub(name), rest)
+
+fn w_unsub(parts, rest) =
+  name = w_name(parts)
+  if str_len(name) == 0 then Bad("a queue name is wanted", rest, false) else Got(CUnsub(name), rest)
+
+# An acknowledgement names the queue as well as the message, because a message
+# id is the queue's own count and two queues hand out the same numbers. The
+# client has the name already: it came with the message.
+fn w_ack(parts, rest) =
+  name = w_name(parts)
+  raw = w_second(parts)
+  if str_len(name) == 0 || str_len(raw) == 0 then Bad("a queue and a message id are wanted", rest, false) else Got(CAck(name, str_to_int(raw)), rest)
+
+fn w_nack(parts, rest) =
+  name = w_name(parts)
+  raw = w_second(parts)
+  if str_len(name) == 0 || str_len(raw) == 0 then Bad("a queue and a message id are wanted", rest, false) else Got(CNack(name, str_to_int(raw)), rest)
+
+fn w_name(parts) = unwrap_or(nth(parts, 1), "")
+
+fn w_second(parts) = unwrap_or(nth(parts, 2), "")
+
+# `PUB` is the one command with a body after its line, so it is the one that
+# can be half here. Saying `Need` and being asked again is the whole of how
+# that is handled — the line stays in the buffer and is parsed twice, which
+# costs a `split` and saves the state machine that would avoid it.
+fn w_take_pub(buf, parts, at) =
+  queue = unwrap_or(nth(parts, 1), "")
+  len = str_to_int(unwrap_or(nth(parts, 2), "-1"))
+  if str_len(queue) == 0 then Bad("a queue name is wanted", at, false) else if len < 0 then Bad("a body length is wanted", at, false) else if len > w_most_body() then Bad("body too long", 0, true) else if str_len(buf) - at < len then Need else Got(CPub(queue, buf[at:at + len]), at + len)
+
+fn upper(s) =
+  b = strbuf()
+  upper_into(b, s, 0)
+
+fn upper_into(b: StrBuf, s, i) =
+  if i >= str_len(s) then strbuf_str(b)
+  else
+    c = str_get(s, i)
+    b += if c >= 97 && c <= 122 then c - 32 else c
+    upper_into(b, s, i + 1)
+
+# -- writing ------------------------------------------------------------------
+
+fn w_ok() = "+OK" + crlf()
+
+fn w_ok_id(id) = "+OK " + int_to_str(id) + crlf()
+
+fn w_pong() = "+PONG" + crlf()
+
+fn w_err(why) = "-ERR " + why + crlf()
+
+fn w_stats(queues, ready, inflight) =
+  "+STATS " + int_to_str(queues) + " " + int_to_str(ready) + " " + int_to_str(inflight) + crlf()
+
+fn w_msg(id, queue, body) =
+  b = strbuf()
+  b += "MSG "
+  b += int_to_str(id)
+  b += " "
+  b += queue
+  b += " "
+  b += int_to_str(str_len(body))
+  b += crlf()
+  b += body
+  strbuf_str(b)

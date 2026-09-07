@@ -1,0 +1,96 @@
+# How fast RillMQ moves messages, on one connection.
+#
+#     rillmq-bench <port> [count] [size]
+#
+# Publishes are pipelined — every one is written before any answer is read —
+# because a broker measured one round trip at a time is a measurement of the
+# round trip. Then the same messages are taken back out through a subscriber,
+# acknowledged as they come.
+fn crlf() = "\r\n"
+
+fn main() =
+  port = if arg_count() > 1 then str_to_int(arg(1)) else 6789
+  count = if arg_count() > 2 then str_to_int(arg(2)) else 50000
+  size = if arg_count() > 3 then str_to_int(arg(3)) else 64
+  match connect_to("127.0.0.1", port)
+    Err(e) ->
+      println(e)
+      0
+    Ok(fd) -> bench(fd, count, body_of(size))
+
+fn body_of(n) = repeat("x", n)
+
+fn bench(fd, count, body) =
+  queue = "bench" + int_to_str(now_millis())
+  sock_buffered(fd)
+  t0 = now_nanos()
+  write_pubs(fd, queue, body, count)
+  sock_flush(fd)
+  read_oks(fd, "", count)
+  t1 = now_nanos()
+  report("publish", count, str_len(body), t1 - t0)
+
+  sock_write(fd, "SUB " + queue + crlf())
+  sock_flush(fd)
+  t2 = now_nanos()
+  left = take_all(fd, "", queue, count)
+  t3 = now_nanos()
+  report("deliver and acknowledge", count - left, str_len(body), t3 - t2)
+  sock_close(fd)
+  0
+
+fn write_pubs(fd, queue, body, n) =
+  if n <= 0 then 0
+  else
+    sock_write(fd, "PUB " + queue + " " + int_to_str(str_len(body)) + crlf() + body)
+    write_pubs(fd, queue, body, n - 1)
+
+fn read_oks(fd, buf, want) =
+  if want <= 0 then buf
+  else
+    got = lines_in(buf)
+    if got == 0 then read_oks(fd, buf + sock_read(fd), want) else read_oks(fd, drop_lines(buf, got), want - got)
+
+fn lines_in(buf) = count_from(buf, 0, 0)
+
+fn count_from(buf, i, n) =
+  at = str_find_from(buf, crlf(), i)
+  if at < 0 then n else count_from(buf, at + 2, n + 1)
+
+fn drop_lines(buf, n) =
+  if n <= 0 then buf
+  else
+    at = str_find(buf, crlf())
+    if at < 0 then buf else drop_lines(buf[at + 2:], n - 1)
+
+# Reads MSG frames and acknowledges each, until the count is met or the broker
+# goes quiet for a second. Answers how many never arrived.
+fn take_all(fd, buf, queue, left) =
+  if left <= 0 then 0
+  else
+    at = str_find(buf, crlf())
+    if at < 0 then
+      if !sock_wait(fd, 1000) then left else take_all(fd, buf + sock_read(fd), queue, left)
+    else take_frame(fd, buf, at, queue, left)
+
+fn take_frame(fd, buf, at, queue, left) =
+  parts = split(buf[:at], " ")
+  if str_cmp(unwrap_or(nth(parts, 0), ""), "MSG") != 0 then take_all(fd, buf[at + 2:], queue, left)
+  else
+    id = unwrap_or(nth(parts, 1), "0")
+    n = str_to_int(unwrap_or(nth(parts, 3), "0"))
+    rest = buf[at + 2:]
+    if str_len(rest) < n then
+      if !sock_wait(fd, 1000) then left else take_all(fd, buf + sock_read(fd), queue, left)
+    else
+      sock_write(fd, "ACK " + queue + " " + id + crlf())
+      # Not flushed here. A socket buffer goes out whenever the strand
+      # waits, and the prefetch window guarantees this one will: the broker
+      # sends at most a window's worth before it wants an answer, so the
+      # reader runs out of frames, waits, and the acknowledgements go with it.
+      take_all(fd, rest[n:], queue, left - 1)
+
+fn report(what, n, size, nanos) =
+  ms = nanos / 1000000
+  per = if ms == 0 then 0 else n * 1000 / ms
+  println(what + ": " + int_to_str(n) + " messages of " + int_to_str(size) + " bytes in " + int_to_str(ms) + " ms, " + int_to_str(per) + "/sec")

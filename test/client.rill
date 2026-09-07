@@ -1,0 +1,215 @@
+# A client for RillMQ, and the tests it runs against a broker.
+#
+# Its own parser rather than the broker's: a wire format that only ever reads
+# itself has not been tested, and the point of a client is to be the other
+# side of the agreement.
+#
+#     rill build test/client.rill -o rillmq-test && ./rillmq-test <port>
+type Reply
+  RLine(text: Str)
+  RMsg(id: Int, queue: Str, body: Str)
+  RNothing
+
+type Took
+  Took(reply: Reply, rest: Str)
+
+fn crlf() = "\r\n"
+
+# -- reading a reply ------------------------------------------------------------
+
+# Waits up to `ms` for one whole reply. `RNothing` means the time ran out,
+# which several of the tests below are specifically about.
+fn c_read(fd, buf, ms) =
+  t = c_parse(buf)
+  match t.reply
+    RNothing ->
+      if !sock_wait(fd, ms) then Took(RNothing, buf)
+      else
+        more = sock_read(fd)
+        if str_len(more) == 0 then Took(RNothing, buf) else c_read(fd, buf + more, ms)
+    _ -> t
+
+fn c_parse(buf) =
+  at = str_find(buf, crlf())
+  if at < 0 then Took(RNothing, buf) else c_parse_line(buf[:at], buf[at + 2:])
+
+fn c_parse_line(line, rest) =
+  parts = split(line, " ")
+  if str_cmp(unwrap_or(nth(parts, 0), ""), "MSG") != 0 then Took(RLine(line), rest)
+  else
+    id = str_to_int(unwrap_or(nth(parts, 1), "0"))
+    queue = unwrap_or(nth(parts, 2), "")
+    len = str_to_int(unwrap_or(nth(parts, 3), "0"))
+    if str_len(rest) < len then Took(RNothing, line + crlf() + rest) else Took(RMsg(id, queue, rest[:len]), rest[len:])
+
+fn c_say(fd, text) =
+  sock_write(fd, text)
+  0
+
+fn c_pub(fd, queue, body) =
+  c_say(fd, "PUB " + queue + " " + int_to_str(str_len(body)) + crlf() + body)
+
+fn c_line(r) = match r
+  RLine(t) -> t
+  RMsg(id, queue, body) -> "MSG " + int_to_str(id) + " " + queue + " " + body
+  RNothing -> "(nothing)"
+
+# A pushed message and the answer to a command travel down the same socket,
+# and nothing promises which of the two is written first: the answer is queued
+# by the strand reading the connection and the message by the strand that owns
+# the queue, and they are different strands. So a client reads for the kind of
+# frame it is waiting for and lets the other kind past — which is what a client
+# for any protocol that pushes has to do, and is why these two exist rather
+# than one `read next`.
+fn c_next_line(fd, buf, ms) =
+  t = c_read(fd, buf, ms)
+  match t.reply
+    RMsg(id, queue, body) -> c_next_line(fd, t.rest, ms)
+    _ -> t
+
+fn c_next_msg(fd, buf, ms) =
+  t = c_read(fd, buf, ms)
+  match t.reply
+    RLine(text) -> c_next_msg(fd, t.rest, ms)
+    _ -> t
+
+# -- saying whether a test passed -------------------------------------------------
+
+# Each test threads the bytes it did not use into the next one. Reading into a
+# fresh buffer would throw away whatever arrived at the end of the last reply,
+# which is most of a reply most of the time.
+type Step
+  Step(passed: Int, rest: Str)
+
+fn check(name, got, want, rest) =
+  if str_cmp(got, want) == 0 then
+    println("ok   " + name)
+    Step(1, rest)
+  else
+    println("FAIL " + name + ": wanted `" + want + "`, got `" + got + "`")
+    Step(0, rest)
+
+# -- the tests ---------------------------------------------------------------------
+
+fn main() =
+  port = if arg_count() > 1 then str_to_int(arg(1)) else 6789
+  match connect_to("127.0.0.1", port)
+    Err(e) ->
+      println(e)
+      0
+    Ok(fd) -> run_all(fd, port)
+
+fn how_many() = 9
+
+fn run_all(fd, port) =
+  a = t_ping(fd, "")
+  b = t_publish_then_subscribe(fd, a.rest)
+  c = t_subscribe_is_answered_before_it_delivers(fd, b.rest)
+  d = t_ack_clears_it(fd, c.rest)
+  e = t_nack_puts_it_back(fd, d.rest)
+  f = t_deadline_puts_it_back(fd, e.rest)
+  g = t_unknown_command_is_not_fatal(fd, f.rest)
+  h = t_stats_counts(fd, g.rest)
+  n = a.passed + b.passed + c.passed + d.passed + e.passed + f.passed + g.passed + h.passed + t_a_lost_consumer_gives_it_back(port)
+  c_say(fd, "QUIT" + crlf())
+  sock_close(fd)
+  println("")
+  println(int_to_str(n) + " of " + int_to_str(how_many()) + " passed")
+  if n == how_many() then 0 else fail_out()
+
+fn fail_out() =
+  exit(1)
+  0
+
+fn t_ping(fd, buf) =
+  c_say(fd, "PING" + crlf())
+  r = c_next_line(fd, buf, 1000)
+  check("PING answers PONG", c_line(r.reply), "+PONG", r.rest)
+
+fn t_publish_then_subscribe(fd, buf) =
+  c_pub(fd, "t1", "hello")
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "SUB t1" + crlf())
+  b = c_next_line(fd, a.rest, 1000)
+  m = c_next_msg(fd, b.rest, 1000)
+  check("a published message reaches a subscriber", c_line(a.reply) + "|" + c_line(b.reply) + "|" + c_line(m.reply), "+OK 1|+OK|MSG 1 t1 hello", m.rest)
+
+# The one piece of ordering the broker does promise: subscribing is answered
+# before anything the subscription brings, because both go down one channel
+# and the answer is put in it first.
+fn t_subscribe_is_answered_before_it_delivers(fd, buf) =
+  c_pub(fd, "t5", "early")
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "SUB t5" + crlf())
+  b = c_read(fd, a.rest, 1000)
+  m = c_read(fd, b.rest, 1000)
+  c_say(fd, "ACK t5 1" + crlf())
+  z = c_next_line(fd, m.rest, 1000)
+  check("subscribing is answered before it delivers", c_line(b.reply) + "|" + c_line(m.reply), "+OK|MSG 1 t5 early", z.rest)
+
+fn t_ack_clears_it(fd, buf) =
+  c_say(fd, "ACK t1 1" + crlf())
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "ACK t1 1" + crlf())
+  b = c_next_line(fd, a.rest, 1000)
+  check("acknowledging twice is refused the second time", c_line(a.reply) + "|" + c_line(b.reply), "+OK|-ERR no such message in flight", b.rest)
+
+fn t_nack_puts_it_back(fd, buf) =
+  c_pub(fd, "t1", "again")
+  m1 = c_next_msg(fd, buf, 1000)
+  c_say(fd, "NACK t1 2" + crlf())
+  m2 = c_next_msg(fd, m1.rest, 1000)
+  c_say(fd, "ACK t1 2" + crlf())
+  z = c_next_line(fd, m2.rest, 1000)
+  check("a refused message comes straight back", c_line(m1.reply) + "|" + c_line(m2.reply) + "|" + c_line(z.reply), "MSG 2 t1 again|MSG 2 t1 again|+OK", z.rest)
+
+# The broker under test is started with a short deadline, so this takes a
+# moment rather than the five seconds it would take in earnest.
+fn t_deadline_puts_it_back(fd, buf) =
+  c_pub(fd, "t1", "slow")
+  m1 = c_next_msg(fd, buf, 1000)
+  m2 = c_next_msg(fd, m1.rest, 3000)
+  c_say(fd, "ACK t1 3" + crlf())
+  z = c_next_line(fd, m2.rest, 1000)
+  check("a message nobody answers for comes back on its own", c_line(m1.reply) + "|" + c_line(m2.reply), "MSG 3 t1 slow|MSG 3 t1 slow", z.rest)
+
+fn t_unknown_command_is_not_fatal(fd, buf) =
+  c_say(fd, "WHAT" + crlf())
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "PING" + crlf())
+  b = c_next_line(fd, a.rest, 1000)
+  check("an unknown command does not end the connection", c_line(a.reply) + "|" + c_line(b.reply), "-ERR unknown command `WHAT`|+PONG", b.rest)
+
+fn t_stats_counts(fd, buf) =
+  c_pub(fd, "t4", "z")
+  a = c_next_line(fd, buf, 1000)
+  c_say(fd, "STATS" + crlf())
+  b = c_next_line(fd, a.rest, 1000)
+  check("stats answers with three numbers", bool_to_str(starts_with(c_line(b.reply), "+STATS ") && len(split(c_line(b.reply), " ")) == 4), "true", b.rest)
+
+# A consumer that goes away holding a message must not take it with it. Its own
+# two connections, because the whole point is that one of them ends.
+fn t_a_lost_consumer_gives_it_back(port) = match connect_to("127.0.0.1", port)
+  Err(e) ->
+    println("FAIL could not connect: " + e)
+    0
+  Ok(one) ->
+    c_pub(one, "t2", "orphan")
+    got = c_next_msg_after_sub(one, "t2")
+    sock_close(one)
+    r = second_take(port)
+    s = check("a consumer that disappears gives its message back", got + "|" + r, "MSG 1 t2 orphan|MSG 1 t2 orphan", "")
+    s.passed
+
+fn c_next_msg_after_sub(fd, queue) =
+  c_say(fd, "SUB " + queue + crlf())
+  m = c_next_msg(fd, "", 2000)
+  c_line(m.reply)
+
+fn second_take(port) = match connect_to("127.0.0.1", port)
+  Err(e) -> e
+  Ok(two) ->
+    got = c_next_msg_after_sub(two, "t2")
+    c_say(two, "ACK t2 1" + crlf())
+    sock_close(two)
+    got

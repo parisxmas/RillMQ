@@ -1,0 +1,58 @@
+# RillMQ: a message broker that keeps everything in memory.
+#
+#     rill build src/main.rill -o rillmq
+#     ./rillmq 6789          # the port, and optionally the ack deadline in ms
+#
+# One strand per queue, two per connection, and one registry. Nothing is
+# shared and nothing is locked. It stops on SIGINT or SIGTERM by closing one
+# channel, which every strand in the program is watching.
+import "broker"
+
+fn default_port() = 6789
+
+fn main() =
+  port = if arg_count() > 1 then str_to_int(arg(1)) else default_port()
+  match listen_on(port)
+    Err(e) ->
+      println(e)
+      0
+    Ok(server) -> serve(server)
+
+fn serve(server) =
+  done = channel()
+  reg = channel()
+  spawn r_run(reg, done)
+  spawn accept_loop(server, reg, done, 1)
+  println("rillmq on port " + int_to_str(sock_port(server)))
+
+  # `main` is the strand that waits for the signal, and closing `done` is how
+  # it tells every other strand in the program at once. Nothing has to be
+  # counted or joined: a queue, a registry and a connection's writer are all
+  # parked on a `select` that watches this channel.
+  sig = wait_signal()
+  println("")
+  println("caught " + name_of(sig) + ", stopping")
+  close(done)
+
+  # The accept loop is parked inside `tcp_accept` and is not waiting on
+  # anything this can reach. Shutting down a *listening* socket wakes the
+  # parked accept on Linux and does not on a Mac, so this does not pretend to:
+  # the strand is abandoned when `main` returns, which is what Rill does with
+  # every strand still running, and the socket goes with the process.
+  #
+  # The pause is for the connections, which do have somewhere to be: their
+  # writers have just been told to shut their sockets down, and this is long
+  # enough for that to reach the far end.
+  sleep_ms(150)
+  println("stopped")
+  0
+
+fn accept_loop(server, reg, done, cid) =
+  conn = tcp_accept(server)
+  if conn < 0 then 0
+  else
+    spawn b_serve(conn, reg, done, cid)
+    accept_loop(server, reg, done, cid + 1)
+
+fn name_of(sig) =
+  if sig == sig_hup() then "SIGHUP" else if sig == sig_int() then "SIGINT" else if sig == sig_term() then "SIGTERM" else "signal " + int_to_str(sig)

@@ -1,0 +1,233 @@
+# A queue is a strand, and the only strand that ever touches its messages.
+#
+# That is the whole of the concurrency design. There is no lock in RillMQ and
+# nothing is shared: a connection that wants to publish sends a request down
+# the queue's channel and waits for the answer on a channel it made for that
+# purpose. Rill's maps and buffers are storage rather than values and are
+# explicitly one strand's at a time on a `--parallel` build, so this is not
+# only the tidy way to write it, it is the only way that stays correct when
+# the program is given more than one worker.
+import "wire"
+
+type Msg
+  Msg(id: Int, body: Str)
+
+# A subscriber, named by the connection that made it. `out` is where whole
+# frames go; it is buffered, and a subscriber whose buffer is full is a
+# subscriber the queue will skip rather than wait for.
+type Sub
+  Sub(id: Int, out: Chan(Str))
+
+# A message handed out and not yet acknowledged. `due` is when the queue gives
+# up waiting and hands it to somebody else; `sub` is who is holding it, which
+# is what lets the queue count how much any one consumer has outstanding.
+type Flight
+  Flight(msg: Msg, due: Int, sub: Int)
+
+# `next_due` is when the loop next has to wake up for a deadline, or 0 when
+# nothing is in flight. It is carried rather than worked out, because working
+# it out means walking everything in flight and that walk was happening on
+# every single request: at a hundred and twenty-eight messages out at once it
+# was a hundred and twenty-eight map lookups and a list of that length built
+# and thrown away per message, which is most of what the queue was doing.
+# Carried, it can be early — an acknowledgement does not correct it — and
+# early only costs a timer that fires and finds nothing, which then puts it
+# right.
+type Q
+  Q(name: Str, ready: Map(Int, Msg), head: Int, tail: Int, subs: List(Sub), inflight: Map(Int, Flight), turn: Int, next_id: Int, next_due: Int, held: Map(Int, Int))
+
+type QCount
+  QCount(ready: Int, inflight: Int)
+
+type QReq
+  QPub(body: Str, reply: Chan(Int))
+  QSub(sub: Sub, reply: Chan(Int))
+  QUnsub(sub_id: Int, reply: Chan(Int))
+  QAck(id: Int, reply: Chan(Int))
+  QNack(id: Int, reply: Chan(Int))
+  QStat(reply: Chan(QCount))
+
+# How long a message may be out before the queue decides the consumer is not
+# coming back with an answer. Five seconds unless the second argument on the
+# command line says otherwise, which is there for tests that would rather not
+# take five seconds to find out that redelivery works.
+fn q_ack_ms() = if arg_count() > 2 then str_to_int(arg(2)) else 5000
+
+# How many messages one consumer may be holding unacknowledged. This is the
+# thing a broker cannot be written without, and it is not obvious until it is
+# measured: with no limit, a queue with fifty thousand messages in it hands
+# every one of them to the first subscriber that appears. The socket fills, so
+# the strand writing it parks; the channel behind that strand fills, so the
+# strand *reading* the connection parks trying to put a reply in it; and the
+# reply it was trying to put there was the answer to an acknowledgement. The
+# consumer is then waiting for the broker to read an acknowledgement that the
+# broker cannot read until the consumer reads what it has already been sent.
+# Neither side is at fault and neither can move. AMQP calls the cure prefetch
+# and Kafka calls it max.poll.records; it is the same limit, and it is the
+# only thing standing between a broker and that deadlock.
+fn q_prefetch() = if arg_count() > 3 then str_to_int(arg(3)) else 64
+
+# What the loop waits when nothing is in flight. Not forever, because a queue
+# that is idle should still notice a shutdown promptly; not short, because a
+# queue that is idle should cost nothing.
+fn q_idle_ms() = 30000
+
+fn q_new(name) = Q(name, map_new(), 0, 0, Nil, map_new(), 0, 1, 0, map_new())
+
+# -- the loop ------------------------------------------------------------------
+
+fn q_run(name, inbox, done) = q_loop(q_new(name), inbox, done)
+
+fn q_loop(q: Q, inbox, done) =
+  step = select
+    r = recv(inbox) -> Some(q_pump(q_handle(q, r)))
+    recv(done) -> None
+    timeout(q_wait_ms(q)) -> Some(q_pump(q_sweep(q)))
+  match step
+    None -> 0
+    Some(next) -> q_loop(next, inbox, done)
+
+# The deadline the `select` above is given. With nothing in flight there is
+# nothing to wake up for, and with something in flight the wait is exactly as
+# long as the soonest of them has left. This is what a `timeout` arm is for:
+# the same thing written with a ticker strand would be a strand and a channel
+# per queue, ticking whether or not anything was waiting on it.
+fn q_wait_ms(q: Q) =
+  if q.next_due == 0 then q_idle_ms()
+  else
+    left = q.next_due - now_millis()
+    if left < 1 then 1 else left
+
+# How much this subscriber is holding.
+fn q_held(q: Q, sub_id) = map_or(q.held, sub_id, 0)
+
+fn q_hold(q: Q, sub_id, by) =
+  q.held[sub_id] = q_held(q, sub_id) + by
+  0
+
+# Worked out once, when a timer has just fired and the answer has to be right
+# again. Everything else carries it.
+fn q_soonest(m: Map(Int, Flight), ks, best) = match ks
+  Nil -> best
+  Cons(k, rest) -> match m[k]
+    None -> q_soonest(m, rest, best)
+    Some(f) -> q_soonest(m, rest, if best == 0 || f.due < best then f.due else best)
+
+# -- what a request does --------------------------------------------------------
+
+fn q_handle(q: Q, r) = match r
+  QPub(body, reply) ->
+    id = q.next_id
+    q.ready[q.tail] = Msg(id, body)
+    send(reply, id)
+    Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held)
+  QSub(s, reply) ->
+    send(reply, 1)
+    Q(q.name, q.ready, q.head, q.tail, append(q.subs, Cons(s, Nil)), q.inflight, q.turn, q.next_id, q.next_due, q.held)
+  QUnsub(sub_id, reply) ->
+    send(reply, 1)
+    # Whatever that subscriber was holding goes back to the front of the
+    # queue at once rather than waiting out its deadline: the consumer is
+    # gone, and there is nothing to wait for.
+    q_requeue_all(Q(q.name, q.ready, q.head, q.tail, q_without(q.subs, sub_id), q.inflight, q.turn, q.next_id, q.next_due, q.held))
+  QAck(id, reply) ->
+    send(reply, if map_has(q.inflight, id) then 1 else 0)
+    q_forget(q, id)
+    q_clear_due(q)
+  QNack(id, reply) ->
+    send(reply, if map_has(q.inflight, id) then 1 else 0)
+    q_requeue(q, id)
+  QStat(reply) ->
+    send(reply, QCount(q.tail - q.head, #q.inflight))
+    q
+
+# An acknowledged message is gone, and the credit it was using goes back.
+fn q_forget(q: Q, id) = match q.inflight[id]
+  None -> 0
+  Some(f) ->
+    map_del(q.inflight, id)
+    q_hold(q, f.sub, -1)
+
+fn q_without(subs, sub_id) = match subs
+  Nil -> Nil
+  Cons(s, rest) -> if q_sub_id(s) == sub_id then q_without(rest, sub_id) else Cons(s, q_without(rest, sub_id))
+
+fn q_sub_id(s: Sub) = s.id
+
+fn q_sub_out(s: Sub) = s.out
+
+# A message coming back goes in front of everything ready, which is what
+# "redelivered" has to mean: a consumer that died holding message one should
+# not put it behind the thousand that arrived while it was dying.
+fn q_requeue(q: Q, id) = match q.inflight[id]
+  None -> q
+  Some(f) ->
+    map_del(q.inflight, id)
+    q_hold(q, f.sub, -1)
+    q.ready[q.head - 1] = f.msg
+    q_clear_due(Q(q.name, q.ready, q.head - 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held))
+
+fn q_requeue_all(q: Q) = q_requeue_each(q, map_keys(q.inflight))
+
+fn q_requeue_each(q: Q, ks) = match ks
+  Nil -> q
+  Cons(k, rest) -> q_requeue_each(q_requeue(q, k), rest)
+
+# Anything whose deadline has passed comes back. The consumer may still be
+# alive and simply slow, in which case its later `ACK` finds nothing and says
+# so — at-least-once delivery, which is the only kind a broker can promise
+# without the consumer telling it more than it knows.
+# Only ever reached from the timer, so the walk it does is the one walk the
+# design allows itself.
+fn q_sweep(q: Q) = q_after_sweep(q_sweep_each(q, map_keys(q.inflight), now_millis()))
+
+fn q_after_sweep(q: Q) =
+  Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, q_soonest(q.inflight, map_keys(q.inflight), 0), q.held)
+
+# Nothing in flight means nothing to wake up for.
+fn q_clear_due(q: Q) =
+  if #q.inflight > 0 then q else Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, 0, q.held)
+
+fn q_sweep_each(q: Q, ks, now) = match ks
+  Nil -> q
+  Cons(k, rest) -> match q.inflight[k]
+    None -> q_sweep_each(q, rest, now)
+    Some(f) -> q_sweep_each(if f.due <= now then q_requeue(q, k) else q, rest, now)
+
+# -- handing messages out -------------------------------------------------------
+
+# Round-robin over the subscribers, skipping any whose buffer is full. A full
+# buffer is a consumer that is behind, and waiting for it would stop the queue
+# for everybody: the message simply stays ready and goes to whoever asks next.
+fn q_pump(q: Q) =
+  if q.head >= q.tail || len(q.subs) == 0 then q else match q.ready[q.head]
+    None -> Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held)
+    Some(m) -> q_offer(q, m, 0)
+
+fn q_offer(q: Q, m: Msg, tried) =
+  if tried >= len(q.subs) then q
+  else
+    at = q.turn - q.turn / len(q.subs) * len(q.subs)
+    match nth(q.subs, at)
+      None -> q
+      Some(s) ->
+        moved = Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, at + 1, q.next_id, q.next_due, q.held)
+        # Two reasons to pass a subscriber by, and they are different reasons.
+        # Its window being full means it has as much as it is allowed; its
+        # buffer being full means it is not keeping up with what it already
+        # has. Either way the message stays ready and somebody else may take
+        # it.
+        if q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), w_msg(m.id, q.name, m.body)) then q_took(moved, m, q_sub_id(s)) else q_offer(moved, m, tried + 1)
+
+fn q_try_send(out, frame) =
+  ok = select
+    send(out, frame) -> true
+    default -> false
+  ok
+
+fn q_took(q: Q, m: Msg, sub_id) =
+  due = now_millis() + q_ack_ms()
+  map_del(q.ready, q.head)
+  q.inflight[m.id] = Flight(m, due, sub_id)
+  q_hold(q, sub_id, 1)
+  q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, if q.next_due == 0 then due else q.next_due, q.held))
