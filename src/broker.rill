@@ -387,9 +387,23 @@ fn b_no_handshake(fd, gone) =
   0
 
 fn b_serving(fd, reg, done, cid, gone, ssl) =
+  # A publisher pipelining a thousand requests is answered a thousand times,
+  # and every one of those was a `write` of its own. Buffered, they go out in
+  # one call when the writer next has nothing to do, which is exactly when the
+  # client is waiting to hear — the runtime flushes on any park, and the
+  # writer's park is the `select` it does between frames. Not on a TLS
+  # connection: those bytes do not go through `sock_write` at all, and
+  # OpenSSL does its own gathering.
+  b_buffer_writes(ssl, fd)
   out = channel(b_backlog())
   spawn b_writer(fd, out, done, false, ssl)
   b_read(Conn(fd, reg, done, cid, out, gone, ssl), "", 0, Nil, 0, "")
+
+fn b_buffer_writes(ssl, fd) =
+  if !is_null(ssl) then 0
+  else
+    sock_buffered(fd)
+    0
 
 # The writer owns the socket. It watches `done` as well as its own channel, so
 # that a broker being shut down can reach a connection that is saying nothing:

@@ -647,14 +647,43 @@ of its own each run. Neither broker knows which it is.
 |---|---:|---:|
 | publish, transient | 256,000/sec | 918,000/sec |
 | deliver and acknowledge | 157,000/sec | 261,000/sec |
-| publish, durable, waiting for confirms | 262,000/sec | 329,000/sec |
+| publish, durable, waiting for confirms | 285,000/sec | 792,000/sec |
 | resident after 120,000 messages | 196 MB | 96 MB |
 
 The transient publish figure is the one to read carefully: with confirms off
 there is nothing to wait for, so it measures how fast a broker takes messages
-rather than how fast it makes them durable. The durable row is the one with a
-disk in it, and both brokers batch, which is why both are faster than any
-drive.
+rather than how fast it makes them durable.
+
+The durable row was 329,000/sec, and the reason it was so much closer to
+RabbitMQ than the others is worth writing down, because the obvious
+explanation was wrong. It looked like the disk: a confirmed publish waits for
+a sync, a sync is the drive, and no broker is faster than the drive it is
+waiting for. It was not the disk. A hundred thousand confirmed publishes took
+251 ms with a journal and 231 ms with no journal at all — group commit had
+already made the syncs nearly free, and twenty milliseconds of a quarter of a
+second is not where a measurement goes.
+
+What it was is the writing back. Every confirmed publish got a `Basic.Ack` of
+its own: a frame built, and a `write` for it. A hundred thousand publishes
+meant a hundred thousand syscalls, which is about what the missing time cost.
+`Basic.Ack` has a `multiple` bit meaning "and everything before this one" —
+which is what RabbitMQ sends and what RillMQ was not — so the confirms are now
+counted as they arrive and said at the moment the session runs out of things
+to do: one frame for however many became safe while it was busy. A hundred
+thousand confirmed durable publishes went from 251 ms to 126 ms, and without a
+journal from 231 ms to 99 ms.
+
+Two things are worth taking from that. The first is that the fix was the
+cheap kind — the protocol already had the bit, and the broker was not using
+it. The second is that the disk had stopped being the interesting cost some
+time ago and nobody had checked: the honest way to find that out was to run
+the same measurement against a broker with no journal at all, which took one
+extra process and settled the question in one line.
+
+The 126 ms now has 56 ms of client in it — that is how long `RabbitMQ.Client`
+takes to write a hundred thousand publishes into a socket before RillMQ has
+had to do anything at all — so the broker's own share of a confirmed durable
+publish is nearer 70 ms, or 1.4 million a second.
 
 What that measurement found on the way was a deadlock in RillMQ's own AMQP
 session, and it is worth writing down because it is the shape of bug an actor
@@ -675,23 +704,33 @@ rather than for the cache.
 
 | RillMQ's own protocol | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 85,000/sec | 182,000/sec |
-| deliver and acknowledge | 131,000/sec | 131,000/sec |
+| publish | 119,000/sec | 366,000/sec |
+| deliver and acknowledge | 303,000/sec | 329,000/sec |
+
+Both of those were about forty per cent lower until the connection's writer
+was given a write buffer. Every `+OK` and every `MSG` was a `write` of its
+own, so a publisher pipelining a thousand requests cost a thousand syscalls to
+answer. `sock_buffered(fd)` queues them and the runtime empties the queue
+whenever the strand parks — which, for a writer, is the `select` it does
+between frames, and so is exactly the moment the client is waiting to hear.
+It is one line, and it is the same mistake as the confirms above, found by
+looking for the same mistake in the other protocol.
 
 Over AMQP, through `RabbitMQ.Client`, 50,000 messages of 64 bytes:
 
 | AMQP | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 373,000/sec | 334,000/sec |
-| deliver and acknowledge | 134,000/sec | 146,000/sec |
+| publish | 918,000/sec | 935,000/sec |
+| deliver and acknowledge | 261,000/sec | 269,000/sec |
 
 The AMQP publish figure is higher than the native one and it is not a better
 number: with confirms off — which is how the measurement above was taken, and
 how most publishing is done — there is no reply to wait for, so it measures
 the rate at which the broker takes messages rather than the rate at which it
 makes them durable. That is also why having a journal does not slow it down.
-`ConfirmSelect()` puts the wait back and brings the number down to the native
-protocol's, which is the same wait for the same disk.
+`ConfirmSelect()` puts the wait back, and what it costs is one frame per batch
+rather than one per message; see the section above for how that came to be
+true and what it was before.
 
 Delivery is slower with a journal than without because draining a queue is
 what makes its journal worth rewriting, so the rewrite happens during the

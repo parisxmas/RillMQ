@@ -111,9 +111,14 @@ class Program
             dch.ConfirmSelect();
             var d0 = DateTime.UtcNow;
             for (int i = 0; i < count; i++) dch.BasicPublish("", dq, props, payload);
+            // The two halves separately: how long the client took to write them
+            // all, and how much longer it then waited to be told they were
+            // safe. Together they are the number; apart they say which end the
+            // time is being spent at.
+            var dw = DateTime.UtcNow;
             dch.WaitForConfirms(TimeSpan.FromMinutes(5));
             var d1 = DateTime.UtcNow;
-            Console.WriteLine($"durable publish: {count} in {(int)(d1 - d0).TotalMilliseconds} ms, {(int)(count / (d1 - d0).TotalSeconds)}/sec");
+            Console.WriteLine($"durable publish: {count} in {(int)(d1 - d0).TotalMilliseconds} ms, {(int)(count / (d1 - d0).TotalSeconds)}/sec (wrote in {(int)(dw - d0).TotalMilliseconds} ms, then waited {(int)(d1 - dw).TotalMilliseconds} ms)");
             return 0;
         }
 
