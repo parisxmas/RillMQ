@@ -646,7 +646,8 @@ of its own each run. Neither broker knows which it is.
 | over AMQP, through RabbitMQ's own .NET client | RabbitMQ | RillMQ |
 |---|---:|---:|
 | publish, transient | 205,000/sec | 837,000/sec |
-| deliver and acknowledge | 163,000/sec | 272,000/sec |
+| deliver and acknowledge | 160,000/sec | 265,000/sec |
+| deliver, `no-ack` | 285,000/sec | 470,000/sec |
 | publish, durable, waiting for confirms | 282,000/sec | 819,000/sec |
 | resident after 170,000 messages | 214 MB | 95 MB |
 
@@ -694,6 +695,37 @@ trying to put a delivery into the very pipe the session had stopped emptying.
 Twenty thousand publishes and then one `Queue.Declare` was enough. Two inboxes
 rather than one, and an offer to send made in the same breath as a readiness
 to receive, is the fix — `am_hand` and `am_wait` in `src/amqp_serve.rill`.
+
+### Why delivery is only two thirds ahead
+
+Publishing is four times RabbitMQ's rate and delivery is not, and the reason
+is that they are not the same kind of measurement. A publish is one way: the
+client writes and the broker absorbs, and the number says how fast the broker
+absorbs. A delivery is a round: the broker writes, the client's own consumer
+dispatch takes it apart and hands it to a thread, and an acknowledgement goes
+back. Two thirds of that is the client's, and the client is the same one in
+both columns, so it flattens the ratio.
+
+Acknowledging is what most of the cost is, and both brokers pay it in the same
+proportion. With the acknowledgements taken out — `no-ack`, where the client
+says it will not answer for what it is given — RillMQ goes from 265,000 to
+470,000 and RabbitMQ from 160,000 to 285,000. Each roughly doubles, so the
+ratio is what it was: the acknowledgement is not where RillMQ's advantage goes.
+
+With no journal and no acknowledgements the broker holds 568,000/sec, and does
+it three runs in a row within half a per cent of itself. A number that stable
+across runs is usually not the thing being measured — but replacing the
+client's own bookkeeping with an interlocked counter did not raise it, so the
+remaining cost is the frames themselves: this broker writing them and that
+client parsing them.
+
+Finding this out is also what turned up a plain bug. `no-ack` could not be
+measured, because RillMQ read the flag off `Basic.Consume` and did nothing with
+it: a consumer that asked for it was given one prefetch window and then
+nothing at all, for ever. Handing messages out is driven by requests arriving —
+an acknowledgement is what usually says "there is room now" — and a consumer
+that has been told it need not acknowledge sends none. It now says so in one
+message a batch instead, at the moment the connection has caught up.
 
 ## Numbers
 
@@ -780,7 +812,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 17 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 19 checks through RabbitMQ's own .NET client
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -796,7 +828,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All eighty-nine pass, with or without a journal.
+All ninety-one pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -831,6 +863,18 @@ All eighty-nine pass, with or without a journal.
   made and per binding taken away, and nothing ever shortens it. A queue's
   journal is compacted; this one is not, on the grounds that a table which
   changes as often as messages arrive is not a routing table.
+- **A channel is a number the broker carries, not a thing it isolates.**
+  A delivery goes back on the channel its consumer was made on and a confirm
+  on the channel that asked for confirms, so a client with several channels
+  works. What a channel does not yet do is separate anything: `Basic.Qos` is
+  one window per connection, and closing one channel does not cancel the
+  consumers on it. Everything went out on channel one until a test was written
+  that used a second, and a consumer on it was handed nothing at all.
+- **`no-ack` is honoured but `Basic.Qos` is not, for a consumer using it.**
+  A consumer that answers for nothing is given whatever the connection's
+  buffer will take, as fast as it will take it. That is what the flag asks
+  for and it is also the danger in it: nothing is between a fast queue and a
+  slow reader but the socket.
 - **No `headers` exchange, and no `Queue.Unbind` over AMQP.** The exchange
   understands unbinding, and a replayed journal can ask it; nothing else does.
 - **`durable` is not a choice.** Every exchange and every binding is written

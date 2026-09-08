@@ -16,8 +16,12 @@ type Msg
 # A subscriber, named by the connection that made it. `out` is buffered, and a
 # subscriber whose buffer is full is a subscriber the queue will skip rather
 # than wait for.
+# `quick` is a consumer that asked not to be asked: AMQP's `no-ack`, where a
+# message is finished the moment it is handed over. Nothing is held for it and
+# nothing waits on it, which is what the client asked for and also what it
+# gives up — a message lost on the way is lost.
 type Sub
-  Sub(id: Int, out: Chan(Out))
+  Sub(id: Int, out: Chan(Out), quick: Bool)
 
 # A message handed out and not yet acknowledged. `due` is when the queue gives
 # up waiting and hands it to somebody else; `sub` is who is holding it, which
@@ -51,6 +55,11 @@ type QReq
   # is left alone: it is somebody's to answer for, and taking it back would be
   # taking it out of a consumer's hands rather than out of the queue.
   QDrain(reply: Chan(Int))
+  # Nothing asked and nothing answered. Handing a message out is driven by
+  # requests arriving — an acknowledgement is what usually says "there is room
+  # now" — and a consumer that has asked not to acknowledge sends none. So it
+  # says this instead, once per batch rather than once per message.
+  QPoke
 
 # How long a message may be out before the queue decides the consumer is not
 # coming back with an answer. Five seconds unless the second argument on the
@@ -238,6 +247,7 @@ fn q_handle(q: Q, r, full) = match r
   QNack(id, reply) -> q_handle_rest(q, r)
   QStat(reply) -> q_handle_rest(q, r)
   QDrain(reply) -> q_handle_rest(q, r)
+  QPoke -> q_handle_rest(q, r)
 
 # The refusal goes down the journal's channel with everything else, so that it
 # arrives in the place the client asked for it. Nothing is written.
@@ -289,6 +299,7 @@ fn q_handle_rest(q: Q, r) = match r
     send(reply, QCount(q.tail - q.head, #q.inflight, len(q.subs), q.next_id - 1))
     q
   QDrain(reply) -> q_drain(q, reply)
+  QPoke -> q
 
 # Everything ready, dropped, and the journal told about each one in the way it
 # is told about an acknowledgement — so a broker that comes back does not find
@@ -338,6 +349,8 @@ fn q_without(subs, sub_id) = match subs
 fn q_sub_id(s: Sub) = s.id
 
 fn q_sub_out(s: Sub) = s.out
+
+fn q_sub_quick(s: Sub) = s.quick
 
 # A message coming back goes in front of everything ready, which is what
 # "redelivered" has to mean: a consumer that died holding message one should
@@ -400,7 +413,7 @@ fn q_offer(q: Q, m: Msg, tried) =
         # buffer being full means it is not keeping up with what it already
         # has. Either way the message stays ready and somebody else may take
         # it.
-        if q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props)) then q_took(moved, m, q_sub_id(s)) else q_offer(moved, m, tried + 1)
+        if !q_sub_quick(s) && q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props)) then q_took(moved, m, q_sub_id(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
 
 fn q_try_send(out, frame) =
   ok = select
@@ -408,7 +421,23 @@ fn q_try_send(out, frame) =
     default -> false
   ok
 
-fn q_took(q: Q, m: Msg, sub_id) =
+# The subscriber arrives here as two plain values rather than as itself. It is
+# the hottest path in the broker, and handing a counted record along it costs a
+# reference taken and given back for every message — worth about a fifth of the
+# delivery rate, which is more than the whole of what this function does.
+fn q_took(q: Q, m: Msg, sub_id, quick) =
+  if quick then q_handed_over(q, m) else q_in_flight(q, m, sub_id)
+
+# Handed to a consumer that wants no acknowledgement, and therefore done with:
+# out of the ready table, written off in the journal at once, and never in the
+# in-flight one. That last part is the whole of why it is faster — no deadline
+# to keep, no window to count, and no answer to wait for.
+fn q_handed_over(q: Q, m: Msg) =
+  map_del(q.ready, q.head)
+  send(q.jr.puts, JNote(j_ack_record(m.id)))
+  q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr))
+
+fn q_in_flight(q: Q, m: Msg, sub_id) =
   due = now_millis() + q_ack_ms()
   map_del(q.ready, q.head)
   q.inflight[m.id] = Flight(m, due, sub_id)

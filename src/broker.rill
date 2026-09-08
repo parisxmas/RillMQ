@@ -569,7 +569,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     # message overtake the `+OK` that promised it.
     send(c.out, OFrame(w_ok()))
     back = channel()
-    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out), back))
+    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false), back))
     recv(back)
     b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0, who)
   CUnsub(qname) ->

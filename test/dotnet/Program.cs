@@ -134,14 +134,32 @@ class Program
             for (int i = 0; i < count; i++) bch.BasicPublish("", bq, null, payload);
             while (bch.QueueDeclare(bq, true, false, false, null).MessageCount < count) Thread.Sleep(50);
             var t1 = DateTime.UtcNow;
+            // `bench <n> auto` takes the acknowledgements out of it: the
+            // broker sends and the client never answers. What is left is
+            // delivery alone, which is how much of the cost the answering was.
+            bool auto = args.Length > 3 && args[3] == "auto";
+            // `thin` takes the client's own bookkeeping out of it: an interlocked
+            // counter instead of a blocking queue handed between two threads.
+            // If the rate moves, the ceiling was this program's and not the
+            // broker's, which is the only way to tell from out here.
+            bool thin = args.Length > 4 && args[4] == "thin";
             var seen2 = new BlockingCollection<int>();
+            int counted = 0;
             bch.BasicQos(0, 64, false);
             var c2 = new EventingBasicConsumer(bch);
-            c2.Received += (_, ea) => { seen2.Add(1); bch.BasicAck(ea.DeliveryTag, false); };
-            bch.BasicConsume(bq, false, c2);
+            if (thin)
+                c2.Received += (_, ea) => { Interlocked.Increment(ref counted); if (!auto) bch.BasicAck(ea.DeliveryTag, false); };
+            else
+                c2.Received += (_, ea) => { seen2.Add(1); if (!auto) bch.BasicAck(ea.DeliveryTag, false); };
+            bch.BasicConsume(bq, auto, c2);
             int n2 = 0;
             var end = DateTime.UtcNow.AddSeconds(120);
-            while (n2 < count && DateTime.UtcNow < end) if (seen2.TryTake(out _, 1000)) n2++;
+            if (thin)
+            {
+                while (Volatile.Read(ref counted) < count && DateTime.UtcNow < end) Thread.Sleep(0);
+                n2 = Volatile.Read(ref counted);
+            }
+            else while (n2 < count && DateTime.UtcNow < end) if (seen2.TryTake(out _, 1000)) n2++;
             var t2 = DateTime.UtcNow;
             Console.WriteLine($"publish: {count} in {(int)(t1 - t0).TotalMilliseconds} ms, {(int)(count / (t1 - t0).TotalSeconds)}/sec");
             Console.WriteLine($"deliver and acknowledge: {n2} in {(int)(t2 - t1).TotalMilliseconds} ms, {(int)(n2 / (t2 - t1).TotalSeconds)}/sec");
@@ -252,6 +270,30 @@ class Program
         Check("a fanout reaches every queue bound to it",
             ch.QueueDeclare(fa, true, false, false, null).MessageCount + "," + ch.QueueDeclare(fb, true, false, false, null).MessageCount,
             "1,1");
+
+        // `no-ack`, where the client says it will not answer for what it is
+        // given. The broker must neither wait for an answer nor stop after one
+        // prefetch window, which is what it did when it read the flag and
+        // ignored it: a consumer got sixty-four messages and then silence.
+        string nq = q + "-noack";
+        ch.QueueDeclare(nq, true, false, false, null);
+        for (int i = 0; i < 300; i++) ch.BasicPublish("", nq, null, Encoding.UTF8.GetBytes("no answer " + i));
+        Thread.Sleep(500);
+        var quick = new BlockingCollection<int>();
+        using (var nch = conn.CreateModel())
+        {
+            nch.BasicQos(0, 64, false);
+            var nc = new EventingBasicConsumer(nch);
+            nc.Received += (_, ea) => quick.Add(1);
+            nch.BasicConsume(nq, true, nc);
+            int quickly = 0;
+            var until = DateTime.UtcNow.AddSeconds(10);
+            while (quickly < 300 && DateTime.UtcNow < until) if (quick.TryTake(out _, 500)) quickly++;
+            Check("a consumer that answers for nothing gets all of it", quickly, 300);
+        }
+        Thread.Sleep(300);
+        Check("and the queue keeps none of it back",
+            ch.QueueDeclare(nq, true, false, false, null).MessageCount, 0u);
 
         // Message properties, which is what the request-and-reply pattern is
         // made of: a message says where to answer and what to call the answer,
