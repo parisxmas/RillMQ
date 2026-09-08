@@ -1,0 +1,183 @@
+# The binaries a release is made of.
+#
+# Each one is built on the machine it is for. That is not tidiness: the broker
+# links OpenSSL, and `rill build --target` stops at the object file for
+# anything but Windows and wasm — so a Linux binary made on a Mac would be a
+# cross-link against libraries that are not there to test against. A runner
+# per platform builds and then runs the whole test suite before anything is
+# published.
+#
+# Windows is missing on purpose. `rill build --target x86_64-pc-windows-msvc`
+# ends in `LLVM ERROR: Can't handle guaranteed tail call under win64 yet`, and
+# every loop in the broker is one of those; the runtime has no socket poller
+# there either, and a broker is nothing but sockets. Both are work in the
+# language rather than in this file.
+#
+# Wants a secret: RILL_TOKEN, which may read the compiler's own repository.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: the tag to build and publish
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    # The Intel Mac is the one runner label that may not be there any more.
+    # If it has gone, the release is made without it rather than not at all.
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macos-arm64
+            runner: macos-15
+          - name: macos-x86_64
+            runner: macos-15-intel
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: The language it is written in
+        uses: actions/checkout@v4
+        with:
+          repository: parisxmas/rill
+          ref: rillmq-foundations
+          token: ${{ secrets.RILL_TOKEN }}
+          path: rill-lang
+
+      - name: What the compiler needs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev zlib1g-dev lsof netcat-openbsd
+          echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
+
+      - name: What the compiler needs (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@18 openssl@3
+          echo "LLVM_SYS_181_PREFIX=$(brew --prefix llvm@18)" >> "$GITHUB_ENV"
+
+      # Keyed on the lockfile, so a release that changes nothing about the
+      # compiler does not build it again.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rill-lang/target
+          key: rill-${{ matrix.name }}-${{ hashFiles('rill-lang/Cargo.lock') }}
+          restore-keys: rill-${{ matrix.name }}-
+
+      - name: Build the compiler
+        working-directory: rill-lang
+        run: cargo build --release
+
+      - name: The tag and the source have to agree
+        run: |
+          want="${TAG#v}"
+          have=$(sed -n 's/^fn b_version() = "\(.*\)"$/\1/p' src/broker.rill)
+          if [ "$want" != "$have" ]; then
+            echo "tag says $want, src/broker.rill says $have" >&2
+            exit 1
+          fi
+
+      - name: Build the broker
+        run: rill-lang/target/release/rill build src/main.rill -o rillmq
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Every test there is
+        run: |
+          for t in amqp blocked catchup cluster deleted failover handover \
+                   majority manage persistence secure vhosts; do
+            printf '\n===== %s =====\n' "$t"
+            sh "test/$t.sh" || exit 1
+          done
+
+      - name: Wrap it up
+        run: |
+          d="rillmq-${TAG#v}-${{ matrix.name }}"
+          mkdir "$d"
+          cp rillmq README.md "$d"/
+          tar -czf "$d.tar.gz" "$d"
+          shasum -a 256 "$d.tar.gz" > "$d.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: rillmq-*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: One file of checksums rather than four
+        working-directory: dist
+        run: |
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          ls -l
+
+      - name: Say what is in it
+        run: |
+          v="${TAG#v}"
+          cat > notes.md <<EOF
+          RillMQ $v — an in-memory message broker with a journal, speaking
+          AMQP 0-9-1 as well as its own protocol.
+
+          Each binary was built and had the whole test suite run against it on
+          the machine it is for. Unpack and run:
+
+          \`\`\`sh
+          tar xzf rillmq-$v-<platform>.tar.gz
+          ./rillmq-$v-<platform>/rillmq 6789 dir=data amqp=5672
+          \`\`\`
+
+          **Wants OpenSSL 3** on the machine it runs on — the TLS ports and the
+          password hashing are its. Every current Linux has it; on a Mac it is
+          \`brew install openssl@3\`.
+
+          **No Windows build.** The compiler cannot emit this program for
+          win64 yet (every loop is a guaranteed tail call, which LLVM refuses
+          there), and the runtime has no socket poller on Windows — which a
+          broker is made of. Both are work in the language rather than here.
+
+          \`SHA256SUMS\` covers every archive.
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RillMQ ${TAG#v}" \
+            --notes-file notes.md
