@@ -1370,6 +1370,18 @@ All hundred and eighty-four of them pass, with or without a journal.
   that carries on is refused a message at a time as before. The difference
   matters for a client that does not listen; for one that does, it is the same
   thing.
+- **The server properties name the broker and nothing else.** `Connection.Start`
+  says `product` and `version` — `rillmq` and the version this is — and stops
+  there. RabbitMQ puts a `capabilities` table beside them, and a client that
+  reads it rather than trying is told whether publisher confirms, `basic.nack`,
+  consumer cancel notify and exchange-to-exchange bindings are there. All four
+  are, and none of them is advertised, so a client that asks by reading is told
+  wrong; the .NET client the acceptance test uses asks by doing, and all
+  seventy-two of those pass. The asymmetry is the awkward part: this broker
+  goes looking for `connection.blocked` in the client's table and offers
+  nothing back in its own. What stands in the way is small — the writer here
+  knows how to write a long string, and a capabilities table is a table inside
+  a table.
 - **How full is how big this process has got.** `rss_bytes()` counts
   everything — the journal's buffers, a connection's, the binary itself — not
   the messages. It is checked every two hundred and fifty-sixth publish on a
