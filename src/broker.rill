@@ -34,6 +34,10 @@ type RReq
   # without a round trip it does not owe, so it answers with the stand-in and
   # lets the owner be the one who knows.
   RFindIf(name: Str, reply: Chan(Option(Chan(QReq))))
+  # Deleting one of each. The reply is how much was in it, which is what AMQP
+  # answers a `Queue.Delete` with, and -1 for a name that was not there.
+  RDropQueue(name: Str, reply: Chan(Int))
+  RDropExchange(name: Str, quiet: Bool, reply: Chan(Int))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
   # The same numbers as `RRows`, as numbers rather than as the lines this
@@ -131,6 +135,12 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RFindIf(name, reply) ->
     send(reply, r_known(qs, mine, g.dir, g.self, name, done))
+    0
+  RDropQueue(name, reply) ->
+    send(reply, r_drop_queue(qs, mine, g.dir, name))
+    0
+  RDropExchange(name, quiet, reply) ->
+    send(reply, r_drop_exchange(xs, name, quiet))
     0
   RExchangeIf(name, reply) ->
     send(reply, xs[name])
@@ -239,6 +249,41 @@ fn r_only(jr) = match jr
 # A queue is made here, or stood in for. Which of the two is the name's hash
 # over the list of nodes, so this node does not have to ask anybody and cannot
 # disagree with anybody: every node runs the same arithmetic on the same list.
+# The queue is told to stop and answers with what it was holding; then it is
+# out of the table and its journal is off the disk. A name nobody has is -1,
+# which is not a count and cannot be mistaken for one.
+fn r_drop_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name) = match qs[name]
+  None -> -1
+  Some(ch) ->
+    back = channel(1)
+    send(ch, QStop(back))
+    held = recv(back)
+    map_del(qs, name)
+    map_del(mine, name)
+    r_unlink(dir, name)
+    held
+
+# The journal goes with the queue. Unlinking a file the journal strand may
+# still have open is safe and is the ordinary Unix answer: the name goes now
+# and the bytes go when it closes.
+fn r_unlink(dir, name) =
+  if str_len(dir) == 0 then 0
+  else
+    file_remove(dir + "/" + j_file(name))
+    0
+
+# The same for an exchange, except that what it answers with is how many
+# bindings went with it. `quiet` is replay, which must not write the record it
+# is reading.
+fn r_drop_exchange(xs: Map(Str, Chan(XReq)), name, quiet) = match xs[name]
+  None -> -1
+  Some(ch) ->
+    back = channel(1)
+    send(ch, XStop(quiet, back))
+    n = recv(back)
+    map_del(xs, name)
+    n
+
 # What this node can honestly say about a queue it has not got. It is not the
 # same question as `r_queue`, which makes one: a name nobody has ever used is
 # a mistake worth telling a client about, and telling it costs nothing here

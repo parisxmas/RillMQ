@@ -6,8 +6,10 @@
 # record, the same checksum, the same rule about what follows a record that
 # does not add up — holding what was declared rather than what was published.
 #
-# Three kinds of record, and reading them in order gives the table as it
-# stands: an exchange declared, a binding made, a binding taken away.
+# Four kinds of record, and reading them in order gives the table as it
+# stands: an exchange declared, a binding made, a binding taken away, and an
+# exchange taken away. The last one is what stops a restart from bringing back
+# something a client deleted.
 import "journal"
 
 # A name no queue can produce. A queue's file is its name with anything unsafe
@@ -21,10 +23,13 @@ fn rt_kind_bind() = 66
 
 fn rt_kind_unbind() = 85
 
+fn rt_kind_gone() = 71
+
 type Route
   RX(name: Str, kind: Str)
   RB(exchange: Str, queue: Str, key: Str)
   RU(exchange: Str, queue: Str, key: Str)
+  RGone(name: Str)
   RNone
 
 # A field is its length and then its bytes, two bytes for the length, because a
@@ -46,6 +51,11 @@ fn rt_x_record(name, kind) =
   rt_field(b, name)
   rt_field(b, kind)
   j_record(rt_kind_x(), 0, strbuf_str(b))
+
+fn rt_gone_record(name) =
+  b = strbuf()
+  rt_field(b, name)
+  j_record(rt_kind_gone(), 0, strbuf_str(b))
 
 fn rt_bind_record(ex, queue, key) = rt_three(rt_kind_bind(), ex, queue, key)
 
@@ -81,7 +91,7 @@ fn rt_scan(buf, at, acc) = match j_take(buf, at)
   RGot(kind, id, body, next) -> rt_scan(buf, next, Cons(rt_of(kind, body), acc))
 
 fn rt_of(kind, body) =
-  if kind == rt_kind_x() then RX(rt_field_at(body, 0), rt_field_at(body, rt_after(body, 0))) else if kind == rt_kind_bind() then rt_triple(body, true) else if kind == rt_kind_unbind() then rt_triple(body, false) else RNone
+  if kind == rt_kind_x() then RX(rt_field_at(body, 0), rt_field_at(body, rt_after(body, 0))) else if kind == rt_kind_bind() then rt_triple(body, true) else if kind == rt_kind_unbind() then rt_triple(body, false) else if kind == rt_kind_gone() then RGone(rt_field_at(body, 0)) else RNone
 
 fn rt_triple(body, bind) =
   at2 = rt_after(body, 0)

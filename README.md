@@ -74,7 +74,8 @@ prefetch — `Queue.Declare` (which is also how a client asks how many are
 waiting), `Exchange.Declare` and `Queue.Bind` — both of which now refuse a name nobody
 declared — `Basic.Qos`, `Basic.Publish`,
 `Basic.Consume` with `no-ack`, `Basic.Deliver`, `Basic.Ack`, `Basic.Nack` and
-`Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `Confirm.Select`, and closing a
+`Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `Queue.Purge`, `Queue.Delete`,
+`Queue.Unbind`, `Exchange.Delete`, `Confirm.Select`, and closing a
 channel or a connection — from either side, since the broker closes a channel
 itself when it has to refuse something. A message's properties — `reply-to`,
 `correlation-id`, `content-type`, headers — are kept as they came and handed
@@ -915,7 +916,8 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 35 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 42 checks through RabbitMQ's own .NET client
+sh test/deleted.sh           # 3 checks that a deleted exchange stays deleted
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -931,7 +933,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and seven of them pass, with or without a journal.
+All hundred and seventeen of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -980,8 +982,16 @@ All hundred and seven of them pass, with or without a journal.
   does, so such a consumer is given whatever the connection will take as fast
   as it will take it. Nothing is between a fast queue and a slow reader but
   the socket, and that is what the flag asks for.
-- **No `headers` exchange, and no `Queue.Unbind` over AMQP.** The exchange
-  understands unbinding, and a replayed journal can ask it; nothing else does.
+- **No `headers` exchange.** Direct, fanout and topic, and no fourth kind.
+- **`Queue.Delete` and `Exchange.Delete` read their conditions and do not
+  honour them.** `if-unused`, `if-empty` and `if-unused` again are parsed off
+  the wire and ignored, so a delete always deletes. A client that asked for a
+  queue to go only if it was empty gets it gone either way, which is the
+  wrong answer to a question it was right to ask.
+- **Deleting a queue does not tell its consumers.** AMQP says they get a
+  `Basic.Cancel`; here the connection that asked has its own consumers
+  forgotten, and a consumer on another connection is left holding a
+  subscription to a queue that has stopped.
 - **`durable` is not a choice.** Every exchange and every binding is written
   down, whatever the flag said, exactly as every queue is.
 - **One virtual host, and one permission.** `Connection.Open` takes whatever

@@ -63,6 +63,11 @@ type QReq
   # now" — and a consumer that has asked not to acknowledge sends none. So it
   # says this instead, once per batch rather than once per message.
   QPoke
+  # The end of this queue. It answers with what it was holding and then its
+  # strand returns, which is the only way one of these ever stops short of the
+  # broker stopping. Its journal is told to stop too: nothing else is watching
+  # for the end of one queue.
+  QStop(reply: Chan(Int))
 
 # How long a message may be out before the queue decides the consumer is not
 # coming back with an answer. Five seconds unless the second argument on the
@@ -175,13 +180,40 @@ fn q_loop(q: Q, inbox, done) = q_turn(q, inbox, done, Guard(false, 0))
 
 fn q_turn(q: Q, inbox, done, g: Guard) =
   step = select
-    r = recv(inbox) -> Some(q_pump(q_handle(q, r, g.full)))
+    r = recv(inbox) -> if q_is_stop(r) then q_stopping(q, r) else Some(q_pump(q_handle(q, r, g.full)))
     recv(q.jr.want) -> Some(q_hand_over(q))
     recv(done) -> None
     timeout(q_wait_ms(q)) -> Some(q_pump(q_sweep(q)))
   match step
     None -> 0
     Some(next) -> q_turn(next, inbox, done, q_look(g))
+
+fn q_is_stop(r) = match r
+  QStop(reply) -> true
+  QPub(b, p, o) -> false
+  QSub(s, reply) -> false
+  QUnsub(i, reply) -> false
+  QAck(i, reply) -> false
+  QNack(i, reply) -> false
+  QStat(reply) -> false
+  QDrain(reply) -> false
+  QPoke -> false
+
+# Answered, then over. The journal is told last so that nothing it is holding
+# is lost before the count goes out.
+fn q_stopping(q: Q, r) = match r
+  QStop(reply) ->
+    send(reply, q.tail - q.head + #q.inflight)
+    send(q.jr.puts, JStop)
+    None
+  QPub(b, p, o) -> Some(q)
+  QSub(s, reply) -> Some(q)
+  QUnsub(i, reply) -> Some(q)
+  QAck(i, reply) -> Some(q)
+  QNack(i, reply) -> Some(q)
+  QStat(reply) -> Some(q)
+  QDrain(reply) -> Some(q)
+  QPoke -> Some(q)
 
 # The journal has decided that most of what it is holding has been
 # acknowledged, and has asked for the queue as it stands. This is the only
@@ -251,6 +283,7 @@ fn q_handle(q: Q, r, full) = match r
   QStat(reply) -> q_handle_rest(q, r)
   QDrain(reply) -> q_handle_rest(q, r)
   QPoke -> q_handle_rest(q, r)
+  QStop(reply) -> q_handle_rest(q, r)
 
 # The refusal goes down the journal's channel with everything else, so that it
 # arrives in the place the client asked for it. Nothing is written.
@@ -303,6 +336,7 @@ fn q_handle_rest(q: Q, r) = match r
     q
   QDrain(reply) -> q_drain(q, reply)
   QPoke -> q
+  QStop(reply) -> q
 
 # Everything ready, dropped, and the journal told about each one in the way it
 # is told about an acknowledgement — so a broker that comes back does not find

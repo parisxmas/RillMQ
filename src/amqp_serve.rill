@@ -355,6 +355,20 @@ fn am_exchange_declare_ok(chan) = am_method(chan, a_class_exchange(), 11, "")
 
 fn am_queue_bind_ok(chan) = am_method(chan, a_class_queue(), 21, "")
 
+fn am_queue_purge_ok(chan, n) =
+  b = strbuf()
+  a_u32(b, n)
+  am_method(chan, a_class_queue(), 31, strbuf_str(b))
+
+fn am_queue_delete_ok(chan, n) =
+  b = strbuf()
+  a_u32(b, n)
+  am_method(chan, a_class_queue(), 41, strbuf_str(b))
+
+fn am_queue_unbind_ok(chan) = am_method(chan, a_class_queue(), 51, "")
+
+fn am_exchange_delete_ok(chan) = am_method(chan, a_class_exchange(), 21, "")
+
 fn am_basic_qos_ok(chan) = am_method(chan, a_class_basic(), 11, "")
 
 fn am_basic_consume_ok(chan, tag) =
@@ -530,11 +544,23 @@ fn am_forget_on(am: Am, tags, chan) = match tags
 # `Exchange.Declare` names an exchange and says what kind it is. The kind is
 # the third field: past the reserved short, past the name.
 fn am_exchange_method(am: Am, chan, method, payload) =
-  if method != 10 then am_no_method(am, chan, a_class_exchange(), method)
+  if method == 20 then am_delete_exchange(am, chan, a_get_shortstr(payload, am_after_reserved()))
+  else if method != 10 then am_no_method(am, chan, a_class_exchange(), method)
   else
     at = a_after_shortstr(payload, am_after_reserved())
     am_exchange(am, a_get_shortstr(payload, am_after_reserved()), a_get_shortstr(payload, at))
     am_answer(am, am_exchange_declare_ok(chan))
+
+# `Exchange.Delete` takes its bindings with it and writes a record saying so,
+# because a restart replays the routing journal and would otherwise bring back
+# what somebody deleted.
+fn am_delete_exchange(am: Am, chan, name) =
+  back = channel(1)
+  send(am.reg, RDropExchange(name, false, back))
+  am_deleted_exchange(am, chan, name, recv(back))
+
+fn am_deleted_exchange(am: Am, chan, name, n) =
+  if n < 0 then am_no_exchange(am, chan, name, 20) else am_answer(am, am_exchange_delete_ok(chan))
 
 fn am_exchange(am: Am, name, kind) =
   back = channel(1)
@@ -557,7 +583,56 @@ fn am_args() = 4
 fn am_after_reserved() = 6
 
 fn am_queue_method(am: Am, chan, method, payload) =
-  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 20 then am_bind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
+  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 40 then am_delete_queue(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
+
+# `Queue.Purge` throws away what is waiting and answers with how much that
+# was. It is `DRAIN` on RillMQ's own protocol, and the same request underneath.
+fn am_purge(am: Am, chan, queue) = match am_queue_if(am, queue)
+  None -> am_no_queue(am, chan, queue, 30)
+  Some(qh) -> am_purging(am, chan, qh)
+
+fn am_purging(am: Am, chan, qh) =
+  back = channel(1)
+  w = am_wait(am_hand(am, qh, QDrain(back)), back)
+  am_answer(w.am, am_queue_purge_ok(chan, w.got))
+
+# `Queue.Delete` ends the queue: its strand returns, its journal stops, and
+# the file goes. The `if-unused` and `if-empty` flags are read and not
+# honoured — see the last section of the README.
+fn am_delete_queue(am: Am, chan, queue) =
+  back = channel(1)
+  send(am.reg, RDropQueue(queue, back))
+  am_deleted_queue(am, chan, queue, recv(back))
+
+fn am_deleted_queue(am: Am, chan, queue, n) =
+  if n < 0 then am_no_queue(am, chan, queue, 40) else am_answer(am_forgot_queue(am, queue), am_queue_delete_ok(chan, n))
+
+# Whatever this connection was reading from it is reading from nothing now.
+fn am_forgot_queue(am: Am, queue) = am_forget_all_on(am, map_keys(am.consumers), queue)
+
+fn am_forget_all_on(am: Am, tags, queue) = match tags
+  Nil -> am
+  Cons(t, rest) -> am_forget_all_on(if str_cmp(map_or(am.consumers, t, ""), queue) == 0 then am_dropped(am, t) else am, rest, queue)
+
+# `Queue.Unbind` is the same three names as `Queue.Bind`, undone. The exchange
+# already understood it — a replayed journal has always been able to ask —
+# and nothing over AMQP could until now.
+fn am_unbind(am: Am, chan, payload) =
+  at1 = a_after_shortstr(payload, am_after_reserved())
+  at2 = a_after_shortstr(payload, at1)
+  queue = a_get_shortstr(payload, am_after_reserved())
+  ex = a_get_shortstr(payload, at1)
+  key = a_get_shortstr(payload, at2)
+  am_unbind_from(am, chan, queue, key, am_exchange_if(am, ex), ex)
+
+fn am_unbind_from(am: Am, chan, queue, key, found, ex) = match found
+  None -> am_no_exchange(am, chan, ex, 50)
+  Some(x) -> am_unbinding(am, chan, queue, key, x)
+
+fn am_unbinding(am: Am, chan, queue, key, x) =
+  back = channel(1)
+  sent = am_hand(am, x, XUnbind(queue, key, back))
+  am_answer(am_wait(sent, back).am, am_queue_unbind_ok(chan))
 
 # `Queue.Bind` is queue, exchange, routing key, in that order after the
 # reserved short. The queue is made if it is not there, because binding a queue

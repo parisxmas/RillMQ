@@ -19,6 +19,9 @@ type XReq
   XPub(key: Str, body: Str, props: Str, out: Chan(Out))
   XBind(queue: Str, key: Str, ch: Chan(QReq), quiet: Bool, reply: Chan(Int))
   XUnbind(queue: Str, key: Str, reply: Chan(Int))
+  # The end of this exchange. Its bindings go with it, and the routing journal
+  # is told so that a restart does not bring back what somebody deleted.
+  XStop(quiet: Bool, reply: Chan(Int))
 
 fn x_direct() = "direct"
 
@@ -30,11 +33,32 @@ fn x_run(name, kind, jr: Jr, inbox, done) = x_loop(X(name, kind, Nil, jr), inbox
 
 fn x_loop(x: X, inbox, done) =
   step = select
-    r = recv(inbox) -> Some(x_handle(x, r))
+    r = recv(inbox) -> if x_is_stop(r) then x_over(x, r) else Some(x_handle(x, r))
     recv(done) -> None
   match step
     None -> 0
     Some(next) -> x_loop(next, inbox, done)
+
+# Replay must not write the record it is reading, which is the whole of what
+# `quiet` means here and everywhere else in this broker.
+fn x_forget(x: X, quiet) =
+  if quiet then 0 else x_note(x, rt_gone_record(x.name))
+  0
+
+fn x_is_stop(r) = match r
+  XStop(quiet, reply) -> true
+  XPub(key, body, props, out) -> false
+  XBind(queue, key, ch, quiet, reply) -> false
+  XUnbind(queue, key, reply) -> false
+
+fn x_over(x: X, r) = match r
+  XStop(quiet, reply) ->
+    send(reply, len(x.binds))
+    x_forget(x, quiet)
+    None
+  XPub(key, body, props, out) -> Some(x)
+  XBind(queue, key, ch, quiet, reply) -> Some(x)
+  XUnbind(queue, key, reply) -> Some(x)
 
 fn x_handle(x: X, r) = match r
   XPub(key, body, props, out) ->
@@ -43,6 +67,7 @@ fn x_handle(x: X, r) = match r
   XBind(queue, key, ch, quiet, reply) ->
     send(reply, 1)
     if x_bound(x.binds, queue, key) then x else x_add(x, queue, key, ch, quiet)
+  XStop(quiet, reply) -> x
   XUnbind(queue, key, reply) ->
     send(reply, 1)
     x_note(x, rt_unbind_record(x.name, queue, key))

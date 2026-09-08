@@ -40,6 +40,34 @@ class Program
         // `auth <user> <word>` is the whole of that mode: it says whether the
         // broker let this pair in, and nothing else. The suite runs it twice,
         // once with the word and once with the wrong one.
+        // `xdel make|gone <exchange>` is the two halves of one question asked
+        // either side of a restart: does an exchange somebody deleted stay
+        // deleted? The routing journal replays declarations and bindings, so
+        // it has to replay the deletion too.
+        if (args.Length > 3 && args[1] == "xdel")
+        {
+            var xf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var xc = xf.CreateConnection();
+            using var xm = xc.CreateModel();
+            string name = args[3];
+            if (args[2] == "make")
+            {
+                xm.ExchangeDeclare(name, "fanout", true);
+                xm.QueueDeclare(name + "-q", true, false, false, null);
+                xm.QueueBind(name + "-q", name, "");
+                xm.ExchangeDelete(name);
+                Console.WriteLine("deleted");
+            }
+            else
+            {
+                var said = new BlockingCollection<string>();
+                xm.ModelShutdown += (_, e) => said.Add(e.ReplyCode.ToString());
+                try { xm.BasicPublish(name, "", null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(700); } catch (Exception) { }
+                Console.WriteLine(said.TryTake(out var w, 3000) ? w : "still there");
+            }
+            return 0;
+        }
+
         // `tls` connects over AMQPS and says whether it got in. The
         // certificate is one RillMQ made for itself, so the name is checked
         // and the chain is not: this says TLS works, not that a self-signed
@@ -349,6 +377,39 @@ class Program
             Check("a prefetch of one means one at a time", most, 1);
         }
 
+        // The four methods that used to be answered with 540. Three had the
+        // machinery already — purge is the same request as the native
+        // protocol's DRAIN, unbind is what a replayed journal has always been
+        // able to ask an exchange — and nothing over AMQP could reach any of
+        // them.
+        string mq = q + "-methods";
+        ch.QueueDeclare(mq, true, false, false, null);
+        for (int i = 0; i < 7; i++) ch.BasicPublish("", mq, null, Encoding.UTF8.GetBytes("m" + i));
+        Thread.Sleep(400);
+        Check("purging a queue says how much it threw away", ch.QueuePurge(mq), 7u);
+        Check("and leaves it empty", ch.QueueDeclare(mq, true, false, false, null).MessageCount, 0u);
+
+        string ux = q + "-unbind-x";
+        string uq = q + "-unbind-q";
+        ch.ExchangeDeclare(ux, "direct", true);
+        ch.QueueDeclare(uq, true, false, false, null);
+        ch.QueueBind(uq, ux, "k");
+        ch.BasicPublish(ux, "k", null, Encoding.UTF8.GetBytes("bound"));
+        Thread.Sleep(400);
+        Check("a binding carries a message", ch.QueueDeclare(uq, true, false, false, null).MessageCount, 1u);
+        ch.QueueUnbind(uq, ux, "k");
+        ch.BasicPublish(ux, "k", null, Encoding.UTF8.GetBytes("unbound"));
+        Thread.Sleep(400);
+        Check("and unbinding stops it", ch.QueueDeclare(uq, true, false, false, null).MessageCount, 1u);
+
+        Check("deleting a queue says what was in it", ch.QueueDelete(uq), 1u);
+        Check("and it is gone", refused(m => m.BasicGet(uq, true)).Split(' ')[0], "404");
+
+        ch.ExchangeDelete(ux);
+        Check("deleting an exchange leaves nothing to publish to",
+            refused(m => { m.BasicPublish(ux, "k", null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(700); }).Split(' ')[0],
+            "404");
+
         // A channel is where a refusal lands. Each of these used to be
         // silence: the client waited for a reply that was never coming, or
         // went on believing something the broker had quietly not done.
@@ -361,8 +422,11 @@ class Program
             return why.TryTake(out var w, 5000) ? w : "(nothing was said)";
         }
 
+        // Transactions, which RillMQ does not do and says so. This check used
+        // to use `Queue.Purge`, until `Queue.Purge` was written — a test that
+        // asserts something is missing has to be moved as things stop being.
         Check("a method the broker has not written closes the channel",
-            refused(m => m.QueuePurge(q)).Split(' ')[0], "540");
+            refused(m => m.TxSelect()).Split(' ')[0], "540");
         Check("acknowledging a tag it never gave out closes it too",
             refused(m => m.BasicAck(9999, false)), "406 unknown delivery tag");
         Check("and so does a consumer tag already in use",

@@ -170,6 +170,9 @@ fn cl_say_no(r) = match r
     send(reply, 0)
     0
   QPoke -> 0
+  QStop(reply) ->
+    send(reply, 0)
+    0
 
 # Local requests and link frames arrive on one inbox, so the proxy waits in one
 # place, as every other strand here does.
@@ -414,6 +417,11 @@ fn cl_ask(p: P, r) = match r
     cl_send(p, "DRAIN " + p.name + crlf2())
     cl_wait(p, WCount(reply))
   QPoke -> p
+  # A stand-in cannot delete somebody else's queue, and saying so is better
+  # than pretending: the count is -1, which is what a name nobody has answers.
+  QStop(reply) ->
+    send(reply, -1)
+    p
 
 # The last subscriber leaving takes the subscription with it, so the far end
 # stops sending: this node has nobody to give a message to.

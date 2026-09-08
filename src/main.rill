@@ -127,6 +127,12 @@ fn apply_routes(reg, rs, n) = match rs
 
 fn apply_route(reg, r) = match r
   RNone -> 0
+  # An exchange somebody deleted. Its declaration and its bindings are earlier
+  # in this file and have already been applied, so this undoes them — which is
+  # what reading a journal in order means.
+  RGone(name) ->
+    b_drop_exchange(reg, name)
+    0
   RX(name, kind) ->
     b_exchange_of(reg, name, kind)
     0
@@ -140,6 +146,11 @@ fn apply_route(reg, r) = match r
     send(b_exchange_of(reg, ex, x_direct()), XUnbind(queue, key, back))
     recv(back)
     0
+
+fn b_drop_exchange(reg, name) =
+  back = channel(1)
+  send(reg, RDropExchange(name, true, back))
+  recv(back)
 
 fn b_exchange_of(reg, name, kind) =
   back = channel(1)

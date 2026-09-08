@@ -199,6 +199,10 @@ type JReq
   # accounted for in the snapshot, and everything after it lands in the new
   # one.
   JRewriteReq(recs: List(Str), name: Str)
+  # The end of this journal, because the queue it belongs to has gone. Nothing
+  # else ends one: every other journal in the program stops when the broker
+  # does, on the `done` everybody watches.
+  JStop
   # Something to say to a client that writes no record: a refusal. It goes
   # through the journal rather than straight to the connection so that it
   # keeps its place — a client pipelining three publishes, the middle one
@@ -284,7 +288,7 @@ fn j_cannot(path, jr: Jr, done) =
 
 fn j_loop(js: Js, jr: Jr, done) =
   first = select
-    r = recv(jr.puts) -> Some(r)
+    r = recv(jr.puts) -> if j_is_stop(r) then None else Some(r)
     recv(done) -> None
   match first
     None ->
@@ -292,6 +296,13 @@ fn j_loop(js: Js, jr: Jr, done) =
       file_close(js.fd)
       0
     Some(r) -> j_loop(j_commit(js, jr, r), jr, done)
+
+fn j_is_stop(r) = match r
+  JStop -> true
+  JPut(rec, reply, value) -> false
+  JNote(rec) -> false
+  JSay(reply, value) -> false
+  JRewriteReq(recs, name) -> false
 
 fn j_commit(js: Js, jr: Jr, r) =
   b = strbuf()
@@ -422,6 +433,7 @@ fn j_add(b: StrBuf, r, g: JBatch) = match r
     JBatch(g.ws, g.pubs, g.acks + 1, g.todo)
   JSay(reply, value) -> JBatch(Cons(JWait(reply, value), g.ws), g.pubs, g.acks, g.todo)
   JRewriteReq(recs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
+  JStop -> g
 
 # In the order the records went in. `j_add` puts each on the front as it
 # arrives, so a batch is back to front until this turns it round — and a
@@ -530,6 +542,7 @@ fn j_cut(fd, upto) =
 fn j_rewrite(js: Js, c) = match c
   JPut(rec, reply, value) -> js
   JNote(rec) -> js
+  JStop -> js
   JSay(reply, value) -> js
   JRewriteReq(recs, name) ->
     tmp = js.path + ".new"
