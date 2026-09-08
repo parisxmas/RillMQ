@@ -69,11 +69,14 @@ the .NET client over AMQP is delivered to a subscriber on RillMQ's own port,
 is written to the same journal, and is there after a restart.
 
 What is implemented is what a client actually uses: the connection handshake,
-channels, `Queue.Declare` (which is also how a client asks how many are
-waiting), `Exchange.Declare` and `Queue.Bind` accepted as no-ops, `Basic.Qos`,
-`Basic.Publish`, `Basic.Consume` and `Basic.Deliver`, `Basic.Ack`,
-`Basic.Nack` and `Basic.Reject`, `Basic.Get`, `Basic.Cancel`,
-`Confirm.Select`, and closing a channel or a connection.
+channels — several to a connection, each with its own consumers and its own
+prefetch — `Queue.Declare` (which is also how a client asks how many are
+waiting), `Exchange.Declare` and `Queue.Bind`, `Basic.Qos`, `Basic.Publish`,
+`Basic.Consume` with `no-ack`, `Basic.Deliver`, `Basic.Ack`, `Basic.Nack` and
+`Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `Confirm.Select`, and closing a
+channel or a connection. A message's properties — `reply-to`,
+`correlation-id`, `content-type`, headers — are kept as they came and handed
+back untouched, which is what the request-and-reply pattern is made of.
 
 **Publisher confirms are the interesting one.** A `Basic.Publish` has no reply,
 so an AMQP client cannot otherwise learn when its message reached the disk —
@@ -812,7 +815,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 19 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 22 checks through RabbitMQ's own .NET client
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -828,7 +831,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All ninety-one pass, with or without a journal.
+All ninety-four pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -863,18 +866,21 @@ All ninety-one pass, with or without a journal.
   made and per binding taken away, and nothing ever shortens it. A queue's
   journal is compacted; this one is not, on the grounds that a table which
   changes as often as messages arrive is not a routing table.
-- **A channel is a number the broker carries, not a thing it isolates.**
-  A delivery goes back on the channel its consumer was made on and a confirm
-  on the channel that asked for confirms, so a client with several channels
-  works. What a channel does not yet do is separate anything: `Basic.Qos` is
-  one window per connection, and closing one channel does not cancel the
-  consumers on it. Everything went out on channel one until a test was written
-  that used a second, and a consumer on it was handed nothing at all.
-- **`no-ack` is honoured but `Basic.Qos` is not, for a consumer using it.**
-  A consumer that answers for nothing is given whatever the connection's
-  buffer will take, as fast as it will take it. That is what the flag asks
-  for and it is also the danger in it: nothing is between a fast queue and a
-  slow reader but the socket.
+- **A channel is not a unit of failure.** A consumer belongs to the channel it
+  was made on, keeps that channel's `Basic.Qos`, and is cancelled when the
+  channel closes. What a channel still cannot do is fail on its own: there is
+  no `Channel.Close` sent *by* the broker, so a request it should refuse —
+  publishing to an exchange that is not there, acknowledging a tag twice —
+  is passed over silently where AMQP would close the channel with a reason.
+- **`Basic.Qos` counts per consumer, not per channel.** Two consumers made on
+  one channel each get the window the channel asked for, rather than sharing
+  it, and `global=true` is read and treated as `false`. For the usual shape —
+  one consumer to a channel — these are the same thing.
+- **A consumer that answers for nothing has no window.** Prefetch does not
+  apply under `no-ack`, which is what the specification says and what RabbitMQ
+  does, so such a consumer is given whatever the connection will take as fast
+  as it will take it. Nothing is between a fast queue and a slow reader but
+  the socket, and that is what the flag asks for.
 - **No `headers` exchange, and no `Queue.Unbind` over AMQP.** The exchange
   understands unbinding, and a replayed journal can ask it; nothing else does.
 - **`durable` is not a choice.** Every exchange and every binding is written

@@ -14,7 +14,11 @@ type Out
   # it sent it. RillMQ has no use for any of it and hands it back byte for
   # byte, which is the only way `reply-to` and `correlation-id` can mean on the
   # way out what they meant on the way in.
-  ODeliver(queue: Str, id: Int, body: Str, props: Str)
+  # `sub` is which subscriber the queue chose. A connection may have several
+  # consumers, on several channels, and the frame has to go back on the one
+  # that asked: guessing from the queue's name was right only while a
+  # connection could have one consumer per queue.
+  ODeliver(queue: Str, id: Int, body: Str, props: Str, sub: Int)
   # A message that is now on the disk. RillMQ's own protocol says `+OK <id>`;
   # AMQP says `Basic.Ack` and only when the client asked for confirms. Both
   # are the same event, so the event is what travels.

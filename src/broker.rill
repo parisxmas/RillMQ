@@ -427,7 +427,7 @@ fn b_put(fd, out, done, stopping, text, ssl) =
 # says it has finished and the socket may go.
 fn b_bytes(what) = match what
   OFrame(text) -> text
-  ODeliver(queue, id, body, props) -> w_msg(id, queue, body)
+  ODeliver(queue, id, body, props, sub) -> w_msg(id, queue, body)
   OPublished(queue, id) -> w_ok_id(id)
 
 fn b_next(out, done) =
@@ -569,7 +569,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     # message overtake the `+OK` that promised it.
     send(c.out, OFrame(w_ok()))
     back = channel()
-    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false), back))
+    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false, q_prefetch()), back))
     recv(back)
     b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0, who)
   CUnsub(qname) ->

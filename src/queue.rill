@@ -20,8 +20,11 @@ type Msg
 # message is finished the moment it is handed over. Nothing is held for it and
 # nothing waits on it, which is what the client asked for and also what it
 # gives up — a message lost on the way is lost.
+# `window` is how much this one consumer may hold unacknowledged — what
+# `Basic.Qos` asks for, per consumer rather than per broker. Zero is no limit,
+# which is what AMQP's prefetch of zero means.
 type Sub
-  Sub(id: Int, out: Chan(Out), quick: Bool)
+  Sub(id: Int, out: Chan(Out), quick: Bool, window: Int)
 
 # A message handed out and not yet acknowledged. `due` is when the queue gives
 # up waiting and hands it to somebody else; `sub` is who is holding it, which
@@ -352,6 +355,8 @@ fn q_sub_out(s: Sub) = s.out
 
 fn q_sub_quick(s: Sub) = s.quick
 
+fn q_sub_window(s: Sub) = s.window
+
 # A message coming back goes in front of everything ready, which is what
 # "redelivered" has to mean: a consumer that died holding message one should
 # not put it behind the thousand that arrived while it was dying.
@@ -413,7 +418,14 @@ fn q_offer(q: Q, m: Msg, tried) =
         # buffer being full means it is not keeping up with what it already
         # has. Either way the message stays ready and somebody else may take
         # it.
-        if !q_sub_quick(s) && q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props)) then q_took(moved, m, q_sub_id(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
+        if q_no_room(q, s) then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props, q_sub_id(s))) then q_took(moved, m, q_sub_id(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
+
+# A consumer that answers for nothing has no window: there is nothing
+# outstanding to count, which is what AMQP says of prefetch under `no-ack` and
+# what RabbitMQ does with it. A window of zero is the same, asked for.
+fn q_no_room(q: Q, s: Sub) =
+  w = q_sub_window(s)
+  !q_sub_quick(s) && w > 0 && q_held(q, q_sub_id(s)) >= w
 
 fn q_try_send(out, frame) =
   ok = select

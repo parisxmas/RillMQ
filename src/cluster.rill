@@ -464,7 +464,7 @@ fn cl_hand_on(p: P, id, body) = cl_offer(p, id, body, p.subs)
 fn cl_offer(p: P, id, body, left) = match left
   Nil -> p
   Cons(s, rest) ->
-    if cl_try(q_sub_out(s), ODeliver(p.name, id, body, "")) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg) else cl_offer(p, id, body, rest)
+    if cl_try(q_sub_out(s), ODeliver(p.name, id, body, "", q_sub_id(s))) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg) else cl_offer(p, id, body, rest)
 
 fn cl_try(out, what) =
   ok = select

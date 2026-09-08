@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using RabbitMQ.Client;
@@ -294,6 +295,59 @@ class Program
         Thread.Sleep(300);
         Check("and the queue keeps none of it back",
             ch.QueueDeclare(nq, true, false, false, null).MessageCount, 0u);
+
+        // Channels. A connection may have several, each with its own consumers
+        // and its own `Basic.Qos`, and what happens on one is not supposed to
+        // happen on another.
+        string ca = q + "-chan-a";
+        string cb = q + "-chan-b";
+        using (var m1 = conn.CreateModel())
+        using (var m2 = conn.CreateModel())
+        {
+            m1.QueueDeclare(ca, true, false, false, null);
+            m2.QueueDeclare(cb, true, false, false, null);
+            for (int i = 0; i < 5; i++) m1.BasicPublish("", ca, null, Encoding.UTF8.GetBytes("a" + i));
+            for (int i = 0; i < 5; i++) m1.BasicPublish("", cb, null, Encoding.UTF8.GetBytes("b" + i));
+            Thread.Sleep(400);
+
+            var onA = new BlockingCollection<string>();
+            var onB = new BlockingCollection<string>();
+            var k1 = new EventingBasicConsumer(m1);
+            k1.Received += (_, ea) => { onA.Add(Encoding.UTF8.GetString(ea.Body.ToArray())); m1.BasicAck(ea.DeliveryTag, false); };
+            var k2 = new EventingBasicConsumer(m2);
+            k2.Received += (_, ea) => { onB.Add(Encoding.UTF8.GetString(ea.Body.ToArray())); m2.BasicAck(ea.DeliveryTag, false); };
+            m1.BasicConsume(ca, false, k1);
+            m2.BasicConsume(cb, false, k2);
+            Thread.Sleep(900);
+            Check("each channel's consumer gets its own queue", onA.Count + "," + onB.Count, "5,5");
+            Check("and nothing crossed over", onA.All(x => x[0] == 'a') && onB.All(x => x[0] == 'b'), true);
+        }
+
+        // `Basic.Qos` with a count of one: the broker may have exactly one
+        // message out at a time on that channel. Answering `Qos-Ok` and then
+        // handing out sixty-four anyway is not fair dispatch, and is what it
+        // did until this was written.
+        string fq = q + "-qos";
+        using (var m3 = conn.CreateModel())
+        {
+            m3.QueueDeclare(fq, true, false, false, null);
+            for (int i = 0; i < 20; i++) m3.BasicPublish("", fq, null, Encoding.UTF8.GetBytes("f" + i));
+            Thread.Sleep(400);
+            int most = 0, outNow = 0;
+            var held = new object();
+            var qc = new EventingBasicConsumer(m3);
+            qc.Received += (_, ea) =>
+            {
+                lock (held) { outNow++; if (outNow > most) most = outNow; }
+                Thread.Sleep(15);
+                lock (held) { outNow--; }
+                m3.BasicAck(ea.DeliveryTag, false);
+            };
+            m3.BasicQos(0, 1, false);
+            m3.BasicConsume(fq, false, qc);
+            Thread.Sleep(1500);
+            Check("a prefetch of one means one at a time", most, 1);
+        }
 
         // Message properties, which is what the request-and-reply pattern is
         // made of: a message says where to answer and what to call the answer,
