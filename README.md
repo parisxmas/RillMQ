@@ -1228,6 +1228,7 @@ could see, and a failure that reported success.
 rill build src/main.rill  -o rillmq
 rill build test/client.rill -o rillmq-test
 rill build test/bench.rill  -o rillmq-bench
+rill build test/compact.rill -o rillmq-compact
 
 ./rillmq 7700 ack=300 &      # no journal, a 300 ms ack deadline
 ./rillmq-test 7700           # 11 checks

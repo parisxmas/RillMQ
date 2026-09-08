@@ -105,6 +105,12 @@ jobs:
       - name: Build the broker
         run: rill-lang/target/release/rill build src/main.rill -o rillmq
 
+      # `test/persistence.sh` drives one of these rather than a socket, because
+      # what it is testing is a journal that is mostly acknowledgements and
+      # that takes more of them than a shell script wants to write.
+      - name: Build what the tests drive it with
+        run: rill-lang/target/release/rill build test/compact.rill -o rillmq-compact
+
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "9.0.x"

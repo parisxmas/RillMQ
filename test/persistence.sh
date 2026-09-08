@@ -78,7 +78,15 @@ stop
 # -- rewriting a journal that is mostly acknowledgements ---------------------------
 
 start 60000
-./rillmq-compact "$PORT" bulk 6000 5000 >/dev/null
+# Acknowledged nearly to the end, and that number matters. A rewrite writes
+# the live queue into the new file as publishes and counts them as such, so
+# what decides whether a second rewrite happens is the acknowledgements that
+# come *after* the first one, measured against the queue it left behind. With
+# a thousand still to acknowledge, a rewrite landing early enough leaves too
+# few behind it to earn another, and the file stays big — which is not the
+# broker getting it wrong, it is this check having depended on where the first
+# rewrite happened to land. On a loaded machine it landed elsewhere.
+./rillmq-compact "$PORT" bulk 6000 5900 >/dev/null
 # Waited for rather than slept through. A rewrite happens off the strand that
 # answered, so how long it takes is how busy the machine is, and a fixed sleep
 # was making this check fail when the rest of the suite was running beside it.
