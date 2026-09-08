@@ -66,6 +66,13 @@ type QReq
   QPub(body: Str, props: Str, out: Chan(Out))
   QSub(sub: Sub, reply: Chan(Int))
   QTune(sub_id: Int, window: Int, group: Int, reply: Chan(Int))
+  # One message, to a caller that is not a subscriber. `Basic.Get` is this:
+  # a poll, which used to be written as subscribe, wait, unsubscribe — three
+  # requests and a wait for something the queue could have handed over at
+  # once. `quick` is the same thing it is for a subscriber: with it the
+  # message is finished on the way out, without it it is in flight and the
+  # caller owes an answer.
+  QTake(group: Int, quick: Bool, reply: Chan(Out))
   QUnsub(sub_id: Int, reply: Chan(Int))
   QAck(id: Int, reply: Chan(Int))
   QNack(id: Int, reply: Chan(Int))
@@ -236,6 +243,7 @@ fn q_is_stop(r) = match r
   QPub(b, p, o) -> false
   QSub(s, reply) -> false
   QTune(i, w, g, reply) -> false
+  QTake(g, k, reply) -> false
   QUnsub(i, reply) -> false
   QAck(i, reply) -> false
   QNack(i, reply) -> false
@@ -250,6 +258,7 @@ fn q_stopping(q: Q, r) = match r
   QPub(b, p, o) -> Some(q)
   QSub(s, reply) -> Some(q)
   QTune(i, w, g, reply) -> Some(q)
+  QTake(g, k, reply) -> Some(q)
   QUnsub(i, reply) -> Some(q)
   QAck(i, reply) -> Some(q)
   QNack(i, reply) -> Some(q)
@@ -325,6 +334,7 @@ fn q_handle(q: Q, r, full) = match r
   QPub(body, props, out) -> if full then q_refuse(q, out) else q_accept(q, body, props, out)
   QSub(s, reply) -> q_handle_rest(q, r)
   QTune(i, w, g, reply) -> q_handle_rest(q, r)
+  QTake(g, k, reply) -> q_handle_rest(q, r)
   QUnsub(sub_id, reply) -> q_handle_rest(q, r)
   QAck(id, reply) -> q_handle_rest(q, r)
   QNack(id, reply) -> q_handle_rest(q, r)
@@ -370,6 +380,7 @@ fn q_handle_rest(q: Q, r) = match r
     # is holding stays counted where it was counted, so the new window governs
     # what is handed out from here rather than what has already gone.
     q_pump(Q(q.name, q.ready, q.head, q.tail, q_retune(q.subs, sub_id, window, group), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
+  QTake(group, quick, reply) -> q_take(q, group, quick, reply)
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     # Whatever that subscriber was holding goes back to the front of the
@@ -395,6 +406,26 @@ fn q_handle_rest(q: Q, r) = match r
 # Everything ready, dropped, and the journal told about each one in the way it
 # is told about an acknowledgement — so a broker that comes back does not find
 # them again. What is in flight is not touched: somebody is holding it.
+fn q_take(q: Q, group, quick, reply) =
+  if q.head >= q.tail then q_took_none(q, reply) else q_take_at(q, group, quick, reply, q.ready[q.head])
+
+fn q_take_at(q: Q, group, quick, reply, at) = match at
+  None -> q_take(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done), group, quick, reply)
+  Some(m) ->
+    send(reply, ODeliver(q.name, q_msg_id(m), q_msg_body(m), q_msg_props(m), group))
+    q_took(q, m, group, quick)
+
+fn q_msg_id(m: Msg) = m.id
+
+fn q_msg_body(m: Msg) = m.body
+
+fn q_msg_props(m: Msg) = m.props
+
+# Nothing there, said in the one shape the caller is already listening for.
+fn q_took_none(q: Q, reply) =
+  send(reply, OFrame(""))
+  q
+
 fn q_drain(q: Q, reply) =
   n = q.tail - q.head
   q_forget_ready(q, q.head)

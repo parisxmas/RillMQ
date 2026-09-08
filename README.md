@@ -1232,6 +1232,11 @@ All hundred and thirty-six of them pass, with or without a journal.
   A `Basic.Qos` arriving after the consumers it governs takes effect on what
   is handed out from then on; what is already outstanding keeps the window it
   went out under.
+- **A `Basic.Get` on a queue another node holds is refused.** The link's
+  language has a word for subscribing and none for polling once, and a poll
+  used to be written as a subscription for an instant, which went over. It is
+  now one request the queue answers directly, and that request stops at the
+  node holding the queue.
 - **A consumer that answers for nothing has no window.** Prefetch does not
   apply under `no-ack`, which is what the specification says and what RabbitMQ
   does, so such a consumer is given whatever the connection will take as fast

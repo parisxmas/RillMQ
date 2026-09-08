@@ -269,6 +269,9 @@ fn cl_say_no(r) = match r
   QTune(sub_id, window, group, reply) ->
     send(reply, 0)
     0
+  QTake(group, quick, reply) ->
+    send(reply, OFrame(w_err("the node holding that queue cannot be reached")))
+    0
   QUnsub(sub_id, reply) ->
     send(reply, 0)
     0
@@ -637,6 +640,12 @@ fn cl_ask(p: P, r) = match r
   # so the consumer keeps the window it subscribed with.
   QTune(sub_id, window, group, reply) ->
     send(reply, 1)
+    p
+  # A poll goes over the link as what it was before it was one request: a
+  # subscription for an instant. There is no word for it in the link's
+  # language and there is no need for one.
+  QTake(group, quick, reply) ->
+    send(reply, OFrame(w_err("a queue on another node is not polled")))
     p
   QUnsub(sub_id, reply) ->
     send(reply, 1)

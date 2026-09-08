@@ -209,6 +209,34 @@ class Program
             return 0;
         }
 
+        // `multiack` acks five deliveries with one `Basic.Ack` carrying the
+        // `multiple` bit, then asks the queue what it still thinks is out.
+        if (args.Length > 1 && args[1] == "multiack")
+        {
+            var kf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var kc = kf.CreateConnection();
+            using var km = kc.CreateModel();
+            var kq = "multiack-" + Environment.TickCount;
+            km.QueueDeclare(kq, true, false, false, null);
+            for (var i = 0; i < 5; i++) km.BasicPublish("", kq, null, Encoding.UTF8.GetBytes("m" + i));
+            Thread.Sleep(500);
+            km.BasicQos(0, 5, false);
+            var kgot = new BlockingCollection<ulong>();
+            var kcon = new EventingBasicConsumer(km);
+            kcon.Received += (_, e) => kgot.Add(e.DeliveryTag);
+            var ktag = km.BasicConsume(kq, false, "", kcon);
+            ulong last = 0;
+            for (var i = 0; i < 5; i++) if (kgot.TryTake(out var t, 3000)) last = t;
+            km.BasicAck(last, multiple: true);
+            Thread.Sleep(700);
+            km.BasicCancel(ktag);
+            Thread.Sleep(300);
+            using var km2 = kc.CreateModel();
+            Console.WriteLine("left=" + km2.QueueDeclare(kq, true, false, false, null).MessageCount);
+            km2.QueueDelete(kq);
+            return 0;
+        }
+
         // `vhost <open|split|name> [host]` is the virtual host, which is a
         // namespace and nothing else: the same queue name in two of them is
         // two queues, and a host this broker was not told about is refused
@@ -845,6 +873,51 @@ class Program
             back == null ? "(nothing)" : back.BasicProperties.ContentType, "application/json");
         Check("and a header a client put there",
             back == null ? "(nothing)" : Encoding.UTF8.GetString((byte[])back.BasicProperties.Headers["tenant"]), "acme");
+
+        // `multiple` on `Basic.Ack`: one frame settles everything this
+        // channel is holding up to the tag it names. Ignoring the bit left
+        // four of five in flight for ever.
+        using var mch = conn.CreateModel();
+        var mq2 = "multi-" + Environment.TickCount;
+        mch.QueueDeclare(mq2, true, false, false, null);
+        for (var i = 0; i < 5; i++) mch.BasicPublish("", mq2, null, Encoding.UTF8.GetBytes("m"));
+        Thread.Sleep(500);
+        mch.BasicQos(0, 5, false);
+        var mtags = new BlockingCollection<ulong>();
+        var mcon2 = new EventingBasicConsumer(mch);
+        mcon2.Received += (_, e) => mtags.Add(e.DeliveryTag);
+        var mctag = mch.BasicConsume(mq2, false, "", mcon2);
+        ulong mlast = 0;
+        for (var i = 0; i < 5; i++) if (mtags.TryTake(out var mt, 3000)) mlast = mt;
+        mch.BasicAck(mlast, multiple: true);
+        Thread.Sleep(600);
+        mch.BasicCancel(mctag);
+        Thread.Sleep(400);
+        using var mch2 = conn.CreateModel();
+        Check("one acknowledgement with `multiple` settles them all",
+            (int)mch2.QueueDeclare(mq2, true, false, false, null).MessageCount, 0);
+        mch2.QueueDelete(mq2);
+
+        // `Basic.Reject` without `requeue` means throw it away, not hand it
+        // back. Handing it back is a message the consumer has refused coming
+        // round again, and again.
+        using var rch = conn.CreateModel();
+        var rq = "reject-" + Environment.TickCount;
+        rch.QueueDeclare(rq, true, false, false, null);
+        rch.BasicPublish("", rq, null, Encoding.UTF8.GetBytes("no thanks"));
+        Thread.Sleep(500);
+        var rgot = rch.BasicGet(rq, autoAck: false);
+        Check("a get that does not acknowledge is answered", rgot == null ? "(nothing)" : "something", "something");
+        if (rgot != null) rch.BasicReject(rgot.DeliveryTag, requeue: true);
+        Thread.Sleep(600);
+        Check("and rejecting it with requeue puts it back",
+            (int)rch.QueueDeclare(rq, true, false, false, null).MessageCount, 1);
+        var rgot2 = rch.BasicGet(rq, autoAck: false);
+        if (rgot2 != null) rch.BasicReject(rgot2.DeliveryTag, requeue: false);
+        Thread.Sleep(600);
+        Check("and rejecting it without requeue does not",
+            (int)rch.QueueDeclare(rq, true, false, false, null).MessageCount, 0);
+        rch.QueueDelete(rq);
 
         // A queue with no name is the broker's to name, and two of them are
         // two queues. They used to both be a queue genuinely called the empty
