@@ -150,6 +150,12 @@ fn au_has(rights, letter) = str_find(rights, letter) >= 0
 
 fn au_names(path) = map_keys(au_load(path))
 
+# Somebody this broker has heard of, without asking for a word. It is what a
+# name that came from a certificate is checked against: the certificate is the
+# proof, and this is only the guest list.
+fn au_known_name(path, name) =
+  !au_wanted(path) || map_has(au_load(path), name)
+
 # -- writing somebody down ------------------------------------------------------
 
 # A salt from the machine's own source of chance. There is no other in Rill and

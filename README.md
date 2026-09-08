@@ -678,6 +678,23 @@ in the handshake — before a frame is read, and so before a name and a word are
 asked for at all. Without `ca=`, nothing is asked of a client but its
 password.
 
+With one, the certificate can be the name as well as the door. AMQP's
+`EXTERNAL` mechanism sends no password: the name is the certificate's common
+name, and the handshake is the proof.
+
+```csharp
+var factory = new ConnectionFactory {
+    HostName = "broker.example", Port = 5671,
+    AuthMechanisms = new IAuthMechanismFactory[] { new ExternalMechanismFactory() },
+    Ssl = new SslOption { Enabled = true, CertPath = "alice.p12" },
+};
+```
+
+That name still has to be somebody in `users=`, with whatever virtual hosts
+and rights their line gives them. A certificate this broker will take at the
+door, whose common name it has never heard of, gets in no further than a wrong
+password would.
+
 The handshake is OpenSSL's, reached through Rill's `extern`, so this is a page
 of declarations in `src/tls.rill` rather than a TLS implementation. Nothing
 above that file knows which kind of connection it has: a connection carries an
@@ -1290,11 +1307,14 @@ All hundred and thirty-six of them pass, with or without a journal.
 - **The management pages do not know about virtual hosts.** They show every
   queue this broker holds, and one in a host other than the first is shown by
   the name it is stored under: the host, a slash, and the name.
-- **A client certificate is a door, not a name.** `ca=` decides who may reach
-  the broker; who they then are is still the name and word they send, and a
-  certificate's subject is not read or mapped to one. Between nodes there is
-  no TLS at all: a cluster link is a plain socket and one node proves nothing
-  to another but `peer=`.
+- **A certificate's name is taken as it is written.** `EXTERNAL` reads the
+  common name and looks it up in `users=`; RabbitMQ can be told a rule for
+  turning one into the other, and there is nothing here to be told. Nor is
+  anything checked for revocation: a certificate signed by something in `ca=`
+  is good until it expires. The broker's own protocol has no `EXTERNAL` of
+  its own — over `tls=` a name and a word are still sent.
+- **Between nodes there is no TLS at all.** A cluster link is a plain socket
+  and one node proves nothing to another but `peer=`.
 - **`immediate` is read and ignored.** The other bit on `Basic.Publish` asks
   for the message to be returned if no consumer is ready for it *this
   instant*, which is a promise about timing rather than about routing. RabbitMQ

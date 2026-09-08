@@ -237,6 +237,38 @@ class Program
             return 0;
         }
 
+        // `external <cert> <key> <cafile>` signs in with a certificate and no
+        // password at all: AMQP's `EXTERNAL` mechanism, where the name is the
+        // certificate's common name and the handshake is the proof.
+        if (args.Length > 4 && args[1] == "external")
+        {
+            var ef = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = port,
+                VirtualHost = "/",
+                AuthMechanisms = new IAuthMechanismFactory[] { new ExternalMechanismFactory() },
+                Ssl = new SslOption
+                {
+                    Enabled = true,
+                    ServerName = "localhost",
+                    CertPath = args[2],
+                    CertPassphrase = "",
+                    AcceptablePolicyErrors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch
+                        | System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors
+                }
+            };
+            try
+            {
+                using var ec = ef.CreateConnection();
+                using var em = ec.CreateModel();
+                em.QueueDeclare("external-q", true, false, false, null);
+                Console.WriteLine("in");
+            }
+            catch (Exception) { Console.WriteLine("out"); }
+            return 0;
+        }
+
         // `innerpub <exchange>` publishes to one exchange and says what came
         // back, which is how the restart suite asks whether `internal`
         // survived being written down and read again.

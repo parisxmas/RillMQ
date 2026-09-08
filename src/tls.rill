@@ -56,6 +56,16 @@ extern "ssl" fn SSL_write(ssl: Ptr, buf: Ptr, num: I32) -> I32
 
 extern "ssl" fn SSL_get_error(ssl: Ptr, ret: I32) -> I32
 
+# In OpenSSL 3 the old `SSL_get_peer_certificate` is a macro for this, so the
+# thing with a symbol is the one that is asked for.
+extern "ssl" fn SSL_get1_peer_certificate(ssl: Ptr) -> Ptr
+
+extern "crypto" fn X509_get_subject_name(x: Ptr) -> Ptr
+
+extern "crypto" fn X509_NAME_oneline(name: Ptr, buf: Ptr, size: I32) -> Ptr
+
+extern "crypto" fn X509_free(x: Ptr) -> Unit
+
 extern "ssl" fn SSL_shutdown(ssl: Ptr) -> I32
 
 extern "ssl" fn SSL_free(ssl: Ptr) -> Unit
@@ -147,6 +157,35 @@ fn tls_why() =
   from_cstr(b)
 
 fn tls_version() = int_to_str(OPENSSL_version_major()) + "." + int_to_str(OPENSSL_version_minor())
+
+# The common name out of the certificate a client showed, or the empty string
+# for a connection that showed none — which is every connection in the clear
+# and every one where `ca=` was not given, because without it the certificate
+# is never asked for.
+#
+# OpenSSL writes a whole subject as one line, `/C=GB/O=Acme/CN=alice`, and the
+# common name is the field this wants. There is a call that returns just that
+# field and it wants an index found by another call; the line is one call and
+# a search, and the search is for a string that cannot appear in a field it is
+# not the start of, because a field cannot hold a slash.
+fn tls_peer_name(ssl) =
+  if is_null(ssl) then "" else tls_named(SSL_get1_peer_certificate(ssl))
+
+fn tls_named(cert) =
+  if is_null(cert) then ""
+  else
+    b = buf_u8(512)
+    X509_NAME_oneline(X509_get_subject_name(cert), b, 511)
+    X509_free(cert)
+    tls_common_name(from_cstr(b))
+
+fn tls_common_name(line) =
+  at = str_find(line, "/CN=")
+  if at < 0 then "" else tls_upto_slash(line[at + 4:])
+
+fn tls_upto_slash(rest) =
+  at = str_find(rest, "/")
+  if at < 0 then rest else rest[0:at]
 
 # -- one connection --------------------------------------------------------------
 

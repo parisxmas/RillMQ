@@ -71,9 +71,19 @@ sign() {
 }
 sign server ca
 sign client ca
+sign alice ca
 sign stranger other-ca
 
-./rillmq "$A" "dir=$D/e" "users=$D/users" "tls=$CAP" \
+# The .NET client wants one file holding both halves.
+pack() {
+  openssl pkcs12 -export -out "$D/$1.p12" -inkey "$D/$1.key" -in "$D/$1.pem" \
+    -passout pass: >/dev/null 2>&1
+}
+pack alice
+pack client
+
+AMQPS2=$((A + 5))
+./rillmq "$A" "dir=$D/e" "users=$D/users" "tls=$CAP" "amqps=$AMQPS2" \
   "cert=$D/server.pem" "key=$D/server.key" "ca=$D/ca.pem" >/dev/null 2>&1 &
 M=$!
 up "$A" "$M" || exit 1
@@ -89,6 +99,15 @@ say "a client with a certificate this broker knows gets in" \
 say "a client with none does not" "$(shown "")" ""
 say "and one signed by somebody else does not either" \
   "$(shown "-cert $D/stranger.pem -key $D/stranger.key")" ""
+
+# `EXTERNAL`: no password at all, and the name is the certificate's common
+# name. `alice` is somebody this broker knows; `client` is a certificate it
+# will take at the door and a name it has never heard of.
+up "$AMQPS2" "$M" || exit 1
+say "a certificate whose name this broker knows signs in with no word" \
+  "$(dotnet_check "$AMQPS2" external "$D/alice.p12" "$D/alice.key" "$D/ca.pem")" "in"
+say "and one whose name it does not, does not" \
+  "$(dotnet_check "$AMQPS2" external "$D/client.p12" "$D/client.key" "$D/ca.pem")" "out"
 
 kill "$M" 2>/dev/null
 sleep 0.3

@@ -75,15 +75,21 @@ fn am_start(w: Who, buf) =
   p_write(w.ssl, w.fd, am_connection_start())
   match am_read_frame(w, buf)
     ADead -> am_shut(w)
-    ARead(kind, chan, payload, rest) -> am_said(am_noted(w, payload), rest, am_start_ok(payload))
+    ARead(kind, chan, payload, rest) -> am_said(am_noted(w, payload), rest, am_start_ok(w, payload), str_cmp(a_get_shortstr(payload, a_after_table(payload, am_args())), "EXTERNAL") == 0)
 
 # `Connection.Start-Ok` is where a client says who it is: a table of things it
 # would like the server to know, the mechanism it picked out of the ones
-# offered, and its answer in that mechanism. Only PLAIN is offered, so only
-# PLAIN is read.
-fn am_start_ok(payload) =
+# offered, and its answer in that mechanism.
+#
+# `EXTERNAL` is the mechanism that says "you already know": the name is not in
+# the frame at all, it is the common name of the certificate the client showed
+# during the handshake. Which means it only means anything on a connection
+# that showed one, and a connection only shows one when `ca=` asked for it —
+# so the certificate is both the door and the name, rather than a door with a
+# password behind it.
+fn am_start_ok(w: Who, payload) =
   at = a_after_table(payload, am_args())
-  au_plain(a_get_longstr(payload, a_after_shortstr(payload, at)))
+  if str_cmp(a_get_shortstr(payload, at), "EXTERNAL") == 0 then Said(tls_peer_name(w.ssl), "") else au_plain(a_get_longstr(payload, a_after_shortstr(payload, at)))
 
 # A word that is not the right one ends the connection there and then, with no
 # method and no reason given. That is what the specification asks for and it is
@@ -103,8 +109,16 @@ fn am_start_ok(payload) =
 fn am_noted(w: Who, payload) =
   Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, str_find(payload, "connection.blocked") >= 0, w.who, w.vh, w.rights)
 
-fn am_said(w: Who, buf, said: Said) =
-  if au_ok(w.users, said.name, said.word) then am_tune(am_signed_in(w, said.name), buf) else am_shut(w)
+# A name from a certificate is not asked for a word, because there is nothing
+# it could be asked: what it has instead is a certificate signed by something
+# in `ca=`, which the handshake already checked. What it still has to be is
+# somebody this broker knows, so a certificate whose common name is not in
+# `users=` gets in no further than a wrong password would.
+fn am_said(w: Who, buf, said: Said, shown) =
+  if am_signs_in(w, said, shown) then am_tune(am_signed_in(w, said.name), buf) else am_shut(w)
+
+fn am_signs_in(w: Who, said: Said, shown) =
+  if !shown then au_ok(w.users, said.name, said.word) else str_len(said.name) > 0 && au_known_name(w.users, said.name)
 
 fn am_signed_in(w: Who, name) =
   Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, name, w.vh, w.rights)
@@ -450,7 +464,7 @@ fn am_connection_start() =
   a_u8(b, 0)
   a_u8(b, 9)
   a_empty_table(b)
-  a_longstr(b, "PLAIN")
+  a_longstr(b, "PLAIN EXTERNAL")
   a_longstr(b, "en_US")
   am_method(0, a_class_connection(), 10, strbuf_str(b))
 
