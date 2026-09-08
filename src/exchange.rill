@@ -16,7 +16,7 @@ type X
   X(name: Str, kind: Str, binds: List(Bind), jr: Jr)
 
 type XReq
-  XPub(key: Str, body: Str, props: Str, out: Chan(Out))
+  XPub(key: Str, body: Str, props: Str, out: Chan(Out), back: Int)
   XBind(queue: Str, key: Str, ch: Chan(QReq), quiet: Bool, reply: Chan(Int))
   XUnbind(queue: Str, key: Str, reply: Chan(Int))
   # The end of this exchange. Its bindings go with it, and the routing journal
@@ -47,7 +47,7 @@ fn x_forget(x: X, quiet) =
 
 fn x_is_stop(r) = match r
   XStop(quiet, reply) -> true
-  XPub(key, body, props, out) -> false
+  XPub(key, body, props, out, back) -> false
   XBind(queue, key, ch, quiet, reply) -> false
   XUnbind(queue, key, reply) -> false
 
@@ -56,13 +56,13 @@ fn x_over(x: X, r) = match r
     send(reply, len(x.binds))
     x_forget(x, quiet)
     None
-  XPub(key, body, props, out) -> Some(x)
+  XPub(key, body, props, out, back) -> Some(x)
   XBind(queue, key, ch, quiet, reply) -> Some(x)
   XUnbind(queue, key, reply) -> Some(x)
 
 fn x_handle(x: X, r) = match r
-  XPub(key, body, props, out) ->
-    x_send(x, x_route(x, x.binds, key, Nil), body, props, out)
+  XPub(key, body, props, out, back) ->
+    x_send(x, x_route(x, x.binds, key, Nil), key, body, props, out, back)
     x
   XBind(queue, key, ch, quiet, reply) ->
     send(reply, 1)
@@ -145,10 +145,11 @@ fn x_hash_more(prest, ks) = match ks
 # channel goes to the queue and the answer comes back from there. More than one
 # needs somebody to wait for all of them and say so once, and that somebody is
 # a strand made for the purpose and gone as soon as it has counted.
-fn x_send(x: X, chans, body, props, out) = match chans
-  Nil ->
-    send(out, OPublished(x.name, 0))
-    0
+# Nothing matched. The publisher is told it is safe either way — an
+# unroutable message is confirmed, because the broker has decided about it and
+# that is what a confirm means — and gets it back as well if it asked to.
+fn x_send(x: X, chans, key, body, props, out, back) = match chans
+  Nil -> x_nowhere(x, key, body, props, out, back)
   Cons(ch, rest) -> match rest
     Nil ->
       send(ch, QPub(body, props, out))
@@ -158,6 +159,17 @@ fn x_send(x: X, chans, body, props, out) = match chans
       x_fan(chans, body, props, collect)
       spawn x_wait(collect, len(chans), out, x.name)
       0
+
+fn x_nowhere(x: X, key, body, props, out, back) =
+  x_hand_back(x, key, body, props, out, back)
+  send(out, OPublished(x.name, 0))
+  0
+
+fn x_hand_back(x: X, key, body, props, out, back) =
+  if back <= 0 then 0
+  else
+    send(out, ONoRoute(x.name, key, body, props, back))
+    0
 
 fn x_fan(chans, body, props, collect) = match chans
   Nil -> 0

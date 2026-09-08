@@ -519,6 +519,8 @@ fn b_put(fd, out, done, stopping, text, ssl) =
 fn b_bytes(what) = match what
   OFrame(text) -> text
   ODeliver(queue, id, body, props, sub) -> w_msg(id, queue, body)
+  # This protocol has no `mandatory` and so never asks for one of these.
+  ONoRoute(exchange, key, body, props, chan) -> ""
   OPublished(queue, id) -> w_ok_id(id)
 
 fn b_next(out, done) =
@@ -612,7 +614,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     send(c.out, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CXPub(ex, key, body) ->
-    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.out))
+    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.out, 0))
     b_read(c, buf, next, subs, 0, who)
   CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, bytes)
   CPromote(qname) ->

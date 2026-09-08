@@ -410,6 +410,30 @@ class Program
             refused(m => { m.BasicPublish(ux, "k", null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(700); }).Split(' ')[0],
             "404");
 
+        // `mandatory`: a publisher saying it would rather have the message
+        // back than have it disappear. Unroutable is not an error — the
+        // channel stays up — so this is the one thing a publisher can be told
+        // that is neither a refusal nor a confirmation.
+        var returned = new BlockingCollection<string>();
+        using (var rm = conn.CreateModel())
+        {
+            rm.BasicReturn += (_, ea) => returned.Add(ea.ReplyCode + " " + ea.ReplyText + " " + Encoding.UTF8.GetString(ea.Body.ToArray()));
+            string rx = q + "-return-x";
+            rm.ExchangeDeclare(rx, "direct", true);
+            rm.BasicPublish(rx, "nobody-is-bound-here", true, null, Encoding.UTF8.GetBytes("came back"));
+            Check("an unroutable mandatory message comes back",
+                returned.TryTake(out var r1, 5000) ? r1 : "(nothing)", "312 NO_ROUTE came back");
+
+            rm.BasicPublish("", "no-queue-of-that-name", true, null, Encoding.UTF8.GetBytes("also back"));
+            Check("and so does one to a queue that is not there",
+                returned.TryTake(out var r2, 5000) ? r2 : "(nothing)", "312 NO_ROUTE also back");
+
+            rm.BasicPublish(rx, "nobody-is-bound-here", false, null, Encoding.UTF8.GetBytes("dropped"));
+            Check("without the flag it is dropped in silence",
+                returned.TryTake(out var r3, 1200) ? r3 : "(nothing)", "(nothing)");
+            Check("and the channel is still up through all of it", rm.IsOpen, true);
+        }
+
         // A channel is where a refusal lands. Each of these used to be
         // silence: the client waited for a reply that was never coming, or
         // went on believing something the broker had quietly not done.

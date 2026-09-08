@@ -23,3 +23,13 @@ type Out
   # AMQP says `Basic.Ack` and only when the client asked for confirms. Both
   # are the same event, so the event is what travels.
   OPublished(queue: Str, id: Int)
+  # A message that matched nothing, on its way back to whoever sent it. Only a
+  # publisher that asked for it with `mandatory` ever sees one: without that
+  # flag an unroutable message is dropped, which is what AMQP says and what
+  # every broker does, and the flag is how a publisher says it would rather
+  # know.
+  # `chan` travels with it because the answer comes back long after the
+  # publish did, by which time the connection has moved on and no longer knows
+  # which channel asked. A message carrying where it is going is the only kind
+  # that arrives.
+  ONoRoute(exchange: Str, key: Str, body: Str, props: Str, chan: Int)

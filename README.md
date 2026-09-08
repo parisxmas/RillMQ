@@ -74,7 +74,8 @@ prefetch — `Queue.Declare` (which is also how a client asks how many are
 waiting), `Exchange.Declare` and `Queue.Bind` — both of which now refuse a name nobody
 declared — `Basic.Qos`, `Basic.Publish`,
 `Basic.Consume` with `no-ack`, `Basic.Deliver`, `Basic.Ack`, `Basic.Nack` and
-`Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `Queue.Purge`, `Queue.Delete`,
+`Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `mandatory` and `Basic.Return`,
+`Queue.Purge`, `Queue.Delete`,
 `Queue.Unbind`, `Exchange.Delete`, `Confirm.Select`, and closing a
 channel or a connection — from either side, since the broker closes a channel
 itself when it has to refuse something. A message's properties — `reply-to`,
@@ -558,11 +559,23 @@ double-delivery bug — was told nothing by the one party that knew. A second
 consumer registered under a name already in use quietly replaced the first,
 which stayed subscribed in the queue with nothing left pointing at it.
 
-Publishing to a queue that is not there is not on that list and is not an
-error: the default exchange routes by name, a name matching nothing routes
-nowhere, and AMQP drops the message — which is what RabbitMQ does. What it
-must not do is make the queue, and it no longer does. A publisher that wants
-to hear about it asks with `mandatory`, which RillMQ does not answer yet.
+Publishing somewhere nothing is listening is not on that list and is not an
+error: a routing key matching no binding routes nowhere, and AMQP drops the
+message — which is what RabbitMQ does. What it must not do is make the queue
+or the exchange, and it no longer does.
+
+A publisher that would rather know says `mandatory`, and then the message
+comes back: `Basic.Return` with 312 `NO_ROUTE`, followed by the same header
+and body frames it published, so a client is handed exactly what it sent. It
+is confirmed as well, because the broker has decided about it and that is what
+a confirm means.
+
+The flag is per publish and the answer arrives long afterwards, by which time
+the connection has moved on and no longer knows which channel asked — so the
+channel travels with the message and comes back on it. Reaching the returning
+code at all means the publisher asked, since nothing produces one of these
+otherwise, and checking a flag a second time would have been checking the
+wrong publish's.
 
 The 404 is the one a client earns most often, by typing a name wrong, and
 making the exchange instead was the expensive kind of silence: the messages
@@ -943,7 +956,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 42 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 46 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 3 checks that a deleted exchange stays deleted
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
@@ -960,7 +973,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and seventeen of them pass, with or without a journal.
+All hundred and twenty-one of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1027,9 +1040,16 @@ All hundred and seventeen of them pass, with or without a journal.
 - **TLS is server-side only, and there is no client certificate.** A client
   proves nothing about itself but its password, and one node proves nothing to
   another but `peer=`.
-- **No flow control back to publishers, only a wall.** A publisher that
-  outruns its consumers is refused rather than slowed, so it finds out by
-  being told no rather than by being made to wait.
+- **`immediate` is read and ignored.** The other bit on `Basic.Publish` asks
+  for the message to be returned if no consumer is ready for it *this
+  instant*, which is a promise about timing rather than about routing. RabbitMQ
+  removed it years ago and this never had it.
+- **At the memory limit a publisher is refused, not slowed.** Below it there
+  is real backpressure and always was: the strand reading a connection hands
+  each publish to the queue and does not read the next until it can, so a
+  slow queue fills the socket and the publisher waits. What is missing is
+  `Connection.Blocked` at the wall, so a publisher that has hit `mem=` finds
+  out by being told no rather than by being asked to pause.
 - **The history is two minutes and it is in memory.** One strand samples the
   registry once a second and keeps a hundred and twenty of those, so a rate is
   over the last ten seconds and a line is over the last minute. Nothing longer
