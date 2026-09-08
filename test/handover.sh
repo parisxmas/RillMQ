@@ -69,6 +69,38 @@ print(','.join(said) + '|' + ','.join(got))
 say "the publish that provokes the takeover is not the one it loses" "${OUT%%|*}" "+OK,+OK,+OK"
 say "and the consumer reads through it without noticing" "${OUT##*|}" "one,two,three"
 
+# And the other half of it: a node that stops while nobody is asking anything
+# at all. Until there were heartbeats the cluster found out on the next
+# request, so a quiet night ended with somebody paying for an election.
+E=$((A + 10))
+F=$((E + 1))
+G=$((E + 2))
+Q="127.0.0.1:$E,127.0.0.1:$F,127.0.0.1:$G"
+D2="$(mktemp -d)"
+./rillmq "$E" "dir=$D2/1" node=0 "peers=$Q" >/dev/null 2>&1 & M1=$!; up "$E" "$M1" || exit 1
+./rillmq "$F" "dir=$D2/2" node=1 "peers=$Q" >/dev/null 2>&1 & M2=$!; up "$F" "$M2" || exit 1
+./rillmq "$G" "dir=$D2/3" node=2 "peers=$Q" >/dev/null 2>&1 & M3=$!; up "$G" "$M3" || exit 1
+sleep 2
+
+# `nc` closes its end as soon as the printf is done, and a publish that has to
+# hold an election first can be slower than that. This waits for the answer.
+quiet() { python3 -c "
+import socket, sys
+s = socket.create_connection(('127.0.0.1', int(sys.argv[2]))); s.settimeout(8)
+s.sendall(sys.argv[1].encode().decode('unicode_escape').encode())
+try: print(s.recv(300).decode().split('\r\n')[0])
+except Exception: print('(timeout)')
+" "$1" "$2"; }
+
+quiet 'PUB gamma 3\r\none' "$F" >/dev/null
+sleep 1
+say "nobody leads it while its own node is up" "$(quiet 'WHO gamma\r\n' "$F")" "+WHO -1"
+kill -9 "$M1" 2>/dev/null
+sleep 6
+say "and somebody does once that node stops, with nobody asking" "$(quiet 'WHO gamma\r\n' "$F")" "+WHO 1"
+say "so the next client to want it is not the one who pays" "$(quiet 'PUB gamma 3\r\ntwo' "$F" | cut -d' ' -f1)" "+OK"
+
+kill -9 "$M2" "$M3" 2>/dev/null
 kill -9 "$N2" "$N3" 2>/dev/null
 sleep 0.3
 printf '\n%d of %d passed\n' "$PASS" "$((PASS + FAIL))"

@@ -49,6 +49,10 @@ type RReq
   # It is the same file that queue would have here, so promoting the copy is
   # starting a queue from a journal that is already in place.
   RCopy(name: Str, reply: Chan(Jr))
+  # Every queue this node is keeping a copy of. It is the only list of other
+  # nodes' queues this node has, and so the only set of things it could take
+  # over if one of them stopped answering.
+  RCopies(reply: Chan(List(Str)))
   # Serve a queue this node has only been keeping a copy of. What was a stand-in
   # for somebody else's queue becomes the queue.
   RPromote(name: Str, reply: Chan(Int))
@@ -159,6 +163,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RTable(reply) ->
     send(reply, r_table(qs, map_keys(qs), Nil))
+    0
+  RCopies(reply) ->
+    send(reply, map_keys(cs))
     0
   RCopy(name, reply) ->
     send(reply, r_copy(cs, g.dir, name, done))

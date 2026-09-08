@@ -67,6 +67,7 @@ fn run_broker(server, dir) =
   restored = bring_back(reg, dir)
   routed = bring_back_routes(reg, dir)
   spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())), b_door())
+  spawn cl_watch(reg, done)
   amqp_on(reg, done, opt_int("amqp", 0), b_door())
   wrapped(reg, done, tls_ready(opt("cert", ""), opt("key", "")))
   mg_on(reg, done, mg_port(), b_users())

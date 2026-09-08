@@ -16,7 +16,9 @@ Everything else is optional and named. Ports: `amqp=<port>` AMQP 0-9-1,
 `tls=<port>` and `amqps=<port>` the same two wrapped in TLS, `manage=<port>`
 the management pages. Files: `cert=` and `key=` a certificate and its key in
 PEM, `users=` who may connect. Cluster: `peers=<host:port,...>`, `node=<i>`,
-and `peer=<name:word>` for what one node signs in to another as. Limits:
+`peer=<name:word>` for what one node signs in to another as, and `beat=<ms>`
+for how often a node checks that the ones whose copies it keeps are still
+there. Limits:
 `ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much
 one consumer may hold, `mem=<MB>` how big the broker may get before it refuses
 publishes, `idle=<s>` how long a connection that has asked for nothing may say
@@ -349,6 +351,27 @@ which is what the proxy already did when a link came back.
 `test/handover.sh` is the two of them together: a publisher and a consumer on
 one node while the node that owns the queue is killed underneath them. Three
 messages published, three received, no error seen by either.
+
+### Noticing without being asked
+
+Until there were heartbeats nothing noticed a node was gone until somebody
+wanted a queue it held, so a quiet night ended with whoever asked first paying
+for an election. `beat=<ms>` is how often a node looks, two seconds by
+default, and `beat=0` turns it off.
+
+What a node can honestly watch is what it is holding a copy of, because that
+is the only list of other nodes' queues it has — and it is exactly the set it
+could take over. So it pings each node whose copies it keeps, and stands for
+the ones that do not answer. The election is the same one a request would have
+held; it is simply held by nobody's request.
+
+The risk this raises is the one the cluster already had. A node cut off from
+the rest still believes it leads its queues, and now the others will take them
+over sooner. What stops that from being two brokers with one queue is what
+always did: a leader confirms nothing without a majority of copies, so the
+cut-off one can still take messages and can no longer promise anything about
+them, and a copy that has heard of a later turn refuses its records with
+`-STALE`. Sooner failover makes the window shorter, not the guarantee weaker.
 
 ### Taking a copy over by hand
 
@@ -983,7 +1006,7 @@ sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
 sh test/majority.sh          # 5 checks across three
-sh test/handover.sh          # 2 checks with a publisher and a consumer working
+sh test/handover.sh          # 5 checks with clients working, and with none at all
 sh test/failover.sh          # 8 checks, one node killed with nobody watching
 ```
 
@@ -995,7 +1018,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and twenty-four of them pass, with or without a journal.
+All hundred and twenty-seven of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1006,12 +1029,14 @@ All hundred and twenty-four of them pass, with or without a journal.
 - **A rewrite holds the whole live queue as records at once.** The queue builds
   them and hands them over as a list, which for a large queue is a second copy
   of it in memory for as long as the write takes.
-- **An election is one round and no heartbeats.** Nothing notices a node is
-  gone until somebody wants a queue it held. A cluster nobody is using does
-  not notice anything, which is the right amount of noticing for a cluster
-  nobody is using and the wrong amount for one about to be. What the asking
-  costs is now nothing, though: the request that provokes the takeover is the
-  first one the new leader answers.
+- **An election is one round.** One ask, one majority, one turn — there is no
+  second phase and no log to reconcile, which is what makes a candidate that
+  is behind a candidate that stays behind.
+- **A node watches only what it is holding a copy of.** That is the only list
+  of other nodes' queues it has, so a queue nobody has published to yet is a
+  queue nobody is watching over. It has nothing in it, which is why this is
+  liveable, but the first message to a cold queue on a dead node still waits
+  for somebody to ask.
 - **A term is per queue, and there is no log to catch up on.** A candidate
   that is behind is refused and stays behind; nothing copies it the records it
   is missing. In a cluster that has been up long enough for a majority to have

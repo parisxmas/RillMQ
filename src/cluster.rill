@@ -135,6 +135,98 @@ fn cl_resub(p: P, ses, done) =
 # coming back costs a connection attempt per second and not per message.
 fn cl_retry_ms() = 1000
 
+# -- noticing without being asked ------------------------------------------------
+#
+# Until this, nothing noticed a node was gone until somebody wanted a queue it
+# held. That is the right amount of noticing for a cluster nobody is using and
+# the wrong amount for one about to be: the first request after a quiet night
+# paid for the election.
+#
+# What a node can honestly watch is what it is holding a copy of, because that
+# is the only list of other nodes' queues it has — and it is exactly the set it
+# could take over. So every few seconds it asks each node whose copies it keeps
+# whether it is there, and stands for the ones that do not answer.
+#
+# The risk this raises is the one it already had. A node cut off from the rest
+# still believes it leads its queues, and now the others will take them over
+# sooner. What stops that being two brokers with one queue is the same thing
+# that always did: a leader confirms nothing without a majority of copies, so
+# the cut-off one can still take messages and can no longer promise anything
+# about them, and a copy that has heard of a later turn refuses its records.
+fn cl_beat_ms() = opt_int("beat", 2000)
+
+fn cl_watch(reg, done) =
+  peers = cl_peers()
+  if cl_beat_ms() <= 0 || len(peers) <= 1 then 0 else cl_beating(reg, done, peers)
+
+fn cl_beating(reg, done, peers) =
+  go = select
+    recv(done) -> false
+    timeout(cl_beat_ms()) -> true
+  if !go then 0 else cl_round(reg, done, peers)
+
+fn cl_round(reg, done, peers) =
+  cl_check_each(reg, peers, cl_copies(reg))
+  cl_beating(reg, done, peers)
+
+fn cl_copies(reg) =
+  back = channel(1)
+  send(reg, RCopies(back))
+  recv(back)
+
+# One ping per queue is one ping too many when a node holds twenty copies of
+# the same node's queues, but a ping is a connection and a line and this
+# happens every couple of seconds. Simplicity is worth more here than the
+# syscalls: what would replace it is a table of who was up when, which is a
+# second thing that can be wrong.
+fn cl_check_each(reg, peers, names) = match names
+  Nil -> 0
+  Cons(n, rest) ->
+    cl_check_one(reg, peers, n)
+    cl_check_each(reg, peers, rest)
+
+fn cl_check_one(reg, peers, name) =
+  owner = cl_owner(name, len(peers))
+  if owner == cl_me() || cl_alive(nth(peers, owner)) then 0 else cl_step_up(reg, peers, name)
+
+fn cl_alive(where) = match where
+  None -> true
+  Some(q) -> starts_with(cl_one_shot(cl_host(q), cl_port(q), "PING" + crlf2()), "+PONG")
+
+# The same election a request would have held, held by nobody's request. If it
+# is won the queue starts here and the next client to want it finds it, rather
+# than finding a node that is not there and waiting for a turn to be decided.
+fn cl_step_up(reg, peers, name) =
+  term = cl_term_at(reg, name) + 1
+  if !cl_stand(name, term, cl_size_at(reg, name), peers, cl_me()) then 0 else cl_stepped_up(reg, name, term)
+
+fn cl_stepped_up(reg, name, term) =
+  println("rillmq: " + name + " has nobody, taking it over for turn " + int_to_str(term))
+  cl_note_term_at(reg, name, term)
+  back = channel(1)
+  send(reg, RPromote(name, back))
+  recv(back)
+  0
+
+# Writing the turn down as a vote for itself, which is what a node standing
+# for a queue does anyway: the record is what makes anything it sends
+# afterwards say which turn it is for.
+fn cl_note_term_at(reg, name, term) =
+  back = channel(1)
+  send(reg, RVote(name, term, cl_size_at(reg, name), cl_me(), back))
+  recv(back)
+  0
+
+fn cl_term_at(reg, name) =
+  back = channel(1)
+  send(reg, RTerm(name, back))
+  recv(back)
+
+fn cl_size_at(reg, name) =
+  back = channel(1)
+  send(reg, RSize(name, back))
+  recv(back)
+
 # A queue whose node cannot be reached still has to answer, or every publisher
 # that names it waits for ever. It says no.
 fn cl_refuse(name, inbox, done) =
