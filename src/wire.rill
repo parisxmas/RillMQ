@@ -165,8 +165,12 @@ fn w_who_line(node) = "+WHO " + int_to_str(node) + crlf()
 
 fn w_stale() = "-STALE" + crlf()
 
-fn w_qstat_line(ready, inflight, subs, published) =
-  "+QSTAT " + int_to_str(ready) + " " + int_to_str(inflight) + " " + int_to_str(subs) + " " + int_to_str(published) + crlf()
+# Four numbers became seven, and the three new ones are on the end so that a
+# client reading the first four goes on working. `delivered` and `acked` only
+# go up, which is what a rate is made from; `oldest` is how long the message at
+# the front has been waiting, in milliseconds, or zero for an empty queue.
+fn w_qstat_line(ready, inflight, subs, published, delivered, acked, oldest) =
+  "+QSTAT " + int_to_str(ready) + " " + int_to_str(inflight) + " " + int_to_str(subs) + " " + int_to_str(published) + " " + int_to_str(delivered) + " " + int_to_str(acked) + " " + int_to_str(oldest) + crlf()
 
 fn w_xdecl(parts, rest) =
   ex = w_name(parts)

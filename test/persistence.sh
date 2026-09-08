@@ -96,7 +96,11 @@ stop
 
 start
 ask 'XDECL logs topic\r\nBIND logs errs *.error\r\nBIND logs under app.#\r\nXPUB logs app.error 5\r\nfirstQUIT\r\n' >/dev/null
-qstat() { printf 'QSTAT %s\r\nQUIT\r\n' "$1" | nc -w 2 127.0.0.1 "$PORT" | head -1 | tr -d '\r'; }
+# The first five fields: `+QSTAT ready inflight subs published`. The line has
+# three more on the end now — delivered, acknowledged and how long the oldest
+# message has been waiting — and the last of those is a clock, so a check that
+# read the whole line would be a check that fails a millisecond later.
+qstat() { printf 'QSTAT %s\r\nQUIT\r\n' "$1" | nc -w 2 127.0.0.1 "$PORT" | head -1 | tr -d '\r' | cut -d' ' -f1-5; }
 say "a routed message reaches both bindings" "$(qstat errs)|$(qstat under)" "+QSTAT 1 0 0 1|+QSTAT 1 0 0 1"
 BYTES=$(wc -c < "$DIR/_routes.log" | tr -d ' ')
 stop

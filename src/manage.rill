@@ -18,6 +18,109 @@ import "sha1"
 
 fn mg_port() = opt_int("manage", 0)
 
+# -- what happened a minute ago ----------------------------------------------------
+#
+# `QUEUES` says what is true now, and "is this queue growing" is not a question
+# about now. So one strand asks the registry once a second and keeps the last
+# few minutes of answers; the pages ask it rather than the registry, and a rate
+# is two of its samples subtracted.
+#
+# It is a strand with a map because that is the only way to hold history in
+# this broker: nothing is shared, so whatever remembers something owns it and
+# answers questions about it.
+fn mg_every_ms() = 1000
+
+fn mg_keep() = 120
+
+type Seen
+  Seen(at: Int, rows: List(QRow))
+
+type SeenReq
+  SeenAll(reply: Chan(List(Seen)))
+
+fn mg_watch(reg, done, inbox) = mg_watching(reg, done, inbox, Nil)
+
+fn mg_watching(reg, done, inbox, past) =
+  step = select
+    r = recv(inbox) -> Some(mg_answer_seen(r, past))
+    recv(done) -> None
+    timeout(mg_every_ms()) -> Some(mg_sample(reg, past))
+  match step
+    None -> 0
+    Some(next) -> mg_watching(reg, done, inbox, next)
+
+fn mg_answer_seen(r, past) = match r
+  SeenAll(reply) ->
+    send(reply, past)
+    past
+
+# Newest first, and the tail dropped. A list rather than a ring because two
+# minutes of samples is a hundred and twenty conses and the code that reads it
+# wants them in order.
+fn mg_sample(reg, past) = mg_kept(Cons(Seen(now_millis(), mg_table(reg)), past), mg_keep())
+
+fn mg_kept(l, n) = match l
+  Nil -> Nil
+  Cons(x, rest) -> if n <= 0 then Nil else Cons(x, mg_kept(rest, n - 1))
+
+# -- reading it back -----------------------------------------------------------------
+
+fn mg_history(watch) =
+  back = channel(1)
+  send(watch, SeenAll(back))
+  recv(back)
+
+# How much came in and went out per second for one queue, over the last little
+# while. Two samples and the seconds between them; nothing is smoothed, because
+# a broker's operator is usually looking for a step rather than a trend.
+fn mg_rate_in(past, name) = mg_rate(past, name, true)
+
+fn mg_rate_out(past, name) = mg_rate(past, name, false)
+
+fn mg_rate(past, name, coming) = match past
+  Nil -> 0
+  Cons(now, rest) -> mg_rate_from(now, mg_older(rest, now.at - 10000), name, coming)
+
+# The oldest sample no more than ten seconds behind the newest, or the oldest
+# there is. A window rather than the last pair, because one second of counting
+# on a busy broker is mostly noise.
+fn mg_older(l, floor) = match l
+  Nil -> None
+  Cons(x, rest) -> mg_pick_older(x, mg_older(rest, floor), floor)
+
+fn mg_pick_older(here: Seen, deeper, floor) = match deeper
+  None -> Some(here)
+  Some(older) -> if mg_seen_at(older) >= floor then Some(older) else Some(here)
+
+fn mg_seen_at(s: Seen) = s.at
+
+fn mg_rate_from(now: Seen, earlier, name, coming) = match earlier
+  None -> 0
+  Some(before) -> mg_between(now, before, name, coming)
+
+fn mg_between(now: Seen, before: Seen, name, coming) =
+  mg_per_second(mg_count_in(now.rows, name, coming) - mg_count_in(before.rows, name, coming), now.at - before.at)
+
+fn mg_per_second(by, over) = if over <= 0 then 0 else by * 1000 / over
+
+fn mg_count_in(rows, name, coming) = match rows
+  Nil -> 0
+  Cons(r, rest) -> if str_cmp(qr_name(r), name) == 0 then if coming then qr_published(r) else qr_acked(r) else mg_count_in(rest, name, coming)
+
+# The last minute of a queue's depth, oldest first, for a line to be drawn
+# from. Nothing is scaled here: the page knows how tall it wants to be.
+fn mg_depths(past, name) = reverse(mg_depths_from(past, name, 60))
+
+fn mg_depths_from(l, name, n) = match l
+  Nil -> Nil
+  Cons(x, rest) -> if n <= 0 then Nil else Cons(mg_seen_depth(x, name), mg_depths_from(rest, name, n - 1))
+
+fn mg_seen_depth(s: Seen, name) = mg_depth_in(s.rows, name)
+
+fn mg_depth_in(rows, name) = match rows
+  Nil -> 0
+  Cons(r, rest) -> if str_cmp(qr_name(r), name) == 0 then qr_ready(r) + qr_inflight(r) else mg_depth_in(rest, name)
+
 fn mg_stop_with(why) =
   println(why)
   exit(1)
@@ -30,22 +133,29 @@ fn mg_on(reg, done, port, users) =
     Err(e) -> mg_stop_with("rillmq: " + e)
     Ok(server) ->
       println("rillmq management on http://127.0.0.1:" + int_to_str(sock_port(server)) + (if au_wanted(users) then "" else " — open, because no users= was given"))
-      spawn mg_accept(server, reg, users)
-      0
+      mg_started(server, reg, done, users)
 
-fn mg_accept(server, reg, users) =
-  serve_taking(server, \req -> mg_guard(reg, users, req), \c, raw -> false)
+# One strand watching, one accepting. The watcher owns the history, which is
+# the only state in this broker that is about the past.
+fn mg_started(server, reg, done, users) =
+  watch = channel(8)
+  spawn mg_watch(reg, done, watch)
+  spawn mg_accept(server, reg, users, watch)
+  0
+
+fn mg_accept(server, reg, users, watch) =
+  serve_taking(server, \req -> mg_guard(reg, users, watch, req), \c, raw -> false)
 
 # -- who is asking ---------------------------------------------------------------
 
 # The same names and words the brokers ask for, over HTTP's own way of asking:
 # `Authorization: Basic`. A broker with no password file has no way to tell one
 # person from another, so it does not pretend to and lets everybody in.
-fn mg_guard(reg, users, req: Request) =
-  if !au_wanted(users) then mg_route(reg, users, req, "anyone") else mg_signed_in(reg, users, req, mg_basic(req))
+fn mg_guard(reg, users, watch, req: Request) =
+  if !au_wanted(users) then mg_route(reg, users, watch, req, "anyone") else mg_signed_in(reg, users, watch, req, mg_basic(req))
 
-fn mg_signed_in(reg, users, req: Request, said: Said) =
-  if str_len(said.name) > 0 && au_ok(users, said.name, said.word) then mg_route(reg, users, req, said.name) else mg_ask()
+fn mg_signed_in(reg, users, watch, req: Request, said: Said) =
+  if str_len(said.name) > 0 && au_ok(users, said.name, said.word) then mg_route(reg, users, watch, req, said.name) else mg_ask()
 
 fn mg_ask() =
   with_header(text_response(401, "a name and a word are wanted\n"), "WWW-Authenticate", "Basic realm=\"rillmq\"")
@@ -83,12 +193,12 @@ fn b64_value(c) =
 
 # -- what is where ------------------------------------------------------------------
 
-fn mg_route(reg, users, req: Request, who) =
+fn mg_route(reg, users, watch, req: Request, who) =
   path = path_of(req.path)
-  if str_cmp(req.method, "POST") == 0 then mg_post(reg, users, req, who, path) else mg_get(reg, users, req, who, path)
+  if str_cmp(req.method, "POST") == 0 then mg_post(reg, users, req, who, path) else mg_get(reg, users, watch, req, who, path)
 
-fn mg_get(reg, users, req: Request, who, path) =
-  if str_cmp(path, "/") == 0 then mg_page(reg, who, param(query_of(req.path), "said")) else if str_cmp(path, "/people") == 0 then mg_people_page(users, who, param(query_of(req.path), "said")) else if str_cmp(path, "/api/queues") == 0 then json_response(200, mg_queues_json(mg_table(reg))) else if str_cmp(path, "/api/overview") == 0 then json_response(200, mg_overview_json(mg_totals(reg), users)) else text_response(404, "no such page\n")
+fn mg_get(reg, users, watch, req: Request, who, path) =
+  if str_cmp(path, "/") == 0 then mg_page(reg, watch, who, param(query_of(req.path), "said")) else if str_cmp(path, "/people") == 0 then mg_people_page(users, who, param(query_of(req.path), "said")) else if str_cmp(path, "/api/queues") == 0 then json_response(200, mg_queues_json(mg_table(reg), mg_history(watch))) else if str_cmp(path, "/api/overview") == 0 then json_response(200, mg_overview_json(mg_totals(reg), users)) else text_response(404, "no such page\n")
 
 # Every form answers with a redirect rather than a page, so that reloading
 # after publishing does not publish again.
@@ -101,9 +211,9 @@ fn mg_back(where, said) =
 
 # -- the pages ------------------------------------------------------------------------
 
-fn mg_page(reg, who, said) =
+fn mg_page(reg, watch, who, said) =
   b = strbuf()
-  mg_overview(b, mg_totals(reg), mg_table(reg), who, mg_note(), said)
+  mg_overview(b, mg_totals(reg), mg_table(reg), mg_history(watch), who, mg_note(), said)
   html_response(200, strbuf_str(b))
 
 fn mg_people_page(users, who, said) =
@@ -168,23 +278,62 @@ fn mg_forget(users, name) =
 fn mg_overview_json(t: Totals, users) =
   "{\"queues\":" + int_to_str(tot_queues(t)) + ",\"ready\":" + int_to_str(tot_ready(t)) + ",\"inflight\":" + int_to_str(tot_inflight(t)) + ",\"asks_for_a_password\":" + (if au_wanted(users) then "true" else "false") + "}"
 
-fn mg_queues_json(rows) =
+fn mg_queues_json(rows, past) =
   b = strbuf()
   b += "["
-  mg_rows_json(b, rows, 0)
+  mg_rows_json(b, rows, past, 0)
   b += "]"
   strbuf_str(b)
 
-fn mg_rows_json(b: StrBuf, rows, n) = match rows
+fn mg_rows_json(b: StrBuf, rows, past, n) = match rows
   Nil -> 0
   Cons(r, rest) ->
-    mg_row_json(b, r, n)
-    mg_rows_json(b, rest, n + 1)
+    mg_row_json(b, r, past, n)
+    mg_rows_json(b, rest, past, n + 1)
 
-fn mg_row_json(b: StrBuf, r: QRow, n) =
+fn mg_row_json(b: StrBuf, r: QRow, past, n) =
   mg_comma(b, n)
-  b += "{\"name\":\"" + mg_quoted(qr_name(r)) + "\",\"ready\":" + int_to_str(qr_ready(r)) + ",\"inflight\":" + int_to_str(qr_inflight(r)) + ",\"consumers\":" + int_to_str(qr_subs(r)) + ",\"published\":" + int_to_str(qr_published(r)) + "}"
+  b += "{\"name\":\"" + mg_quoted(qr_name(r)) + "\",\"ready\":" + int_to_str(qr_ready(r)) + ",\"inflight\":" + int_to_str(qr_inflight(r)) + ",\"consumers\":" + int_to_str(qr_subs(r)) + ",\"published\":" + int_to_str(qr_published(r)) + ",\"delivered\":" + int_to_str(qr_delivered(r)) + ",\"acked\":" + int_to_str(qr_acked(r)) + ",\"oldest_ms\":" + int_to_str(mg_age(qr_oldest(r))) + ",\"in_per_sec\":" + int_to_str(mg_rate_in(past, qr_name(r))) + ",\"out_per_sec\":" + int_to_str(mg_rate_out(past, qr_name(r))) + "}"
   0
+
+# The queue keeps the moment a message arrived; a page wants how long ago that
+# was. An empty queue has no oldest message rather than one from 1970.
+fn mg_age(at) = if at <= 0 then 0 else now_millis() - at
+
+# The same as words, because "4m 12s" is read faster than a number of
+# milliseconds by the person who is worried about it.
+fn mg_ago(at) =
+  ms = mg_age(at)
+  if ms <= 0 then "—" else if ms < 1000 then int_to_str(ms) + "ms" else if ms < 60000 then int_to_str(ms / 1000) + "s" else if ms < 3600000 then int_to_str(ms / 60000) + "m " + int_to_str(ms / 1000 - ms / 60000 * 60) + "s" else int_to_str(ms / 3600000) + "h " + int_to_str(ms / 60000 - ms / 3600000 * 60) + "m"
+
+# A line of the last minute's depth, as an SVG path. Sixty numbers scaled to
+# the tallest of them, so the shape is what is read rather than the value:
+# flat is keeping up, climbing is not.
+fn mg_spark(past, name) = mg_spark_of(mg_depths(past, name))
+
+fn mg_spark_of(ds) =
+  n = len(ds)
+  if n < 2 then "" else mg_spark_path(ds, n, mg_tallest(ds, 1))
+
+fn mg_tallest(ds, most) = match ds
+  Nil -> most
+  Cons(d, rest) -> mg_tallest(rest, if d > most then d else most)
+
+fn mg_spark_path(ds, n, most) =
+  b = strbuf()
+  mg_spark_points(b, ds, 0, n, most)
+  strbuf_str(b)
+
+# Two units of headroom at each end, because a queue that is empty is the
+# interesting flat line and half a stroke of it was being clipped by the edge
+# of the box.
+fn mg_spark_y(d, most) = 18 - d * 16 / most
+
+fn mg_spark_points(b: StrBuf, ds, i, n, most) = match ds
+  Nil -> 0
+  Cons(d, rest) ->
+    b += (if i == 0 then "M" else "L") + int_to_str(i * 100 / (n - 1)) + " " + int_to_str(mg_spark_y(d, most)) + " "
+    mg_spark_points(b, rest, i + 1, n, most)
 
 # A queue name is whatever a client called it, so it may hold a quote or a
 # backslash and JSON has to be told.

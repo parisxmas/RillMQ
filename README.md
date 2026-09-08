@@ -506,6 +506,33 @@ Emptying a queue writes an acknowledgement record per message, so a queue
 emptied from a page is still empty after a restart. What is in flight is left
 alone: it is somebody's to answer for.
 
+**What it shows that `QUEUES` cannot.** `QUEUES` says what is true now, and
+"is this queue growing" is not a question about now. So one strand asks the
+registry once a second and keeps two minutes of answers; the pages ask it
+rather than the registry, and a rate is two of its samples subtracted. That
+strand owns the history, which is the only state in this broker that is about
+the past — nothing is shared, so whatever remembers something answers the
+questions about it.
+
+The row for a queue then reads as a sentence. Three queues under load:
+
+| name | last minute | in /s | out /s | ready | in flight | oldest |
+|---|---|---:|---:|---:|---:|---:|
+| `audit-log` | flat | 5 | 5 | 0 | 0 | — |
+| `emails` | climbing | 115 | 19 | 5,636 | 64 | 46s |
+| `orders` | flat | 38 | 36 | 50 | 64 | 1s |
+
+`emails` is the one to look at, and it takes no arithmetic to see: more is
+going in than coming out, the line is climbing, and the message at the front
+has been waiting three quarters of a minute. `orders` is busier than
+`audit-log` and just as healthy. None of that was visible before — the numbers
+were all there and none of them had a yesterday to be compared with.
+
+`QSTAT` on the wire and `/api/queues` carry the same figures, so a script sees
+what a person sees. The wire line gained three fields on the end —
+`delivered`, `acked` and how long the oldest message has waited — and a client
+reading the first four goes on working.
+
 ## When the answer is no
 
 A channel is where a refusal lands, which is what a channel is for: a
@@ -620,7 +647,7 @@ body is bytes; a Rill string is a byte string, so nothing cares what is in one.
 | `XPUB <exchange> <key> <len>\r\n<body>` | `+OK` |
 | `STATS` | `+STATS <queues> <ready> <inflight>` |
 | `QUEUES` | `+QUEUES <n>`, then `n` rows of `Q <name> <ready> <inflight> <subs> <published>` |
-| `QSTAT <queue>` | `+QSTAT <ready> <inflight> <subs> <published>` |
+| `QSTAT <queue>` | `+QSTAT <ready> <inflight> <subs> <published> <delivered> <acked> <oldest-ms>` |
 | `DRAIN <queue>` | `+DRAIN <n>` — everything waiting thrown away, what is in flight left alone |
 | `AUTH <name> <word>` | `+OK`, or `-ERR no`; wanted first when the broker was given a `users=` file |
 | `PING` | `+PONG` |
@@ -1003,6 +1030,15 @@ All hundred and seventeen of them pass, with or without a journal.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.
-- **Nothing is measured over time.** `QUEUES` says what is true now; there is
-  no rate, no age of the oldest message, and no way to see how big a queue's
-  journal has grown.
+- **The history is two minutes and it is in memory.** One strand samples the
+  registry once a second and keeps a hundred and twenty of those, so a rate is
+  over the last ten seconds and a line is over the last minute. Nothing longer
+  is kept and nothing survives a restart, because keeping it would mean a
+  second thing on the disk with its own rules about being trimmed.
+- **The age of the oldest message is since this broker saw it.** It is held
+  beside the message in memory and not in the journal, so after a restart
+  every message is as old as the restart. That is a smaller lie than it looks:
+  what the number answers is "has anything moved in this queue lately", and a
+  restart is a thing that moved.
+- **A queue's journal size is not reported.** The pages say what is in a
+  queue, not what its file has grown to between rewrites.

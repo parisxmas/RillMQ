@@ -67,7 +67,7 @@ type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
 
 type QRow
-  QRow(name: Str, ready: Int, inflight: Int, subs: Int, published: Int)
+  QRow(name: Str, ready: Int, inflight: Int, subs: Int, published: Int, delivered: Int, acked: Int, oldest: Int)
 
 fn qr_name(r: QRow) = r.name
 
@@ -78,6 +78,12 @@ fn qr_inflight(r: QRow) = r.inflight
 fn qr_subs(r: QRow) = r.subs
 
 fn qr_published(r: QRow) = r.published
+
+fn qr_delivered(r: QRow) = r.delivered
+
+fn qr_acked(r: QRow) = r.acked
+
+fn qr_oldest(r: QRow) = r.oldest
 
 fn tot_queues(t: Totals) = t.queues
 
@@ -388,8 +394,8 @@ fn r_table(qs: Map(Str, Chan(QReq)), ks, acc) = match ks
     Some(ch) -> r_table(qs, rest, Cons(r_one(k, r_ask(ch)), acc))
 
 fn r_one(name, answer) = match answer
-  None -> QRow(name, 0, 0, 0, 0)
-  Some(c) -> QRow(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c))
+  None -> QRow(name, 0, 0, 0, 0, 0, 0, 0)
+  Some(c) -> QRow(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c), q_count_delivered(c), q_count_acked(c), q_count_oldest(c))
 
 fn r_row(name, answer) = match answer
   None -> w_queue_busy(name)
@@ -398,6 +404,17 @@ fn r_row(name, answer) = match answer
 fn q_count_subs(c: QCount) = c.subs
 
 fn q_count_published(c: QCount) = c.published
+
+fn q_count_delivered(c: QCount) = c.delivered
+
+fn q_count_acked(c: QCount) = c.acked
+
+fn q_count_oldest(c: QCount) = c.oldest
+
+# The queue keeps a moment; what anybody wants is a duration. Zero stays zero,
+# because a queue with nothing in it has no oldest message rather than one that
+# arrived at the beginning of 1970.
+fn b_age(at) = if at <= 0 then 0 else now_millis() - at
 
 fn q_count_ready(c: QCount) = c.ready
 
@@ -621,7 +638,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     b_read(c, buf, next, subs, 0, who)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))
-    send(c.out, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st))))
+    send(c.out, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st), q_count_delivered(st), q_count_acked(st), b_age(q_count_oldest(st)))))
     b_read(c, buf, next, subs, 0, who)
   CQueues ->
     rows = channel()

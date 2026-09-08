@@ -4,7 +4,7 @@ import "broker"
 import "head"
 import "foot"
 
-fn mg_overview(b: StrBuf, t: Totals, rows: List(QRow), who, note, said) =
+fn mg_overview(b: StrBuf, t: Totals, rows: List(QRow), past: List(Seen), who, note, said) =
   mg_head(b, "Overview", who)
   b += "\n<section class=\"cards\">\n<div class=\"card\"><span class=\"n\">"
   render(b, tot_queues(t))
@@ -24,20 +24,26 @@ fn mg_overview(b: StrBuf, t: Totals, rows: List(QRow), who, note, said) =
     b += "\n<p class=\"empty\">Nothing yet. A queue appears the first time somebody publishes to it or subscribes to it.</p>\n"
     0
   else
-    b += "\n<table>\n<tr><th>Name</th><th class=\"n\">Ready</th><th class=\"n\">In flight</th><th class=\"n\">Consumers</th><th class=\"n\">Published</th><th></th></tr>\n"
+    b += "\n<table>\n<tr><th>Name</th><th>Last minute</th><th class=\"n\">In /s</th><th class=\"n\">Out /s</th><th class=\"n\">Ready</th><th class=\"n\">In flight</th><th class=\"n\">Consumers</th><th class=\"n\">Oldest</th><th></th></tr>\n"
     fn each0(l0, i0) = match l0
       Nil -> 0
       Cons(r, rest0) ->
         b += "\n<tr>\n<td><code>"
         render(b, qr_name(r))
-        b += "</code></td>\n<td class=\"n\">"
+        b += "</code></td>\n<td class=\"spark\"><svg viewBox=\"0 0 100 20\" preserveAspectRatio=\"none\"><path d=\""
+        render(b, mg_spark(past, qr_name(r)))
+        b += "\"/></svg></td>\n<td class=\"n\">"
+        render(b, mg_rate_in(past, qr_name(r)))
+        b += "</td>\n<td class=\"n\">"
+        render(b, mg_rate_out(past, qr_name(r)))
+        b += "</td>\n<td class=\"n\">"
         render(b, qr_ready(r))
         b += "</td>\n<td class=\"n\">"
         render(b, qr_inflight(r))
         b += "</td>\n<td class=\"n\">"
         render(b, qr_subs(r))
-        b += "</td>\n<td class=\"n\">"
-        render(b, qr_published(r))
+        b += "</td>\n<td class=\"n age\">"
+        render(b, mg_ago(qr_oldest(r)))
         b += "</td>\n<td class=\"n\"><form method=\"post\" action=\"/drain\" style=\"border:none;padding:0;background:none\">\n<input type=\"hidden\" name=\"queue\" value=\""
         render(b, qr_name(r))
         b += "\">\n<button class=\"plain\" type=\"submit\">Empty it</button></form></td>\n</tr>\n"
