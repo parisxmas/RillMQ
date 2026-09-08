@@ -1,0 +1,30 @@
+%% import "head"
+%% import "foot"
+%= mg_people(names: List(Str), who, note, said, asks)
+<% include mg_head("People", who) %>
+<h2>Who may connect</h2>
+<% if !asks %>
+<p class="empty">This broker asks nobody for a password. Start it with <code>users=&lt;file&gt;</code> and everything below takes effect.</p>
+<% end %>
+<% if str_len(said) > 0 %><p class="empty"><%= said %></p><% end %>
+<% if len(names) == 0 %>
+<p class="empty">Nobody is written down yet.</p>
+<% else %>
+<table>
+<tr><th>Name</th><th></th></tr>
+<% each n in names %>
+<tr><td><code><%= n %></code></td>
+<td class="n"><form method="post" action="/forget" style="border:none;padding:0;background:none">
+<input type="hidden" name="name" value="<%= n %>">
+<button class="plain" type="submit">Remove</button></form></td></tr>
+<% end %>
+</table>
+<% end %>
+<h2>Add somebody, or change a word</h2>
+<form method="post" action="/remember">
+<label>Name<input name="name" required></label>
+<label>Word<input name="word" type="password" required></label>
+<label>May<select name="tag"><option>administrator</option><option>monitoring</option></select></label>
+<button type="submit">Write it down</button>
+</form>
+<% include mg_foot(note) %>

@@ -16,7 +16,7 @@ type X
   X(name: Str, kind: Str, binds: List(Bind), jr: Jr)
 
 type XReq
-  XPub(key: Str, body: Str, out: Chan(Out))
+  XPub(key: Str, body: Str, props: Str, out: Chan(Out))
   XBind(queue: Str, key: Str, ch: Chan(QReq), quiet: Bool, reply: Chan(Int))
   XUnbind(queue: Str, key: Str, reply: Chan(Int))
 
@@ -37,8 +37,8 @@ fn x_loop(x: X, inbox, done) =
     Some(next) -> x_loop(next, inbox, done)
 
 fn x_handle(x: X, r) = match r
-  XPub(key, body, out) ->
-    x_send(x, x_route(x, x.binds, key, Nil), body, out)
+  XPub(key, body, props, out) ->
+    x_send(x, x_route(x, x.binds, key, Nil), body, props, out)
     x
   XBind(queue, key, ch, quiet, reply) ->
     send(reply, 1)
@@ -120,25 +120,25 @@ fn x_hash_more(prest, ks) = match ks
 # channel goes to the queue and the answer comes back from there. More than one
 # needs somebody to wait for all of them and say so once, and that somebody is
 # a strand made for the purpose and gone as soon as it has counted.
-fn x_send(x: X, chans, body, out) = match chans
+fn x_send(x: X, chans, body, props, out) = match chans
   Nil ->
     send(out, OPublished(x.name, 0))
     0
   Cons(ch, rest) -> match rest
     Nil ->
-      send(ch, QPub(body, out))
+      send(ch, QPub(body, props, out))
       0
     _ ->
       collect = channel(len(chans))
-      x_fan(chans, body, collect)
+      x_fan(chans, body, props, collect)
       spawn x_wait(collect, len(chans), out, x.name)
       0
 
-fn x_fan(chans, body, collect) = match chans
+fn x_fan(chans, body, props, collect) = match chans
   Nil -> 0
   Cons(ch, rest) ->
-    send(ch, QPub(body, collect))
-    x_fan(rest, body, collect)
+    send(ch, QPub(body, props, collect))
+    x_fan(rest, body, props, collect)
 
 fn x_wait(collect, n, out, name) =
   x_drain(collect, n)

@@ -5,6 +5,7 @@
 // Nothing here knows it is not talking to RabbitMQ, which is the point.
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using RabbitMQ.Client;
@@ -32,17 +33,89 @@ class Program
     static int Main(string[] args)
     {
         int port = args.Length > 0 ? int.Parse(args[0]) : 5672;
+        string user = Environment.GetEnvironmentVariable("RILLMQ_USER") ?? "guest";
+        string word = Environment.GetEnvironmentVariable("RILLMQ_PASS") ?? "guest";
+
+        // `auth <user> <word>` is the whole of that mode: it says whether the
+        // broker let this pair in, and nothing else. The suite runs it twice,
+        // once with the word and once with the wrong one.
+        // `tls` connects over AMQPS and says whether it got in. The
+        // certificate is one RillMQ made for itself, so the name is checked
+        // and the chain is not: this says TLS works, not that a self-signed
+        // certificate is trustworthy.
+        if (args.Length > 1 && args[1] == "tls")
+        {
+            var tf = new ConnectionFactory { HostName = "localhost", Port = port, UserName = user, Password = word, VirtualHost = "/", RequestedConnectionTimeout = TimeSpan.FromSeconds(10) };
+            tf.Ssl.Enabled = true;
+            tf.Ssl.ServerName = "localhost";
+            tf.Ssl.AcceptablePolicyErrors = System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors | System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
+            tf.Ssl.CertificateValidationCallback = (_, _, _, _) => true;
+            try
+            {
+                using var tc = tf.CreateConnection();
+                using var tch = tc.CreateModel();
+                string tq = "tls-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                tch.QueueDeclare(tq, true, false, false, null);
+                tch.BasicPublish("", tq, null, Encoding.UTF8.GetBytes("over tls"));
+                Thread.Sleep(400);
+                var over = tch.BasicGet(tq, true);
+                Console.WriteLine(over == null ? "no message" : Encoding.UTF8.GetString(over.Body.ToArray()));
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("failed: " + e.Message + (e.InnerException == null ? "" : " / " + e.InnerException.GetType().Name + ": " + e.InnerException.Message));
+            }
+            return 0;
+        }
+
+        if (args.Length > 3 && args[1] == "auth")
+        {
+            var af = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = args[2], Password = args[3], VirtualHost = "/", RequestedConnectionTimeout = TimeSpan.FromSeconds(5) };
+            try
+            {
+                using var ac = af.CreateConnection();
+                Console.WriteLine(ac.IsOpen ? "in" : "out");
+            }
+            catch (Exception)
+            {
+                Console.WriteLine("out");
+            }
+            return 0;
+        }
+
         var factory = new ConnectionFactory
         {
             HostName = "127.0.0.1",
             Port = port,
-            UserName = "guest",
-            Password = "guest",
+            UserName = user,
+            Password = word,
             VirtualHost = "/",
             RequestedHeartbeat = TimeSpan.Zero,
         };
 
         using var conn = factory.CreateConnection();
+
+        // `benchc <n>` is the same measurement with the message marked
+        // persistent and the channel in confirm mode: both brokers are then
+        // being asked for the same promise, which is the only way the two
+        // numbers mean the same thing.
+        if (args.Length > 2 && args[1] == "benchc")
+        {
+            int count = int.Parse(args[2]);
+            using var dch = conn.CreateModel();
+            string dq = "benchc-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            dch.QueueDeclare(dq, durable: true, exclusive: false, autoDelete: false, arguments: null);
+            var props = dch.CreateBasicProperties();
+            props.Persistent = true;
+            var payload = new byte[64];
+            dch.ConfirmSelect();
+            var d0 = DateTime.UtcNow;
+            for (int i = 0; i < count; i++) dch.BasicPublish("", dq, props, payload);
+            dch.WaitForConfirms(TimeSpan.FromMinutes(5));
+            var d1 = DateTime.UtcNow;
+            Console.WriteLine($"durable publish: {count} in {(int)(d1 - d0).TotalMilliseconds} ms, {(int)(count / (d1 - d0).TotalSeconds)}/sec");
+            return 0;
+        }
 
         // `bench <n>` measures, over the same client anything else would use.
         if (args.Length > 2 && args[1] == "bench")
@@ -174,6 +247,29 @@ class Program
         Check("a fanout reaches every queue bound to it",
             ch.QueueDeclare(fa, true, false, false, null).MessageCount + "," + ch.QueueDeclare(fb, true, false, false, null).MessageCount,
             "1,1");
+
+        // Message properties, which is what the request-and-reply pattern is
+        // made of: a message says where to answer and what to call the answer,
+        // and the broker hands both back untouched.
+        string pq = q + "-props";
+        ch.QueueDeclare(pq, true, false, false, null);
+        var sent = ch.CreateBasicProperties();
+        sent.ReplyTo = "somewhere-else";
+        sent.CorrelationId = "abc-123";
+        sent.ContentType = "application/json";
+        sent.Persistent = true;
+        sent.Headers = new Dictionary<string, object> { { "tenant", Encoding.UTF8.GetBytes("acme") } };
+        ch.BasicPublish("", pq, sent, Encoding.UTF8.GetBytes("{}"));
+        Thread.Sleep(600);
+        var back = ch.BasicGet(pq, autoAck: true);
+        Check("reply-to comes back as it went",
+            back == null ? "(nothing)" : back.BasicProperties.ReplyTo, "somewhere-else");
+        Check("and so does correlation-id",
+            back == null ? "(nothing)" : back.BasicProperties.CorrelationId, "abc-123");
+        Check("and content-type",
+            back == null ? "(nothing)" : back.BasicProperties.ContentType, "application/json");
+        Check("and a header a client put there",
+            back == null ? "(nothing)" : Encoding.UTF8.GetString((byte[])back.BasicProperties.Headers["tenant"]), "acme");
 
         Console.WriteLine();
         Console.WriteLine($"{passed} of {passed + failed} passed");

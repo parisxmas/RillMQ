@@ -1,0 +1,38 @@
+%% import "broker"
+%% import "head"
+%% import "foot"
+%= mg_overview(t: Totals, rows: List(QRow), who, note, said)
+<% include mg_head("Overview", who) %>
+<section class="cards">
+<div class="card"><span class="n"><%= tot_queues(t) %></span><span class="l">queues</span></div>
+<div class="card"><span class="n"><%= tot_ready(t) %></span><span class="l">ready</span></div>
+<div class="card"><span class="n"><%= tot_inflight(t) %></span><span class="l">in flight</span></div>
+</section>
+<% if str_len(said) > 0 %><p class="empty"><%= said %></p><% end %>
+<h2>Queues</h2>
+<% if len(rows) == 0 %>
+<p class="empty">Nothing yet. A queue appears the first time somebody publishes to it or subscribes to it.</p>
+<% else %>
+<table>
+<tr><th>Name</th><th class="n">Ready</th><th class="n">In flight</th><th class="n">Consumers</th><th class="n">Published</th><th></th></tr>
+<% each r in rows %>
+<tr>
+<td><code><%= qr_name(r) %></code></td>
+<td class="n"><%= qr_ready(r) %></td>
+<td class="n"><%= qr_inflight(r) %></td>
+<td class="n"><%= qr_subs(r) %></td>
+<td class="n"><%= qr_published(r) %></td>
+<td class="n"><form method="post" action="/drain" style="border:none;padding:0;background:none">
+<input type="hidden" name="queue" value="<%= qr_name(r) %>">
+<button class="plain" type="submit">Empty it</button></form></td>
+</tr>
+<% end %>
+</table>
+<% end %>
+<h2>Publish one</h2>
+<form method="post" action="/publish">
+<label>Queue<input name="queue" placeholder="orders" required></label>
+<label>Body<input name="body" placeholder="hello" size="34" required></label>
+<button type="submit">Send</button>
+</form>
+<% include mg_foot(note) %>

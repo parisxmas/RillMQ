@@ -1,0 +1,41 @@
+# Generated from web/people.tmpl by tools/tmplgen.rill — do not edit.
+import "tmpl"
+import "head"
+import "foot"
+
+fn mg_people(b: StrBuf, names: List(Str), who, note, said, asks) =
+  mg_head(b, "People", who)
+  b += "\n<h2>Who may connect</h2>\n"
+  if !asks then
+    b += "\n<p class=\"empty\">This broker asks nobody for a password. Start it with <code>users=&lt;file&gt;</code> and everything below takes effect.</p>\n"
+    0
+  else 0
+  b += "\n"
+  if str_len(said) > 0 then
+    b += "<p class=\"empty\">"
+    render(b, said)
+    b += "</p>"
+    0
+  else 0
+  b += "\n"
+  if len(names) == 0 then
+    b += "\n<p class=\"empty\">Nobody is written down yet.</p>\n"
+    0
+  else
+    b += "\n<table>\n<tr><th>Name</th><th></th></tr>\n"
+    fn each0(l0, i0) = match l0
+      Nil -> 0
+      Cons(n, rest0) ->
+        b += "\n<tr><td><code>"
+        render(b, n)
+        b += "</code></td>\n<td class=\"n\"><form method=\"post\" action=\"/forget\" style=\"border:none;padding:0;background:none\">\n<input type=\"hidden\" name=\"name\" value=\""
+        render(b, n)
+        b += "\">\n<button class=\"plain\" type=\"submit\">Remove</button></form></td></tr>\n"
+        each0(rest0, i0 + 1)
+    each0(names, 0)
+    b += "\n</table>\n"
+    0
+  b += "\n<h2>Add somebody, or change a word</h2>\n<form method=\"post\" action=\"/remember\">\n<label>Name<input name=\"name\" required></label>\n<label>Word<input name=\"word\" type=\"password\" required></label>\n<label>May<select name=\"tag\"><option>administrator</option><option>monitoring</option></select></label>\n<button type=\"submit\">Write it down</button>\n</form>\n"
+  mg_foot(b, note)
+  b += "\n"
+  0

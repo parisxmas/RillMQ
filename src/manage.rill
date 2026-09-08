@@ -1,0 +1,212 @@
+# The management pages.
+#
+#     ./rillmq 6789 dir=data users=data/users manage=15672
+#
+# One more listener, one more strand per request, and the same registry
+# everything else talks to. There is no second copy of anything here: a page
+# asks the registry what it asks a client's `QUEUES`, and a form that publishes
+# publishes down the same channel a publisher does.
+#
+# Rill's own HTTP server serves it and Rill's own template compiler wrote the
+# rendering: `web/*.tmpl` become `src/head.rill` and the rest, so a page is a
+# run of appends with nothing parsed and no tag looked at while somebody is
+# waiting. `tools/pages.sh` is what turns one into the other.
+import "http"
+import "overview"
+import "people"
+import "sha1"
+
+fn mg_port() = opt_int("manage", 0)
+
+# -- the listener ----------------------------------------------------------------
+
+fn mg_on(reg, done, port, users) =
+  if port <= 0 then 0 else match listen_on(port)
+    Err(e) ->
+      println("rillmq: " + e)
+      0
+    Ok(server) ->
+      println("rillmq management on http://127.0.0.1:" + int_to_str(sock_port(server)) + (if au_wanted(users) then "" else " — open, because no users= was given"))
+      spawn mg_accept(server, reg, users)
+      0
+
+fn mg_accept(server, reg, users) =
+  serve_taking(server, \req -> mg_guard(reg, users, req), \c, raw -> false)
+
+# -- who is asking ---------------------------------------------------------------
+
+# The same names and words the brokers ask for, over HTTP's own way of asking:
+# `Authorization: Basic`. A broker with no password file has no way to tell one
+# person from another, so it does not pretend to and lets everybody in.
+fn mg_guard(reg, users, req: Request) =
+  if !au_wanted(users) then mg_route(reg, users, req, "anyone") else mg_signed_in(reg, users, req, mg_basic(req))
+
+fn mg_signed_in(reg, users, req: Request, said: Said) =
+  if str_len(said.name) > 0 && au_ok(users, said.name, said.word) then mg_route(reg, users, req, said.name) else mg_ask()
+
+fn mg_ask() =
+  with_header(text_response(401, "a name and a word are wanted\n"), "WWW-Authenticate", "Basic realm=\"rillmq\"")
+
+fn mg_basic(req: Request) =
+  raw = header(req, "authorization")
+  if !starts_with(lower(raw), "basic ") then Said("", "") else mg_pair(un_base64(raw[6:]))
+
+fn mg_pair(s) =
+  i = str_find(s, ":")
+  if i < 0 then Said("", "") else Said(s[0:i], s[i + 1:])
+
+# -- base64, the way back ----------------------------------------------------------
+
+# `lib/sha1.rill` writes base64 for the WebSocket handshake and never reads it.
+# This is the other direction, which is all `Authorization: Basic` needs: four
+# characters in, three bytes out, and anything that is not one of the
+# sixty-four passed over rather than refused.
+fn un_base64(s) = un_b64_from(strbuf(), s, 0, 0, 0)
+
+fn un_b64_from(b: StrBuf, s, i, acc, bits) =
+  if i >= str_len(s) then strbuf_str(b)
+  else
+    v = b64_value(str_get(s, i))
+    if v < 0 then un_b64_from(b, s, i + 1, acc, bits) else un_b64_step(b, s, i, shl(acc, 6) + v, bits + 6)
+
+fn un_b64_step(b: StrBuf, s, i, acc, bits) =
+  if bits < 8 then un_b64_from(b, s, i + 1, acc, bits)
+  else
+    strbuf_byte(b, bit_and(shr(acc, bits - 8), 255))
+    un_b64_from(b, s, i + 1, acc, bits - 8)
+
+fn b64_value(c) =
+  if c >= 65 && c <= 90 then c - 65 else if c >= 97 && c <= 122 then c - 71 else if c >= 48 && c <= 57 then c + 4 else if c == 43 then 62 else if c == 47 then 63 else -1
+
+# -- what is where ------------------------------------------------------------------
+
+fn mg_route(reg, users, req: Request, who) =
+  path = path_of(req.path)
+  if str_cmp(req.method, "POST") == 0 then mg_post(reg, users, req, who, path) else mg_get(reg, users, req, who, path)
+
+fn mg_get(reg, users, req: Request, who, path) =
+  if str_cmp(path, "/") == 0 then mg_page(reg, who, param(query_of(req.path), "said")) else if str_cmp(path, "/people") == 0 then mg_people_page(users, who, param(query_of(req.path), "said")) else if str_cmp(path, "/api/queues") == 0 then json_response(200, mg_queues_json(mg_table(reg))) else if str_cmp(path, "/api/overview") == 0 then json_response(200, mg_overview_json(mg_totals(reg), users)) else text_response(404, "no such page\n")
+
+# Every form answers with a redirect rather than a page, so that reloading
+# after publishing does not publish again.
+fn mg_post(reg, users, req: Request, who, path) =
+  f = req.body
+  if str_cmp(path, "/publish") == 0 then mg_publish(reg, param(f, "queue"), param(f, "body")) else if str_cmp(path, "/drain") == 0 then mg_drain(reg, param(f, "queue")) else if str_cmp(path, "/remember") == 0 then mg_remember(users, param(f, "name"), param(f, "word"), param(f, "tag")) else if str_cmp(path, "/forget") == 0 then mg_forget(users, param(f, "name")) else text_response(404, "no such form\n")
+
+fn mg_back(where, said) =
+  with_header(text_response(303, ""), "Location", where + "?said=" + encoded(said))
+
+# -- the pages ------------------------------------------------------------------------
+
+fn mg_page(reg, who, said) =
+  b = strbuf()
+  mg_overview(b, mg_totals(reg), mg_table(reg), who, mg_note(), said)
+  html_response(200, strbuf_str(b))
+
+fn mg_people_page(users, who, said) =
+  b = strbuf()
+  mg_people(b, au_names(users), who, mg_note(), said, au_wanted(users))
+  html_response(200, strbuf_str(b))
+
+fn mg_note() = "RillMQ · " + mg_where()
+
+fn mg_where() =
+  if str_len(opt("dir", "")) == 0 then "keeping nothing" else "keeping messages in " + opt("dir", "")
+
+# -- what the pages ask for -------------------------------------------------------------
+
+fn mg_totals(reg) =
+  back = channel(1)
+  send(reg, RTotals(back))
+  recv(back)
+
+fn mg_table(reg) =
+  back = channel(1)
+  send(reg, RTable(back))
+  recv(back)
+
+# -- what the forms do --------------------------------------------------------------------
+
+fn mg_publish(reg, queue, body) =
+  if str_len(queue) == 0 then mg_back("/", "a queue name is wanted")
+  else
+    out = channel(1)
+    send(b_find(reg, queue), QPub(body, "", out))
+    mg_published(queue, out)
+
+# Waited for rather than fired and forgotten: somebody looking at a page has
+# asked whether it worked, and on a durable broker the answer arrives when the
+# message is on the disk.
+fn mg_published(queue, out) =
+  said = select
+    v = recv(out) -> "published to " + queue
+    timeout(5000) -> "published to " + queue + ", but it did not say so within five seconds"
+  mg_back("/", said)
+
+fn mg_drain(reg, queue) =
+  if str_len(queue) == 0 then mg_back("/", "a queue name is wanted")
+  else
+    back = channel(1)
+    send(b_find(reg, queue), QDrain(back))
+    mg_back("/", "emptied " + queue + " of " + int_to_str(recv(back)) + " message(s)")
+
+fn mg_remember(users, name, word, tag) =
+  if !au_wanted(users) then mg_back("/people", "this broker was not started with a users= file") else if str_len(name) == 0 || str_len(word) == 0 then mg_back("/people", "a name and a word are both wanted") else match au_set(users, name, word, tag)
+    Err(e) -> mg_back("/people", e)
+    Ok(n) -> mg_back("/people", name + " may now connect")
+
+fn mg_forget(users, name) =
+  if !au_wanted(users) then mg_back("/people", "this broker was not started with a users= file") else match au_forget(users, name)
+    Err(e) -> mg_back("/people", e)
+    Ok(n) -> mg_back("/people", name + " may no longer connect")
+
+# -- the same numbers, for a program ---------------------------------------------------------
+
+fn mg_overview_json(t: Totals, users) =
+  "{\"queues\":" + int_to_str(tot_queues(t)) + ",\"ready\":" + int_to_str(tot_ready(t)) + ",\"inflight\":" + int_to_str(tot_inflight(t)) + ",\"asks_for_a_password\":" + (if au_wanted(users) then "true" else "false") + "}"
+
+fn mg_queues_json(rows) =
+  b = strbuf()
+  b += "["
+  mg_rows_json(b, rows, 0)
+  b += "]"
+  strbuf_str(b)
+
+fn mg_rows_json(b: StrBuf, rows, n) = match rows
+  Nil -> 0
+  Cons(r, rest) ->
+    mg_row_json(b, r, n)
+    mg_rows_json(b, rest, n + 1)
+
+fn mg_row_json(b: StrBuf, r: QRow, n) =
+  mg_comma(b, n)
+  b += "{\"name\":\"" + mg_quoted(qr_name(r)) + "\",\"ready\":" + int_to_str(qr_ready(r)) + ",\"inflight\":" + int_to_str(qr_inflight(r)) + ",\"consumers\":" + int_to_str(qr_subs(r)) + ",\"published\":" + int_to_str(qr_published(r)) + "}"
+  0
+
+# A queue name is whatever a client called it, so it may hold a quote or a
+# backslash and JSON has to be told.
+fn mg_comma(b: StrBuf, n) =
+  if n <= 0 then 0
+  else
+    b += ","
+    0
+
+fn mg_quoted(s) = mg_quoted_from(strbuf(), s, 0)
+
+fn mg_quoted_from(b: StrBuf, s, i) =
+  if i >= str_len(s) then strbuf_str(b)
+  else
+    c = str_get(s, i)
+    mg_quote_byte(b, c)
+    mg_quoted_from(b, s, i + 1)
+
+fn mg_quote_byte(b: StrBuf, c) =
+  mg_escape(b, c)
+  strbuf_byte(b, if c < 32 then 32 else c)
+  0
+
+fn mg_escape(b: StrBuf, c) =
+  if c != 34 && c != 92 then 0
+  else
+    strbuf_byte(b, 92)
+    0

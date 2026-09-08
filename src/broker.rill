@@ -13,6 +13,8 @@ import "queue"
 import "exchange"
 import "cluster"
 import "routes"
+import "auth"
+import "tls"
 
 type RReq
   RFind(name: Str, reply: Chan(Chan(QReq)))
@@ -23,6 +25,11 @@ type RReq
   RExchange(name: Str, kind: Str, quiet: Bool, reply: Chan(Chan(XReq)))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
+  # The same numbers as `RRows`, as numbers rather than as the lines this
+  # protocol writes. The management pages want to put them in a table and the
+  # wire wants to put them on a socket, and neither should have to undo what
+  # the other did.
+  RTable(reply: Chan(List(QRow)))
   # The journal of a queue this node does not hold and is keeping a copy of.
   # It is the same file that queue would have here, so promoting the copy is
   # starting a queue from a journal that is already in place.
@@ -44,6 +51,25 @@ type RReq
 type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
 
+type QRow
+  QRow(name: Str, ready: Int, inflight: Int, subs: Int, published: Int)
+
+fn qr_name(r: QRow) = r.name
+
+fn qr_ready(r: QRow) = r.ready
+
+fn qr_inflight(r: QRow) = r.inflight
+
+fn qr_subs(r: QRow) = r.subs
+
+fn qr_published(r: QRow) = r.published
+
+fn tot_queues(t: Totals) = t.queues
+
+fn tot_ready(t: Totals) = t.ready
+
+fn tot_inflight(t: Totals) = t.inflight
+
 # What the writer strand is told to do next.
 type Frame
   Send(what: Out)
@@ -56,7 +82,7 @@ type Frame
 # commands would run out of stack. The compiler says so, by name, at the call
 # it cannot promise.
 type Conn
-  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), gone: Chan(Int))
+  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), gone: Chan(Int), ssl: Ptr)
 
 # -- the registry ---------------------------------------------------------------
 
@@ -97,6 +123,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RRows(reply) ->
     send(reply, r_rows(qs, map_keys(qs), Nil))
+    0
+  RTable(reply) ->
+    send(reply, r_table(qs, map_keys(qs), Nil))
     0
   RCopy(name, reply) ->
     send(reply, r_copy(cs, g.dir, name, done))
@@ -278,6 +307,16 @@ fn r_rows(qs: Map(Str, Chan(QReq)), ks, acc) = match ks
     None -> r_rows(qs, rest, acc)
     Some(ch) -> r_rows(qs, rest, Cons(r_row(k, r_ask(ch)), acc))
 
+fn r_table(qs: Map(Str, Chan(QReq)), ks, acc) = match ks
+  Nil -> acc
+  Cons(k, rest) -> match qs[k]
+    None -> r_table(qs, rest, acc)
+    Some(ch) -> r_table(qs, rest, Cons(r_one(k, r_ask(ch)), acc))
+
+fn r_one(name, answer) = match answer
+  None -> QRow(name, 0, 0, 0, 0)
+  Some(c) -> QRow(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c))
+
 fn r_row(name, answer) = match answer
   None -> w_queue_busy(name)
   Some(c) -> w_queue_row(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c))
@@ -311,40 +350,70 @@ fn b_idle_secs() = opt_int("idle", 60)
 # with a sentence is better than failing to accept it with none.
 fn b_max_conns() = opt_int("conns", 1024)
 
+# The file naming who may connect, or "" for a broker that asks nobody.
+fn b_users() = opt("users", "")
+
+# What one node signs in to another as, when there is a file to sign in
+# against. A cluster whose brokers ask for a password has to have one to give.
+fn b_peer() = opt("peer", "")
+
+# What a listener hands to every connection it takes: who may connect, and
+# whether the connection is wrapped in TLS. A plain port carries a context
+# that is null, and `p_read` and `p_write` then do exactly what they did
+# before there was any TLS at all.
+type Door
+  Door(users: Str, tls: Tls)
+
+fn b_door() = Door(b_users(), Tls(null_ptr(), ""))
+
 # What the accept loop carries: how many connections are up, what to number
 # the next one, and where the ones that end say so.
 type Gate
   Gate(live: Int, next: Int, gone: Chan(Int))
 
-fn b_serve(fd, reg, done, cid, gone) =
+# The handshake, if there is one, happens here rather than in the accept loop:
+# it is a round trip with a client that may be slow or may never answer, and
+# the doorman has other people waiting.
+fn b_serve(fd, reg, done, cid, gone, d: Door) =
   sock_nodelay(fd)
+  if is_null(d.tls.ctx) then b_serving(fd, reg, done, cid, gone, null_ptr()) else b_shaken(fd, reg, done, cid, gone, tls_up(d.tls, fd))
+
+fn b_shaken(fd, reg, done, cid, gone, ssl) =
+  if is_null(ssl) then b_no_handshake(fd, gone) else b_serving(fd, reg, done, cid, gone, ssl)
+
+fn b_no_handshake(fd, gone) =
+  sock_close(fd)
+  send(gone, 1)
+  0
+
+fn b_serving(fd, reg, done, cid, gone, ssl) =
   out = channel(b_backlog())
-  spawn b_writer(fd, out, done, false)
-  b_read(Conn(fd, reg, done, cid, out, gone), "", 0, Nil, 0)
+  spawn b_writer(fd, out, done, false, ssl)
+  b_read(Conn(fd, reg, done, cid, out, gone, ssl), "", 0, Nil, 0, "")
 
 # The writer owns the socket. It watches `done` as well as its own channel, so
 # that a broker being shut down can reach a connection that is saying nothing:
 # `sock_shutdown` ends the connection without closing the descriptor, which is
 # the only thing that wakes the reader parked on it.
-fn b_writer(fd, out, done, stopping) =
+fn b_writer(fd, out, done, stopping, ssl) =
   f = if stopping then Send(recv(out)) else b_next(out, done)
   match f
     Shutdown ->
       sock_shutdown(fd)
-      b_writer(fd, out, done, true)
-    Send(what) -> b_put(fd, out, done, stopping, b_bytes(what))
+      b_writer(fd, out, done, true, ssl)
+    Send(what) -> b_put(fd, out, done, stopping, b_bytes(what), ssl)
 
-fn b_put(fd, out, done, stopping, text) =
-  if str_len(text) == 0 then sock_close(fd)
+fn b_put(fd, out, done, stopping, text, ssl) =
+  if str_len(text) == 0 then p_close(ssl, fd)
   else
-    sock_write(fd, text)
-    b_writer(fd, out, done, stopping)
+    p_write(ssl, fd, text)
+    b_writer(fd, out, done, stopping, ssl)
 
 # This protocol's way of saying a message. The empty string is how the reader
 # says it has finished and the socket may go.
 fn b_bytes(what) = match what
   OFrame(text) -> text
-  ODeliver(queue, id, body) -> w_msg(id, queue, body)
+  ODeliver(queue, id, body, props) -> w_msg(id, queue, body)
   OPublished(queue, id) -> w_ok_id(id)
 
 fn b_next(out, done) =
@@ -353,95 +422,131 @@ fn b_next(out, done) =
     recv(done) -> Shutdown
   f
 
-fn b_read(c: Conn, buf, from, subs, idle) = match w_take(buf, from)
-  Got(cmd, next) -> b_do(c, buf, next, subs, cmd)
+fn b_read(c: Conn, buf, from, subs, idle, who) = match w_take(buf, from)
+  Got(cmd, next) -> b_gate(c, buf, next, subs, cmd, who)
   Bad(why, next, fatal) ->
     send(c.out, OFrame(w_err(why)))
-    if fatal then b_bye(c, subs) else b_read(c, buf, next, subs, 0)
-  Need -> b_fill(c, buf, from, subs, idle)
+    if fatal then b_bye(c, subs) else b_read(c, buf, next, subs, 0, who)
+  Need -> b_fill(c, buf, from, subs, idle, who)
+
+# The one door. A broker with a password file answers everything but `AUTH`,
+# `PING` and `QUIT` with a refusal until somebody has signed in, and a broker
+# without one has already said yes before this is reached.
+fn b_gate(c: Conn, buf, next, subs, cmd, who) =
+  if !au_wanted(b_users()) || str_len(who) > 0 || b_always(cmd) then b_do(c, buf, next, subs, cmd, who)
+  else
+    send(c.out, OFrame(w_err("say AUTH first")))
+    b_read(c, buf, next, subs, 0, who)
+
+fn b_always(cmd) = match cmd
+  CAuth(name, word) -> true
+  CPing -> true
+  CQuit -> true
+  CPub(q, b) -> false
+  CSub(q) -> false
+  CUnsub(q) -> false
+  CAck(q, i) -> false
+  CNack(q, i) -> false
+  CStats -> false
+  CQueues -> false
+  CQStat(q) -> false
+  CDrain(q) -> false
+  CXDecl(x, k) -> false
+  CBind(x, q, k) -> false
+  CXPub(x, k, b) -> false
+  CRepl(q, t, n) -> false
+  CVote(q, t, n, f) -> false
+  CWho(q) -> false
+  CPromote(q) -> false
 
 # A second at a time, rather than until something arrives. The wait costs one
 # cheap look at the socket when there is something there, and it is what gives
 # a connection that has gone quiet somewhere to be counted.
-fn b_fill(c: Conn, buf, from, subs, idle) =
+fn b_fill(c: Conn, buf, from, subs, idle, who) =
   # A subscriber has no deadline to keep, so it does not pay for one. This is
   # not only tidiness: a consumer acknowledging one message at a time makes
   # many small reads, and a look at the socket before each of them costs about
   # a tenth of the delivery rate.
-  if len(subs) > 0 then b_take(c, buf, from, subs) else if !sock_wait(c.fd, 1000) then b_quiet(c, buf, from, subs, idle + 1) else b_take(c, buf, from, subs)
+  if len(subs) > 0 then b_take(c, buf, from, subs, who) else if !sock_wait(c.fd, 1000) then b_quiet(c, buf, from, subs, idle + 1, who) else b_take(c, buf, from, subs, who)
 
-fn b_take(c: Conn, buf, from, subs) =
+fn b_take(c: Conn, buf, from, subs, who) =
   # The one place the front is thrown away: once per read from the socket
   # rather than once per command in it.
   kept = if from == 0 then buf else buf[from:]
-  more = sock_read(c.fd)
-  if str_len(more) == 0 then b_bye(c, subs) else b_read(c, kept + more, 0, subs, 0)
+  more = p_read(c.ssl, c.fd)
+  if str_len(more) == 0 then b_bye(c, subs) else b_read(c, kept + more, 0, subs, 0, who)
 
-fn b_quiet(c: Conn, buf, from, subs, idle) =
-  if len(subs) > 0 || idle < b_idle_secs() then b_read(c, buf, from, subs, idle)
+fn b_quiet(c: Conn, buf, from, subs, idle, who) =
+  if len(subs) > 0 || idle < b_idle_secs() then b_read(c, buf, from, subs, idle, who)
   else
     send(c.out, OFrame(w_err("said nothing for " + int_to_str(b_idle_secs()) + " seconds")))
     b_bye(c, subs)
 
-fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
+fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
+  CAuth(name, word) -> b_signed_in(c, buf, next, subs, name, au_ok(b_users(), name, word))
   CQuit ->
     send(c.out, OFrame(w_ok()))
     b_bye(c, subs)
   CPing ->
     send(c.out, OFrame(w_pong()))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CStats ->
     back = channel()
     send(c.reg, RTotals(back))
     t = recv(back)
     send(c.out, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CXDecl(ex, kind) ->
     b_exchange(c, ex, kind)
     send(c.out, OFrame(w_ok()))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CBind(ex, qname, key) ->
     back = channel(1)
     send(b_exchange(c, ex, x_direct()), XBind(qname, key, b_find(c.reg, qname), false, back))
     recv(back)
     send(c.out, OFrame(w_ok()))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CXPub(ex, key, body) ->
-    send(b_exchange(c, ex, x_direct()), XPub(key, body, c.out))
-    b_read(c, buf, next, subs, 0)
-  CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs), qname, term, bytes)
+    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.out))
+    b_read(c, buf, next, subs, 0, who)
+  CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, bytes)
   CPromote(qname) ->
     back = channel(1)
     send(c.reg, RPromote(qname, back))
     recv(back)
     send(c.out, OFrame(w_ok()))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CVote(qname, term, size, node) ->
     back = channel(1)
     send(c.reg, RVote(qname, term, size, node, back))
     send(c.out, OFrame(if recv(back) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CWho(qname) ->
     back = channel(1)
     send(c.reg, RWho(qname, back))
     send(c.out, OFrame(w_who_line(recv(back))))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
+  CDrain(qname) ->
+    back = channel(1)
+    send(b_find(c.reg, qname), QDrain(back))
+    send(c.out, OFrame(w_drained(recv(back))))
+    b_read(c, buf, next, subs, 0, who)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))
     send(c.out, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st))))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CQueues ->
     rows = channel()
     send(c.reg, RRows(rows))
     b_say_rows(c, recv(rows))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CPub(qname, body) ->
     # Nothing is waited for. The queue is given this connection's writer, and
     # the `+OK` is put there by whoever makes the message durable; this strand
     # goes straight back to reading, which is what lets a pipelining publisher
     # fill a batch.
-    send(b_find(c.reg, qname), QPub(body, c.out))
-    b_read(c, buf, next, subs, 0)
+    send(b_find(c.reg, qname), QPub(body, "", c.out))
+    b_read(c, buf, next, subs, 0, who)
   CSub(qname) ->
     # The answer goes into the writer's queue before the subscription is made,
     # so that it is written before any message the subscription brings. Both
@@ -452,21 +557,25 @@ fn b_do(c: Conn, buf, next, subs, cmd) = match cmd
     back = channel()
     send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out), back))
     recv(back)
-    b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0)
+    b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0, who)
   CUnsub(qname) ->
     b_drop(c.reg, c.cid, qname)
     send(c.out, OFrame(w_ok()))
-    b_read(c, buf, next, without_name(subs, qname), 0)
+    b_read(c, buf, next, without_name(subs, qname), 0, who)
   CAck(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QAck(id, back))
     send(c.out, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
   CNack(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QNack(id, back))
     send(c.out, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
-    b_read(c, buf, next, subs, 0)
+    b_read(c, buf, next, subs, 0, who)
+
+fn b_signed_in(c: Conn, buf, next, subs, name, yes) =
+  send(c.out, OFrame(if yes then w_ok() else w_err("no")))
+  b_read(c, buf, next, subs, 0, if yes then name else "")
 
 # The count first, then the rows, so a client knows how many to read.
 fn b_say_rows(c: Conn, rows) =
@@ -493,7 +602,7 @@ fn b_inflight(t: Totals) = t.inflight
 # six arguments a tail call spills to the stack and stops being one, and a
 # connection taking copies is a loop that runs as long as the node does.
 type Where
-  Where(buf: Str, next: Int, subs: List(Str))
+  Where(buf: Str, next: Int, subs: List(Str), who: Str)
 
 fn b_take_copy(c: Conn, w: Where, qname, term, bytes) =
   if term < b_term(c, qname) then b_refuse_copy(c, w) else b_keep_copy(c, w, qname, bytes)
@@ -502,11 +611,11 @@ fn b_keep_copy(c: Conn, w: Where, qname, bytes) =
   back = channel(1)
   send(c.reg, RCopy(qname, back))
   send(r_puts(recv(back)), JPut(bytes, c.out, OFrame(w_ok())))
-  b_read(c, w.buf, w.next, w.subs, 0)
+  b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_refuse_copy(c: Conn, w: Where) =
   send(c.out, OFrame(w_stale()))
-  b_read(c, w.buf, w.next, w.subs, 0)
+  b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_term(c: Conn, name) =
   back = channel(1)

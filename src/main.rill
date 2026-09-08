@@ -11,30 +11,61 @@
 # channel, which every strand in the program is watching.
 import "broker"
 import "amqp_serve"
+import "auth"
+import "manage"
 
 fn default_port() = 6789
 
 fn main() =
+  if arg_count() > 1 && str_cmp(arg(1), "passwd") == 0 then set_password() else start()
+
+# `rillmq passwd <file> <name> <word> [tag]` writes somebody into a password
+# file, making the file if it is not there. It is the one thing this program
+# does that is not a broker, and it is here rather than in a second program
+# because the hashing has to be the hashing the broker checks against.
+fn set_password() =
+  if arg_count() < 5 then said_wrong() else match au_set(arg(2), arg(3), arg(4), if arg_count() > 5 then arg(5) else "")
+    Err(e) ->
+      println(e)
+      1
+    Ok(n) ->
+      println(arg(3) + " may now connect to a broker started with users=" + arg(2))
+      0
+
+fn said_wrong() =
+  println("usage: rillmq passwd <file> <name> <word> [tag]")
+  1
+
+fn start() =
   port = if arg_count() > 1 then str_to_int(arg(1)) else default_port()
   dir = where_to_keep_it()
   match listen_on(port)
     Err(e) ->
       println(e)
       0
-    Ok(server) -> serve(server, dir)
+    Ok(server) -> run_broker(server, dir)
 
 # `dir=` names somewhere to keep messages. Without one the broker keeps
 # nothing, which is a thing to want rather than a thing to be warned about.
 fn where_to_keep_it() = opt("dir", "")
 
-fn serve(server, dir) =
+fn say_who_may(users) =
+  if !au_wanted(users) then 0
+  else
+    println("rillmq asks for a name and a word, from " + users)
+    0
+
+fn run_broker(server, dir) =
   done = channel()
   reg = channel()
   spawn r_run(dir, reg, done)
   restored = bring_back(reg, dir)
   routed = bring_back_routes(reg, dir)
-  spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())))
-  amqp_on(reg, done, opt_int("amqp", 0))
+  spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())), b_door())
+  amqp_on(reg, done, opt_int("amqp", 0), b_door())
+  wrapped(reg, done, tls_ready(opt("cert", ""), opt("key", "")))
+  mg_on(reg, done, mg_port(), b_users())
+  say_who_may(b_users())
   println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) and " + int_to_str(routed) + " binding(s) restored)"))
 
   # `main` is the strand that waits for the signal, and closing `done` is how
@@ -116,17 +147,17 @@ fn ends_with_log(f) = str_len(f) > 4 && str_cmp(f[str_len(f) - 4:], ".log") == 0
 # and turns people away rather than opening a descriptor it may not be able to
 # open. Counting here rather than in a strand of its own is what keeps it off
 # the path a message takes: nothing asks it anything.
-fn accept_loop(server, reg, done, g: Gate) =
+fn accept_loop(server, reg, done, g: Gate, d: Door) =
   conn = tcp_accept(server)
-  if conn < 0 then 0 else b_admit(server, reg, done, settle(g), conn)
+  if conn < 0 then 0 else b_admit(server, reg, done, settle(g), conn, d)
 
-fn b_admit(server, reg, done, g: Gate, conn) =
+fn b_admit(server, reg, done, g: Gate, conn, d: Door) =
   if g.live >= b_max_conns() then
     turn_away(conn)
-    accept_loop(server, reg, done, g)
+    accept_loop(server, reg, done, g, d)
   else
-    spawn b_serve(conn, reg, done, g.next, g.gone)
-    accept_loop(server, reg, done, Gate(g.live + 1, g.next + 1, g.gone))
+    spawn b_serve(conn, reg, done, g.next, g.gone, d)
+    accept_loop(server, reg, done, Gate(g.live + 1, g.next + 1, g.gone), d)
 
 # Everyone who has left since the last time anyone looked, without waiting for
 # anyone who has not.
@@ -143,27 +174,62 @@ fn turn_away(conn) =
 
 # The same queues, reached by the protocol RabbitMQ speaks, on a port of its
 # own. `amqp=5672` is the port everything that speaks it expects.
-fn amqp_on(reg, done, port) =
+fn amqp_on(reg, done, port, d: Door) =
   if port <= 0 then 0 else match listen_on(port)
     Err(e) ->
       println("rillmq: " + e)
       0
     Ok(server) ->
-      println("rillmq speaking amqp 0-9-1 on port " + int_to_str(sock_port(server)))
-      spawn amqp_accept(server, reg, done, Gate(0, 1, channel(b_max_conns())))
+      println("rillmq speaking amqp 0-9-1 on port " + int_to_str(sock_port(server)) + (if is_null(d.tls.ctx) then "" else ", wrapped in tls"))
+      spawn amqp_accept(server, reg, done, Gate(0, 1, channel(b_max_conns())), d)
       0
 
-fn amqp_accept(server, reg, done, g: Gate) =
+fn amqp_accept(server, reg, done, g: Gate, d: Door) =
   conn = tcp_accept(server)
-  if conn < 0 then 0 else amqp_admit(server, reg, done, settle(g), conn)
+  if conn < 0 then 0 else amqp_admit(server, reg, done, settle(g), conn, d)
 
-fn amqp_admit(server, reg, done, g: Gate, conn) =
+fn amqp_admit(server, reg, done, g: Gate, conn, d: Door) =
   if g.live >= b_max_conns() then
     sock_close(conn)
-    amqp_accept(server, reg, done, g)
+    amqp_accept(server, reg, done, g, d)
   else
-    spawn am_serve(conn, reg, done, g.next, g.gone)
-    amqp_accept(server, reg, done, Gate(g.live + 1, g.next + 1, g.gone))
+    spawn am_serve(conn, reg, done, g.next, g.gone, d)
+    amqp_accept(server, reg, done, Gate(g.live + 1, g.next + 1, g.gone), d)
+
+# The same two protocols again, wrapped. `tls=` and `amqps=` are ports; the
+# certificate and the key are read once, here, and shared by every connection
+# either port takes. A broker asked for neither port reads neither file and
+# never calls OpenSSL at all.
+#
+# A certificate that will not load stops the broker rather than quietly
+# leaving the plain ports up: somebody who asked for TLS and got a broker
+# without it has been told the opposite of the truth.
+fn wrapped(reg, done, t: Tls) =
+  tls_port = opt_int("tls", 0)
+  amqps = opt_int("amqps", 0)
+  if tls_port <= 0 && amqps <= 0 then 0 else tls_listeners(reg, done, t, tls_port, amqps)
+
+fn tls_listeners(reg, done, t: Tls, tls_port, amqps) =
+  if !tls_working(t) then stop_with("rillmq: " + t.why) else tls_both(reg, done, Door(b_users(), t), tls_port, amqps)
+
+fn tls_both(reg, done, d: Door, tls_port, amqps) =
+  native_tls_on(reg, done, tls_port, d)
+  amqp_on(reg, done, amqps, d)
+
+fn stop_with(why) =
+  println(why)
+  exit(1)
+  0
+
+fn native_tls_on(reg, done, port, d: Door) =
+  if port <= 0 then 0 else match listen_on(port)
+    Err(e) ->
+      println("rillmq: " + e)
+      0
+    Ok(server) ->
+      println("rillmq on port " + int_to_str(sock_port(server)) + ", wrapped in tls (openssl " + tls_version() + ")")
+      spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())), d)
+      0
 
 fn name_of(sig) =
   if sig == sig_hup() then "SIGHUP" else if sig == sig_int() then "SIGINT" else if sig == sig_term() then "SIGTERM" else "signal " + int_to_str(sig)

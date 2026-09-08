@@ -66,6 +66,8 @@ fn cl_port(p: Peer) = p.port
 type Waiting
   WPub(out: Chan(Out))
   WNum(reply: Chan(Int))
+  # A number in the answer rather than a yes or a no: `+DRAIN 12`.
+  WCount(reply: Chan(Int))
   WStat(reply: Chan(QCount))
 
 type P
@@ -91,6 +93,7 @@ fn cl_proxy(name, host, port, reg, inbox, done) =
 fn cl_start(p: P, ses, done) = match connect_to(p.host, p.port)
   Err(e) -> cl_start_elsewhere(p, ses, done)
   Ok(fd) ->
+    sock_write(fd, cl_greeting())
     spawn cl_link(fd, ses, "", p.name)
     cl_resub(P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0, p.reg), ses, done)
 
@@ -116,6 +119,7 @@ fn cl_start_at(p: P, ses, done, where) = match where
 fn cl_start_once(p: P, ses, done) = match connect_to(p.host, p.port)
   Err(e) -> cl_idle(p, ses, done)
   Ok(fd) ->
+    sock_write(fd, cl_greeting())
     spawn cl_link(fd, ses, "", p.name)
     cl_resub(P(p.name, fd, p.subs, p.waits, p.head, p.tail, p.host, p.port, 0, p.reg), ses, done)
 
@@ -144,7 +148,7 @@ fn cl_refuse(name, inbox, done) =
       cl_refuse(name, inbox, done)
 
 fn cl_say_no(r) = match r
-  QPub(body, out) ->
+  QPub(body, props, out) ->
     send(out, OFrame(w_err("the node holding that queue cannot be reached")))
     0
   QSub(s, reply) ->
@@ -161,6 +165,9 @@ fn cl_say_no(r) = match r
     0
   QStat(reply) ->
     send(reply, QCount(0, 0, 0, 0))
+    0
+  QDrain(reply) ->
+    send(reply, 0)
     0
 
 # Local requests and link frames arrive on one inbox, so the proxy waits in one
@@ -248,11 +255,26 @@ fn cl_fail_one(w, name) = match w
 
 # One question and one answer, on a connection made for it. Everything between
 # nodes that is not a stream of records is this shape: ask, hear, hang up.
+# What one node says to another before anything else, when this broker asks
+# for a password. A cluster whose members refuse strangers has to give its
+# members something to be: `peer=name:word`, and the name has to be in the
+# password file every node reads.
+fn cl_greeting() =
+  raw = b_peer()
+  i = str_find(raw, ":")
+  if str_len(raw) == 0 || i < 0 then "" else "AUTH " + raw[0:i] + " " + raw[i + 1:] + crlf2()
+
 fn cl_one_shot(host, port, text) = match connect_to(host, port)
   Err(e) -> ""
   Ok(fd) ->
-    sock_write(fd, text)
-    cl_hear(fd, "")
+    sock_write(fd, cl_greeting() + text)
+    cl_reply_after(fd, str_len(cl_greeting()) > 0)
+
+# Signing in costs a line of answer, and the answer this wanted is the one
+# after it.
+fn cl_reply_after(fd, greeted) =
+  first = cl_hear(fd, "")
+  if greeted then cl_hear(fd, "") else first
 
 fn cl_hear(fd, buf) =
   at = str_find(buf, crlf2())
@@ -368,7 +390,7 @@ fn cl_wait(p: P, w) =
 # What the queue would have done, said down the link instead. Everything that
 # expects an answer leaves a note of what to do with it.
 fn cl_ask(p: P, r) = match r
-  QPub(body, out) ->
+  QPub(body, props, out) ->
     cl_send(p, "PUB " + p.name + " " + int_to_str(str_len(body)) + crlf2() + body)
     cl_wait(p, WPub(out))
   QSub(s, reply) ->
@@ -387,6 +409,9 @@ fn cl_ask(p: P, r) = match r
   QStat(reply) ->
     cl_send(p, "QSTAT " + p.name + crlf2())
     cl_wait(p, WStat(reply))
+  QDrain(reply) ->
+    cl_send(p, "DRAIN " + p.name + crlf2())
+    cl_wait(p, WCount(reply))
 
 # The last subscriber leaving takes the subscription with it, so the far end
 # stops sending: this node has nobody to give a message to.
@@ -417,6 +442,9 @@ fn cl_give(w, line, name) = match w
   WNum(reply) ->
     send(reply, if starts_with(line, "+OK") then 1 else 0)
     0
+  WCount(reply) ->
+    send(reply, cl_num(split(line, " "), 1))
+    0
   WStat(reply) ->
     send(reply, cl_stat_of(split(line, " ")))
     0
@@ -434,7 +462,7 @@ fn cl_hand_on(p: P, id, body) = cl_offer(p, id, body, p.subs)
 fn cl_offer(p: P, id, body, left) = match left
   Nil -> p
   Cons(s, rest) ->
-    if cl_try(q_sub_out(s), ODeliver(p.name, id, body)) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg) else cl_offer(p, id, body, rest)
+    if cl_try(q_sub_out(s), ODeliver(p.name, id, body, "")) then P(p.name, p.fd, cl_rotate(p.subs), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg) else cl_offer(p, id, body, rest)
 
 fn cl_try(out, what) =
   ok = select

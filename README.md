@@ -12,12 +12,21 @@ rill build src/main.rill -o rillmq
 ./rillmq 6789 dir=data amqp=5672       # and speaks AMQP as well
 ```
 
-Everything else is optional and named: `amqp=<port>` a second port speaking
-AMQP 0-9-1, `peers=<host:port,...>` and `node=<i>` for a cluster,
-`ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much one consumer may hold, `mem=<MB>` how
-big the broker may get before it refuses publishes, `idle=<s>` how long a
-connection that has asked for nothing may say nothing, `conns=<n>` how many
-connections at once.
+Everything else is optional and named. Ports: `amqp=<port>` AMQP 0-9-1,
+`tls=<port>` and `amqps=<port>` the same two wrapped in TLS, `manage=<port>`
+the management pages. Files: `cert=` and `key=` a certificate and its key in
+PEM, `users=` who may connect. Cluster: `peers=<host:port,...>`, `node=<i>`,
+and `peer=<name:word>` for what one node signs in to another as. Limits:
+`ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much
+one consumer may hold, `mem=<MB>` how big the broker may get before it refuses
+publishes, `idle=<s>` how long a connection that has asked for nothing may say
+nothing, `conns=<n>` how many connections at once.
+
+```sh
+./rillmq passwd data/users alice hunter2
+./rillmq 6789 dir=data amqp=5672 amqps=5671 users=data/users \
+         cert=server.pem key=server.key manage=15672
+```
 
 ```
 $ nc localhost 6789
@@ -387,6 +396,110 @@ comes back from there. More than one needs somebody to wait for all of them
 and confirm once, and that is a strand made for the purpose and gone as soon
 as it has counted.
 
+## Passwords
+
+Off by default, because a broker on a machine of its own behind nothing else
+should be. `users=<file>` turns it on, and then nobody gets in without a name
+and a word — over RillMQ's own protocol, over AMQP, and on the management
+pages alike.
+
+```sh
+./rillmq passwd data/users alice hunter2
+./rillmq passwd data/users bob s3cret monitoring
+./rillmq 6789 amqp=5672 users=data/users
+```
+
+The file is one person a line and the word is not in it:
+
+```
+alice:9f3c…:4096:1a7b…:administrator
+ name  salt  work  hash   what they may do
+```
+
+The hash is PBKDF2-HMAC-SHA-1, which `lib/passwd.rill` had already written and
+checked against the published vectors. The salt is why two people who chose
+the same word do not share a line. The work factor is written down beside the
+hash rather than compiled in, so raising it later leaves everybody already in
+the file able to sign in with the count that made them.
+
+Four thousand rounds is about sixty-five milliseconds here. It is a
+compromise, and worth saying which way: the number cannot go much higher,
+because a broker is a place a thousand clients may all come back to at once
+after a restart and this is time on the one thread that then owes them all an
+answer. RabbitMQ, for comparison, stretches not at all — one SHA-256 over salt
+and word — so this is four thousand times its cost per guess and still under a
+tenth of a second per login.
+
+A name nobody has costs the same as a name somebody has with the wrong word:
+the hashing runs either way, so the clock does not answer a question the
+broker declines to.
+
+On the wire it is `AUTH name word` before anything else, and over AMQP it is
+SASL `PLAIN`, which is what every client already sends. A word that is wrong
+ends an AMQP connection with no method and no reason given — what the
+specification asks for, and the only answer that does not say whether the
+*name* was the part that was wrong.
+
+## TLS
+
+Two more ports, `tls=` for RillMQ's own protocol and `amqps=` for AMQP, both
+from one certificate:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+        -days 365 -nodes -subj "/CN=broker.example" \
+        -addext "subjectAltName=DNS:broker.example"
+./rillmq 6789 amqps=5671 cert=cert.pem key=key.pem users=data/users
+```
+
+`RabbitMQ.Client` connects to `amqps=` with `Ssl.Enabled = true` and nothing
+else changed, which is the whole point.
+
+The handshake is OpenSSL's, reached through Rill's `extern`, so this is a page
+of declarations in `src/tls.rill` rather than a TLS implementation. Nothing
+above that file knows which kind of connection it has: a connection carries an
+`SSL*` that is null when it is in the clear, and `p_read`, `p_write` and
+`p_close` are what the broker calls instead of the socket. That was the whole
+of the change TLS made to the rest of it.
+
+A handshake happens on the connection's own strand rather than in the accept
+loop, and parks on the descriptor exactly as a plain read does — so a client
+that connects and then says nothing costs a parked strand and no processor.
+A certificate that will not load stops the broker rather than quietly leaving
+the plain ports up: somebody who asked for TLS and got a broker without it has
+been told the opposite of the truth.
+
+Building now needs OpenSSL 3. On a Mac that is `brew install openssl@3`; on a
+Linux box it is already where the linker looks.
+
+## The management pages
+
+`manage=15672` opens an HTTP server on the same registry everything else
+talks to. There is no second copy of anything: a page asks the registry what a
+client's `QUEUES` asks it, and a form that publishes publishes down the
+channel a publisher uses.
+
+```sh
+./rillmq 6789 dir=data users=data/users manage=15672
+open http://localhost:15672/
+```
+
+It shows the totals and a row per queue — ready, in flight, consumers, and how
+many have ever been published — and it can publish a message, empty a queue,
+and add or remove a person. `/api/queues` and `/api/overview` are the same
+numbers as JSON, for a program. Everything is behind the same password file as
+the brokers, over HTTP's own `Authorization: Basic`.
+
+The pages are Rill's own HTTP server (`lib/http.rill`) and Rill's own template
+compiler: `web/*.tmpl` are turned into Rill by `tools/pages.sh`, so rendering a
+page is a run of appends to a builder with nothing parsed and no tag looked at
+while somebody is waiting. The generated files are checked in, so building the
+broker stays `rill build src/main.rill` and nothing else.
+
+Emptying a queue writes an acknowledgement record per message, so a queue
+emptied from a page is still empty after a restart. What is in flight is left
+alone: it is somebody's to answer for.
+
 ## Who is allowed to stay
 
 A client that opens a socket and never speaks holds a strand, a descriptor and
@@ -521,6 +634,35 @@ read until the consumer reads what it has already been sent. Neither side is
 at fault and neither can move. A window of sixty-four messages per consumer is
 what stands between a broker and that deadlock.
 
+## Against RabbitMQ
+
+Apple M4, one worker, RabbitMQ 4 on the same machine, and the same program
+pointed at each in turn — `RabbitMQ.Client` 6.8.1, 64-byte messages, a queue
+of its own each run. Neither broker knows which it is.
+
+| over AMQP, through RabbitMQ's own .NET client | RabbitMQ | RillMQ |
+|---|---:|---:|
+| publish, transient | 256,000/sec | 918,000/sec |
+| deliver and acknowledge | 157,000/sec | 261,000/sec |
+| publish, durable, waiting for confirms | 262,000/sec | 329,000/sec |
+| resident after 120,000 messages | 196 MB | 96 MB |
+
+The transient publish figure is the one to read carefully: with confirms off
+there is nothing to wait for, so it measures how fast a broker takes messages
+rather than how fast it makes them durable. The durable row is the one with a
+disk in it, and both brokers batch, which is why both are faster than any
+drive.
+
+What that measurement found on the way was a deadlock in RillMQ's own AMQP
+session, and it is worth writing down because it is the shape of bug an actor
+model invites. The session both asks queues questions and is where their
+deliveries come out. Merging both into one inbox was simpler to write and was
+a deadlock: the session stood still on an answer, while the queue stood still
+trying to put a delivery into the very pipe the session had stopped emptying.
+Twenty thousand publishes and then one `Queue.Declare` was enough. Two inboxes
+rather than one, and an offer to send made in the same breath as a readiness
+to receive, is the fix — `am_hand` and `am_wait` in `src/amqp_serve.rill`.
+
 ## Numbers
 
 Apple M4, one worker, 200,000 messages of 64 bytes on one connection.
@@ -596,7 +738,9 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 13 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 17 checks through RabbitMQ's own .NET client
+sh test/secure.sh            # 9 checks of passwords and TLS
+sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
 sh test/majority.sh          # 5 checks across three
 sh test/failover.sh          # 7 checks, one node killed with nobody watching
@@ -610,8 +754,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All sixty-one pass against a `--parallel` build on four workers, and with or
-without a journal.
+All eighty-nine pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -642,8 +785,6 @@ without a journal.
 - **A proxy asks one thing at a time.** A queue standing in for a remote one
   waits for each answer before sending the next question, so one queue's
   traffic across a link is a round trip deep rather than a pipeline.
-- **No TLS, and no authentication.** Do not put this on a network you do not
-  own.
 - **The routing journal is never rewritten.** It gains a record per binding
   made and per binding taken away, and nothing ever shortens it. A queue's
   journal is compacted; this one is not, on the grounds that a table which
@@ -652,8 +793,12 @@ without a journal.
   understands unbinding, and a replayed journal can ask it; nothing else does.
 - **`durable` is not a choice.** Every exchange and every binding is written
   down, whatever the flag said, exactly as every queue is.
-- **One virtual host, and any password.** `Connection.Open` takes whatever
-  virtual host it is given and `PLAIN` takes whatever credentials it is given.
+- **One virtual host, and one permission.** `Connection.Open` takes whatever
+  virtual host it is given. A name and a word are checked; what that person
+  may then do is not, beyond a tag the management pages read.
+- **TLS is server-side only, and there is no client certificate.** A client
+  proves nothing about itself but its password, and one node proves nothing to
+  another but `peer=`.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.

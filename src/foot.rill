@@ -1,0 +1,8 @@
+# Generated from web/foot.tmpl by tools/tmplgen.rill — do not edit.
+import "tmpl"
+
+fn mg_foot(b: StrBuf, note) =
+  b += "</main>\n<footer>"
+  render(b, note)
+  b += "</footer>\n</body>\n</html>\n"
+  0

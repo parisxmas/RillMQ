@@ -1,0 +1,51 @@
+# Generated from web/overview.tmpl by tools/tmplgen.rill — do not edit.
+import "tmpl"
+import "broker"
+import "head"
+import "foot"
+
+fn mg_overview(b: StrBuf, t: Totals, rows: List(QRow), who, note, said) =
+  mg_head(b, "Overview", who)
+  b += "\n<section class=\"cards\">\n<div class=\"card\"><span class=\"n\">"
+  render(b, tot_queues(t))
+  b += "</span><span class=\"l\">queues</span></div>\n<div class=\"card\"><span class=\"n\">"
+  render(b, tot_ready(t))
+  b += "</span><span class=\"l\">ready</span></div>\n<div class=\"card\"><span class=\"n\">"
+  render(b, tot_inflight(t))
+  b += "</span><span class=\"l\">in flight</span></div>\n</section>\n"
+  if str_len(said) > 0 then
+    b += "<p class=\"empty\">"
+    render(b, said)
+    b += "</p>"
+    0
+  else 0
+  b += "\n<h2>Queues</h2>\n"
+  if len(rows) == 0 then
+    b += "\n<p class=\"empty\">Nothing yet. A queue appears the first time somebody publishes to it or subscribes to it.</p>\n"
+    0
+  else
+    b += "\n<table>\n<tr><th>Name</th><th class=\"n\">Ready</th><th class=\"n\">In flight</th><th class=\"n\">Consumers</th><th class=\"n\">Published</th><th></th></tr>\n"
+    fn each0(l0, i0) = match l0
+      Nil -> 0
+      Cons(r, rest0) ->
+        b += "\n<tr>\n<td><code>"
+        render(b, qr_name(r))
+        b += "</code></td>\n<td class=\"n\">"
+        render(b, qr_ready(r))
+        b += "</td>\n<td class=\"n\">"
+        render(b, qr_inflight(r))
+        b += "</td>\n<td class=\"n\">"
+        render(b, qr_subs(r))
+        b += "</td>\n<td class=\"n\">"
+        render(b, qr_published(r))
+        b += "</td>\n<td class=\"n\"><form method=\"post\" action=\"/drain\" style=\"border:none;padding:0;background:none\">\n<input type=\"hidden\" name=\"queue\" value=\""
+        render(b, qr_name(r))
+        b += "\">\n<button class=\"plain\" type=\"submit\">Empty it</button></form></td>\n</tr>\n"
+        each0(rest0, i0 + 1)
+    each0(rows, 0)
+    b += "\n</table>\n"
+    0
+  b += "\n<h2>Publish one</h2>\n<form method=\"post\" action=\"/publish\">\n<label>Queue<input name=\"queue\" placeholder=\"orders\" required></label>\n<label>Body<input name=\"body\" placeholder=\"hello\" size=\"34\" required></label>\n<button type=\"submit\">Send</button>\n</form>\n"
+  mg_foot(b, note)
+  b += "\n"
+  0

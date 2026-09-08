@@ -1,0 +1,235 @@
+# TLS, by calling OpenSSL.
+#
+# The broker speaks its own protocol and AMQP in the clear on their own ports,
+# and the same two wrapped in TLS on two more:
+#
+#     ./rillmq 6789 amqp=5672 amqps=5671 tls=6790 \
+#              cert=server.pem key=server.key
+#
+# Nothing above this file knows which kind of connection it has. A connection
+# carries an `SSL*` that is null when it is in the clear, and `p_read`,
+# `p_write` and `p_close` at the bottom of this file are what everything calls
+# instead of the socket directly. That is the whole of the change TLS made to
+# the rest of the broker.
+#
+# Why OpenSSL rather than TLS written here: a handshake is not the part of a
+# broker worth writing twice, and the part of it worth getting wrong is none.
+# Rill reaches C, so this is a few declarations rather than a library.
+
+# -- what OpenSSL is asked for ---------------------------------------------------
+#
+# The `-L` is where Homebrew puts it on a Mac; on a Linux box the library is on
+# the default path already and a search directory that is not there costs
+# nothing.
+extern "-L/opt/homebrew/opt/openssl@3/lib" fn OPENSSL_version_major() -> U32
+
+extern "-L/usr/local/opt/openssl@3/lib" fn OPENSSL_version_minor() -> U32
+
+extern "ssl" fn TLS_server_method() -> Ptr
+
+extern "ssl" fn SSL_CTX_new(method: Ptr) -> Ptr
+
+extern "ssl" fn SSL_CTX_use_certificate_chain_file(ctx: Ptr, path: Ptr) -> I32
+
+extern "ssl" fn SSL_CTX_use_PrivateKey_file(ctx: Ptr, path: Ptr, kind: I32) -> I32
+
+extern "ssl" fn SSL_CTX_check_private_key(ctx: Ptr) -> I32
+
+# `SSL_CTX_set_min_proto_version` is a macro in the header rather than a
+# symbol in the library, so what it stands for is written out: control 123 on
+# the context, with the version as the argument.
+extern "ssl" fn SSL_CTX_ctrl(ctx: Ptr, cmd: I32, larg: I64, parg: Ptr) -> I64
+
+extern "ssl" fn SSL_new(ctx: Ptr) -> Ptr
+
+extern "ssl" fn SSL_set_fd(ssl: Ptr, fd: I32) -> I32
+
+extern "ssl" fn SSL_accept(ssl: Ptr) -> I32
+
+extern "ssl" fn SSL_read(ssl: Ptr, buf: Ptr, num: I32) -> I32
+
+extern "ssl" fn SSL_write(ssl: Ptr, buf: Ptr, num: I32) -> I32
+
+extern "ssl" fn SSL_get_error(ssl: Ptr, ret: I32) -> I32
+
+extern "ssl" fn SSL_shutdown(ssl: Ptr) -> I32
+
+extern "ssl" fn SSL_free(ssl: Ptr) -> Unit
+
+extern "crypto" fn ERR_get_error() -> U64
+
+extern "crypto" fn ERR_error_string_n(e: U64, buf: Ptr, len: USize) -> Unit
+
+# The two OpenSSL constants this needs by number, and one version.
+fn tls_pem() = 1
+
+fn tls_want_read() = 2
+
+fn tls_want_write() = 3
+
+# TLS 1.2. Below that is a decade of attacks nobody should be reachable by, and
+# no client that talks to a broker is older than it.
+fn tls_1_2() = 771
+
+fn tls_set_min_version() = 123
+
+# -- the server's one context ----------------------------------------------------
+
+# Made once, at startup, and shared by every connection. It holds the
+# certificate and the key, which is why making it per connection would mean
+# reading and parsing both for every client that arrives.
+type Tls
+  Tls(ctx: Ptr, why: Str)
+
+fn tls_ready(cert, key) =
+  if str_len(cert) == 0 || str_len(key) == 0 then Tls(null_ptr(), "a cert= and a key= are both wanted") else tls_with_files(SSL_CTX_new(TLS_server_method()), cert, key)
+
+fn tls_with_files(ctx, cert, key) =
+  if is_null(ctx) then Tls(null_ptr(), "openssl would not make a context: " + tls_why())
+  else
+    SSL_CTX_ctrl(ctx, tls_set_min_version(), tls_1_2(), null_ptr())
+    tls_loaded(ctx, tls_load(ctx, cert, key))
+
+fn tls_load(ctx, cert, key) =
+  c = tls_use_cert(ctx, cert)
+  if c != 1 then "cannot read the certificate in " + cert + ": " + tls_why() else tls_load_key(ctx, key)
+
+fn tls_use_cert(ctx, cert) =
+  p = to_cstr(cert)
+  r = SSL_CTX_use_certificate_chain_file(ctx, p)
+  free_ptr(p)
+  r
+
+fn tls_load_key(ctx, key) =
+  p = to_cstr(key)
+  r = SSL_CTX_use_PrivateKey_file(ctx, p, tls_pem())
+  free_ptr(p)
+  if r != 1 then "cannot read the key in " + key + ": " + tls_why() else if SSL_CTX_check_private_key(ctx) != 1 then "the key in " + key + " is not the key for that certificate" else ""
+
+fn tls_loaded(ctx, why) = if str_len(why) == 0 then Tls(ctx, "") else Tls(null_ptr(), why)
+
+fn tls_working(t: Tls) = !is_null(t.ctx)
+
+# What OpenSSL says went wrong, in words. Its errors are a stack; this takes
+# the one on top, which is the one that matters.
+fn tls_why() =
+  b = buf_u8(256)
+  ERR_error_string_n(ERR_get_error(), b, 255)
+  from_cstr(b)
+
+fn tls_version() = int_to_str(OPENSSL_version_major()) + "." + int_to_str(OPENSSL_version_minor())
+
+# -- one connection --------------------------------------------------------------
+
+# How long a client has to finish a handshake, and how long a quiet TLS
+# connection is waited on before it is asked about again. Both are generous:
+# the second is not a deadline, only how long the strand sleeps between looks.
+fn tls_handshake_ms() = 10000
+
+fn tls_read_ms() = 3600000
+
+fn tls_chunk() = 16384
+
+# The handshake, on a socket that does not block. OpenSSL says what it is
+# waiting for and this waits for that: the strand parks on the descriptor
+# exactly as a plain read would, so a client that connects and says nothing
+# costs a parked strand and no processor at all.
+fn tls_up(t: Tls, fd) =
+  ssl = SSL_new(t.ctx)
+  if is_null(ssl) then null_ptr() else tls_shake(ssl, fd, SSL_set_fd(ssl, fd))
+
+fn tls_shake(ssl, fd, set) =
+  if set != 1 then tls_give_up(ssl) else tls_shaking(ssl, fd, 0)
+
+fn tls_shaking(ssl, fd, tries) =
+  if tries > 64 then tls_give_up(ssl) else tls_shook(ssl, fd, tries, SSL_accept(ssl))
+
+fn tls_shook(ssl, fd, tries, r) =
+  if r == 1 then ssl else tls_shake_again(ssl, fd, tries, SSL_get_error(ssl, r))
+
+fn tls_shake_again(ssl, fd, tries, e) =
+  if e != tls_want_read() && e != tls_want_write() then tls_give_up(ssl) else tls_shake_after(ssl, fd, tries, e)
+
+# Waiting to read is what the descriptor can be parked on. Waiting to write
+# means the far end has stopped taking bytes mid-handshake, which is rare
+# enough that a short pause and another try is the whole of the answer.
+fn tls_shake_after(ssl, fd, tries, e) =
+  if e == tls_want_read() then tls_shake_read(ssl, fd, tries) else tls_shake_pause(ssl, fd, tries)
+
+fn tls_shake_read(ssl, fd, tries) =
+  if sock_wait(fd, tls_handshake_ms()) then tls_shaking(ssl, fd, tries + 1) else tls_give_up(ssl)
+
+fn tls_shake_pause(ssl, fd, tries) =
+  sleep_ms(2)
+  tls_shaking(ssl, fd, tries + 1)
+
+fn tls_give_up(ssl) =
+  SSL_free(ssl)
+  null_ptr()
+
+# -- reading and writing ----------------------------------------------------------
+
+# Whatever has arrived, decrypted. An empty string means the connection is
+# over, which is what `sock_read` means by one, so nothing above has to know
+# which kind of connection it was reading.
+fn tls_read(ssl, fd) =
+  b = buf_u8(tls_chunk())
+  n = SSL_read(ssl, b, tls_chunk())
+  if n > 0 then str_from_ptr(b, n) else tls_read_again(ssl, fd, SSL_get_error(ssl, n))
+
+fn tls_read_again(ssl, fd, e) =
+  if e == tls_want_read() then tls_read_wait(ssl, fd) else if e == tls_want_write() then tls_read_pause(ssl, fd) else ""
+
+fn tls_read_wait(ssl, fd) = if sock_wait(fd, tls_read_ms()) then tls_read(ssl, fd) else ""
+
+fn tls_read_pause(ssl, fd) =
+  sleep_ms(2)
+  tls_read(ssl, fd)
+
+# All of it or nothing, which is what `sock_write` promises. A string with a
+# zero byte in the middle of it is written whole: the length is carried
+# alongside rather than looked for.
+fn tls_write(ssl, fd, s) =
+  if str_len(s) == 0 then 0
+  else
+    p = to_cstr(s)
+    n = tls_write_from(ssl, fd, p, str_len(s), 0)
+    free_ptr(p)
+    n
+
+fn tls_write_from(ssl, fd, p, want, sent) =
+  if sent >= want then sent else tls_wrote(ssl, fd, p, want, sent, SSL_write(ssl, ptr_offset(p, sent), want - sent))
+
+fn tls_wrote(ssl, fd, p, want, sent, k) =
+  if k > 0 then tls_write_from(ssl, fd, p, want, sent + k) else tls_write_again(ssl, fd, p, want, sent, SSL_get_error(ssl, k))
+
+fn tls_write_again(ssl, fd, p, want, sent, e) =
+  if e == tls_want_read() then tls_write_after_read(ssl, fd, p, want, sent) else if e == tls_want_write() then tls_write_after_pause(ssl, fd, p, want, sent) else -1
+
+fn tls_write_after_read(ssl, fd, p, want, sent) =
+  if sock_wait(fd, tls_read_ms()) then tls_write_from(ssl, fd, p, want, sent) else -1
+
+fn tls_write_after_pause(ssl, fd, p, want, sent) =
+  sleep_ms(2)
+  tls_write_from(ssl, fd, p, want, sent)
+
+# The close-notify the far end is owed, and then the memory. Only the first
+# half of the exchange is sent: waiting for the answer is waiting on a peer
+# that is usually already gone.
+fn tls_down(ssl) =
+  SSL_shutdown(ssl)
+  SSL_free(ssl)
+  0
+
+# -- what the rest of the broker calls ---------------------------------------------
+
+# One connection, either kind. `ssl` is null for a connection in the clear, and
+# these three are the only place in RillMQ that asks which it is.
+fn p_read(ssl, fd) = if is_null(ssl) then sock_read(fd) else tls_read(ssl, fd)
+
+fn p_write(ssl, fd, s) = if is_null(ssl) then sock_write(fd, s) else tls_write(ssl, fd, s)
+
+fn p_close(ssl, fd) =
+  if is_null(ssl) then 0 else tls_down(ssl)
+  sock_close(fd)
+  0

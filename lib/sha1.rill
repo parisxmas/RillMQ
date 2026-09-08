@@ -1,0 +1,98 @@
+# SHA-1 and base64, written in Rill. The WebSocket handshake needs both, and
+# they are a fair test of the language's bit operations: everything here is
+# 32-bit arithmetic emulated on 64-bit integers by masking after each step.
+
+fn mask32(x) = bit_and(x, 4294967295)
+
+fn add32(a, b) = mask32(a + b)
+
+fn rotl32(x, n) = mask32(bit_or(shl(x, n), shr(mask32(x), 32 - n)))
+
+# -- message schedule ---------------------------------------------------------
+
+# SHA-1 pads to a multiple of 64 bytes: a 0x80 byte, then zeros, then the
+# length in bits as a 64-bit big-endian number.
+fn pad(msg) =
+  n = str_len(msg)
+  zeros = zero_count(n)
+  msg + chr(128) + repeat(chr(0), zeros) + be64(n * 8)
+
+fn zero_count(n) =
+  rest = (n + 1) % 64
+  if rest <= 56 then 56 - rest else 120 - rest
+
+fn be64(v) =
+  chr(bit_and(shr(v, 56), 255)) + chr(bit_and(shr(v, 48), 255)) + chr(bit_and(shr(v, 40), 255)) + chr(bit_and(shr(v, 32), 255)) + chr(bit_and(shr(v, 24), 255)) + chr(bit_and(shr(v, 16), 255)) + chr(bit_and(shr(v, 8), 255)) + chr(bit_and(v, 255))
+
+fn word_at(s, i) =
+  bit_or(bit_or(shl(str_get(s, i), 24), shl(str_get(s, i + 1), 16)), bit_or(shl(str_get(s, i + 2), 8), str_get(s, i + 3)))
+
+# The 80-word schedule, built as a list so it can be indexed by round.
+fn schedule(block, base, i, acc) =
+  if i == 80 then reverse(acc) else schedule(block, base, i + 1, Cons(next_word(block, base, i, acc), acc))
+
+fn next_word(block, base, i, acc) =
+  if i < 16 then word_at(block, base + i * 4) else rotl32(bit_xor(bit_xor(at(acc, 2), at(acc, 7)), bit_xor(at(acc, 13), at(acc, 15))), 1)
+
+# `acc` holds the words in reverse, so index 0 is w[i-1].
+fn at(acc, back) = unwrap_or(nth(acc, back), 0)
+
+# -- the compression function -------------------------------------------------
+
+type Digest
+  Digest(a: Int, b: Int, c: Int, d: Int, e: Int)
+
+fn f_at(round, b, c, d) =
+  if round < 20 then bit_or(bit_and(b, c), bit_and(bit_not(b), d)) else if round < 40 then bit_xor(bit_xor(b, c), d) else if round < 60 then bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d)) else bit_xor(bit_xor(b, c), d)
+
+fn k_at(round) =
+  if round < 20 then 1518500249 else if round < 40 then 1859775393 else if round < 60 then 2400959708 else 3395469782
+
+fn round_step(st, ws, round) = match st
+  Digest(a, b, c, d, e) -> Digest(add32(add32(add32(add32(rotl32(a, 5), f_at(round, b, c, d)), e), k_at(round)), unwrap_or(nth(ws, round), 0)), a, rotl32(b, 30), c, d)
+
+fn rounds(st, ws, round) =
+  if round == 80 then st else rounds(round_step(st, ws, round), ws, round + 1)
+
+fn add_digest(x, y) = match x
+  Digest(a, b, c, d, e) -> add_second(a, b, c, d, e, y)
+
+fn add_second(a, b, c, d, e, y) = match y
+  Digest(a2, b2, c2, d2, e2) -> Digest(add32(a, a2), add32(b, b2), add32(c, c2), add32(d, d2), add32(e, e2))
+
+fn blocks(padded, base, st) =
+  if base >= str_len(padded) then st else blocks(padded, base + 64, add_digest(st, rounds(st, schedule(padded, base, 0, Nil), 0)))
+
+# The digest as 20 raw bytes.
+fn sha1(msg) =
+  digest_bytes(blocks(pad(msg), 0, Digest(1732584193, 4023233417, 2562383102, 271733878, 3285377520)))
+
+fn digest_bytes(d) = match d
+  Digest(a, b, c, e, f) -> be32(a) + be32(b) + be32(c) + be32(e) + be32(f)
+
+fn be32(v) =
+  chr(bit_and(shr(v, 24), 255)) + chr(bit_and(shr(v, 16), 255)) + chr(bit_and(shr(v, 8), 255)) + chr(bit_and(v, 255))
+
+# -- base64 -------------------------------------------------------------------
+
+fn b64_alphabet() = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn b64_char(v) = str_sub(b64_alphabet(), v, 1)
+
+fn base64(s) = b64_from(s, 0, "")
+
+fn b64_from(s, i, acc) =
+  left = str_len(s) - i
+  if left <= 0 then acc else if left == 1 then acc + b64_one(str_get(s, i)) else if left == 2 then acc + b64_two(str_get(s, i), str_get(s, i + 1)) else b64_from(s, i + 3, acc + b64_three(str_get(s, i), str_get(s, i + 1), str_get(s, i + 2)))
+
+fn b64_three(x, y, z) =
+  n = bit_or(bit_or(shl(x, 16), shl(y, 8)), z)
+  b64_char(shr(n, 18)) + b64_char(bit_and(shr(n, 12), 63)) + b64_char(bit_and(shr(n, 6), 63)) + b64_char(bit_and(n, 63))
+
+fn b64_two(x, y) =
+  n = bit_or(shl(x, 16), shl(y, 8))
+  b64_char(shr(n, 18)) + b64_char(bit_and(shr(n, 12), 63)) + b64_char(bit_and(shr(n, 6), 63)) + "="
+
+fn b64_one(x) =
+  n = shl(x, 16)
+  b64_char(shr(n, 18)) + b64_char(bit_and(shr(n, 12), 63)) + "=="

@@ -1,0 +1,171 @@
+# Who may connect.
+#
+# Off by default: a broker with no `users=` is open, which is the right thing
+# for one on a machine of its own with nothing else on it. Naming a file turns
+# it on, and then nobody gets in without a name and a word.
+#
+#     ./rillmq passwd data/users alice hunter2
+#     ./rillmq 6789 amqp=5672 users=data/users
+#
+# The file is one person a line, and the word is not in it:
+#
+#     alice:9f3c…:4096:1a7b…:administrator
+#      name  salt  work  hash   what they may do
+#
+# The salt is why two people who chose the same word do not share a line, and
+# why a table computed in advance is a table for this broker's one user. The
+# work is written down beside the hash rather than compiled in, so that raising
+# it later leaves everybody already in the file able to sign in with the count
+# that made them.
+import "passwd"
+
+# What a new password costs to make, and so what a guess costs. Four thousand
+# rounds is about sixty-five milliseconds here — paid once when a connection
+# opens and never again, and paid by an attacker for every word in their list.
+#
+# It is a compromise and worth saying which way: the number cannot be raised
+# much, because a broker is a place a thousand clients may all come back to at
+# once after a restart, and this is time on the one thread that then owes them
+# all an answer. RabbitMQ, for comparison, stretches not at all — one SHA-256
+# over salt and word — so this is four thousand times its cost per guess and
+# still less than a tenth of a second per login.
+fn au_rounds() = 4096
+
+fn au_salt_bytes() = 16
+
+# -- the file ------------------------------------------------------------------
+
+fn au_load(path) = match read_file(path)
+  Err(e) -> map_new()
+  Ok(text) -> au_lines(map_new(), lines(text))
+
+fn au_lines(m: Map(Str, Str), ls) = match ls
+  Nil -> m
+  Cons(l, rest) ->
+    au_line(m, l)
+    au_lines(m, rest)
+
+# A line is a name and the rest of it. The rest is kept as written and taken
+# apart when somebody tries to sign in, so a file carrying a field this version
+# does not know about still names the people it names.
+fn au_line(m: Map(Str, Str), l) =
+  i = str_find(l, ":")
+  if i <= 0 then 0
+  else
+    m[l[0:i]] = l[i + 1:]
+    0
+
+# The fields after the name, by number: salt is 0, the work is 1, the hash 2,
+# what they may do 3.
+fn au_field(rest, n) = au_field_from(rest, n, 0)
+
+fn au_field_from(s, want, at) =
+  i = str_find(s, ":")
+  if want == 0 then if i < 0 then s else s[0:i] else if i < 0 then "" else au_field_from(s[i + 1:], want - 1, at)
+
+# -- signing in ---------------------------------------------------------------
+
+# Whether a broker asks at all.
+fn au_wanted(path) = str_len(path) > 0
+
+# The one thing a connection calls. A broker told to use a file it cannot read
+# lets nobody in rather than everybody: an unreadable password file is the
+# failure most worth being loud about, and the loud version is a broker that
+# refuses.
+fn au_ok(path, name, word) =
+  !au_wanted(path) || au_known(au_load(path), name, word)
+
+fn au_known(users: Map(Str, Str), name, word) = match users[name]
+  # The work is done for a name nobody has, so that it takes as long to refuse
+  # as a name somebody has with the wrong word. Otherwise the clock answers a
+  # question the broker declines to.
+  None -> au_no(au_hash(word, "0000000000000000", au_rounds()))
+  Some(rest) -> au_matches(rest, word)
+
+fn au_no(ignored) = false
+
+fn au_matches(rest, word) =
+  salt = au_field(rest, 0)
+  rounds = str_to_int(au_field(rest, 1))
+  if rounds <= 0 then false else same_secret(au_hash(word, salt, rounds), au_field(rest, 2)) == 1
+
+fn au_hash(word, salt_hex, rounds) = to_hex(pbkdf2_sha1(word, from_hex(salt_hex), rounds))
+
+# What somebody may do, which only the management pages read. Everything else
+# in this broker is one permission.
+fn au_tag(path, name) = match au_load(path)[name]
+  None -> ""
+  Some(rest) -> au_field(rest, 3)
+
+fn au_names(path) = map_keys(au_load(path))
+
+# -- writing somebody down ------------------------------------------------------
+
+# A salt from the machine's own source of chance. There is no other in Rill and
+# there should not be: a salt from the clock is a salt whose range is guessable.
+fn au_salt() = match open_file("/dev/urandom", "r")
+  Err(e) -> ""
+  Ok(fd) ->
+    s = file_read(fd, au_salt_bytes())
+    file_close(fd)
+    to_hex(s)
+
+fn au_set(path, name, word, tag) =
+  salt = au_salt()
+  if str_len(salt) == 0 then Err("no /dev/urandom, so no salt, so no password") else if str_len(name) == 0 || str_find(name, ":") >= 0 then Err("a name, without a colon in it, is wanted") else replace_file(path, au_rewritten(au_existing(path), name, au_line_for(name, word, salt, tag)))
+
+fn au_line_for(name, word, salt, tag) =
+  name + ":" + salt + ":" + int_to_str(au_rounds()) + ":" + au_hash(word, salt, au_rounds()) + ":" + (if str_len(tag) == 0 then "administrator" else tag)
+
+fn au_existing(path) = match read_file(path)
+  Err(e) -> Nil
+  Ok(text) -> lines(text)
+
+fn au_forget(path, name) = replace_file(path, au_rewritten(au_existing(path), name, ""))
+
+# The file again with this one person replaced, or added at the end if they
+# were not in it. Rewriting the whole file through `replace_file` is what keeps
+# one line's change from ever being half of one.
+fn au_rewritten(ls, name, line) =
+  b = strbuf()
+  au_put_others(b, ls, name)
+  au_put_line(b, line)
+  strbuf_str(b)
+
+fn au_put_line(b: StrBuf, line) =
+  if str_len(line) == 0 then 0
+  else
+    b += line + "\n"
+    0
+
+fn au_put_others(b: StrBuf, ls, name) = match ls
+  Nil -> 0
+  Cons(l, rest) ->
+    au_put_kept(b, l, name)
+    au_put_others(b, rest, name)
+
+fn au_put_kept(b: StrBuf, l, name) =
+  if str_len(l) == 0 || au_is_named(l, name) then 0
+  else
+    b += l + "\n"
+    0
+
+fn au_is_named(l, name) =
+  i = str_find(l, ":")
+  i > 0 && str_cmp(l[0:i], name) == 0
+
+# -- what a client sends --------------------------------------------------------
+
+# SASL PLAIN, which is what every AMQP client uses: an authorisation identity
+# nobody fills in, the name, and the word, with a zero byte before each of the
+# last two.
+type Said
+  Said(name: Str, word: Str)
+
+fn au_plain(blob) =
+  i = str_find(blob, chr(0))
+  if i < 0 then Said("", "") else au_plain_rest(blob[i + 1:])
+
+fn au_plain_rest(rest) =
+  j = str_find(rest, chr(0))
+  if j < 0 then Said(rest, "") else Said(rest[0:j], rest[j + 1:])

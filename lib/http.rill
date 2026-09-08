@@ -1,0 +1,664 @@
+# A small HTTP/1.1 server, written in Rill on top of the socket builtins.
+# One strand per connection: while a connection has nothing to say its
+# strand is parked, so idle clients cost nothing.
+
+type Request
+  Request(method: Str, path: Str, headers: List(Header), body: Str)
+
+# A name and what it was given, as they arrived. The name is folded to lower
+# case on the way in, because HTTP says the two are the same header and a
+# program that compares them itself will one day meet a proxy that disagrees
+# about the capital letters.
+type Header
+  Header(name: Str, value: Str)
+
+# A reply carries what it is as well as what it says: a browser shown
+# `text/plain` renders the tags rather than the page, so a server that can
+# only say one type can only serve one kind of thing. Anything else it has to
+# say — how long this may be cached, what it is a version of — goes in
+# `headers`, which the three helpers below leave empty.
+type Response
+  Response(status: Int, content_type: Str, headers: List(Header), body: Str)
+
+fn text_response(status, body) = Response(status, "text/plain", Nil, body)
+
+fn html_response(status, body) = Response(status, "text/html; charset=utf-8", Nil, body)
+
+fn json_response(status, body) = Response(status, "application/json", Nil, body)
+
+# One more line on the way out.
+fn with_header(res: Response, name, value) =
+  Response(res.status, res.content_type, Cons(Header(name, value), res.headers), res.body)
+
+# What a request said under that name, or "" — the lookup a handler wants,
+# since a header that is not there and one that is empty mean the same thing
+# to almost every caller.
+fn header(req: Request, name) = header_in(req.headers, lower(name))
+
+fn header_in(headers: List(Header), name) = match headers
+  Nil -> ""
+  Cons(one, rest) -> if one.name == name then one.value else header_in(rest, name)
+
+# What the browser sent under that name, or "". Cookies arrive as one header
+# — `a=1; b=2` — so this is a walk over that line rather than another lookup.
+#
+# A browser's `localStorage` and `sessionStorage` are not here and cannot be:
+# they never leave the page. What a server sees is what the browser sends, and
+# that is a cookie (which it sends by itself) or whatever the page decides to
+# put in a header or a body.
+fn cookie(req: Request, name) = cookie_in(split(header(req, "cookie"), ";"), name)
+
+fn cookie_in(pairs, name) = match pairs
+  Nil -> ""
+  Cons(p, rest) ->
+    at = str_find(p, "=")
+    if at >= 0 && trim(str_sub(p, 0, at)) == name then trim(str_sub(p, at + 1, str_len(p) - at - 1)) else cookie_in(rest, name)
+
+# One `Set-Cookie` line; a response may carry several, since its headers are a
+# list rather than a table. What goes in `rest` is the browser's own language:
+#
+#     set_cookie(res, "who", id, "; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
+fn set_cookie(res: Response, name, value, rest) =
+  with_header(res, "Set-Cookie", name + "=" + value + rest)
+
+fn lower(s) =
+  b = strbuf()
+  for i in 0..str_len(s)
+    c = str_get(s, i)
+    b += if c >= 65 && c <= 90 then c + 32 else c
+  strbuf_str(b)
+
+# -- reading ------------------------------------------------------------------
+
+# Headers end at a blank line; keep reading until we have them (or the peer
+# gives up).
+fn read_head(conn, acc) =
+  if contains(acc, "\r\n\r\n") then acc else if str_len(acc) > most_head() then acc else read_more(conn, acc)
+
+# A header block that never ends is a connection that never ends: a client
+# sending one byte a second would otherwise hold a strand and a growing string
+# for as long as it liked. Sixty-four kilobytes is more than any real request
+# needs and less than any of them can hurt with.
+fn most_head() = 65536
+
+fn read_more(conn, acc) =
+  if !sock_wait(conn, quiet_ms()) then acc
+  else
+    chunk = sock_read(conn)
+    if str_len(chunk) == 0 then acc else read_head(conn, acc + chunk)
+
+# How long a connection may say nothing before it is let go, and how much a
+# request may weigh. A server with neither is one that anybody can hold open
+# with one byte and some patience: the strand waits, the string grows, and
+# nothing about it looks like an attack.
+fn quiet_ms() = 15000
+
+fn most_body() = 1048576
+
+fn first_line(raw) = unwrap_or(nth(split(raw, "\r\n"), 0), "")
+
+# The body is what `Content-Length` says it is, no more: what came after it on
+# the same connection is the next request, not part of this one.
+fn body_of(raw) =
+  i = str_find(raw, "\r\n\r\n")
+  if i < 0 then "" else if chunked(raw) then str_sub(raw, i + 4, str_len(raw) - i - 4) else str_sub(raw, i + 4, at_most(body_wanted(raw), str_len(raw) - i - 4))
+
+# A client that does not know how long its body will be says so and sends it
+# in pieces, each with its length in front — `curl -T -` and most libraries
+# streaming an upload. By the time a handler sees it the pieces are one body
+# again and the framing is gone, so nothing above this line knows the
+# difference.
+fn chunked(raw) = contains(lower(header_in(headers_of(raw), "transfer-encoding")), "chunked")
+
+fn at_most(n, cap) = if n > cap then cap else n
+
+# How long this request is altogether: its head, and the body its headers
+# promise. A request with no `Content-Length` and no body ends at the blank
+# line.
+fn whole_length(raw) =
+  i = str_find(raw, "\r\n\r\n")
+  if i < 0 then 0 else if chunked(raw) then str_len(raw) else i + 4 + body_wanted(raw)
+
+fn body_wanted(raw) =
+  said = header_in(headers_of(raw), "content-length")
+  if str_len(said) == 0 then 0 else str_to_int(said)
+
+fn parse_request(raw) =
+  parts = split(first_line(raw), " ")
+  Request(unwrap_or(nth(parts, 0), "GET"), unwrap_or(nth(parts, 1), "/"), headers_of(raw), body_of(raw))
+
+# Every line after the first, up to the blank one. A line with no colon is not
+# a header and is passed over rather than guessed at.
+fn headers_of(raw) =
+  i = str_find(raw, "\r\n\r\n")
+  head = if i < 0 then raw else str_sub(raw, 0, i)
+  lines = split(head, "\r\n")
+  named(lines, 1, Nil)
+
+fn named(lines, i, acc) =
+  if i >= len(lines) then reverse(acc)
+  else
+    line = unwrap_or(nth(lines, i), "")
+    at = str_find(line, ":")
+    if at < 0 then named(lines, i + 1, acc) else named(lines, i + 1, Cons(Header(lower(str_sub(line, 0, at)), trim(str_sub(line, at + 1, str_len(line)))), acc))
+
+# -- what a URL says -----------------------------------------------------------
+#
+# A path and a query string arrive as they were written, which is not what
+# they mean: a space is `%20` or `+`, and anything a filter holds may be
+# either. These four are what every server writes for itself otherwise.
+
+# The path with the query taken off.
+fn path_of(target) =
+  i = str_find(target, "?")
+  if i < 0 then target else str_sub(target, 0, i)
+
+# The query string, without the `?`.
+fn query_of(target) =
+  i = str_find(target, "?")
+  if i < 0 then "" else str_sub(target, i + 1, str_len(target))
+
+# What the query said under that name, decoded, or "".
+fn param(qs, name) = param_in(split(qs, "&"), name)
+
+fn param_in(pairs, name) = match pairs
+  Nil -> ""
+  Cons(p, rest) ->
+    at = str_find(p, "=")
+    key = if at < 0 then p else str_sub(p, 0, at)
+    if decoded(key) == name then if at < 0 then "" else decoded(str_sub(p, at + 1, str_len(p) - at - 1)) else param_in(rest, name)
+
+# Every parameter, in the order they were written, decoded.
+fn params(qs) = if str_len(qs) == 0 then Nil else pairs_in(split(qs, "&"), Nil)
+
+fn pairs_in(pairs, acc) = match pairs
+  Nil -> reverse(acc)
+  Cons(p, rest) ->
+    at = str_find(p, "=")
+    key = decoded(if at < 0 then p else str_sub(p, 0, at))
+    value = if at < 0 then "" else decoded(str_sub(p, at + 1, str_len(p) - at - 1))
+    if str_len(key) == 0 then pairs_in(rest, acc) else pairs_in(rest, Cons(Header(key, value), acc))
+
+# `%41` is an A and `+` is a space — the second only inside a query, which is
+# where this is used. A `%` that is not followed by two digits is a `%`: a
+# decoder that refuses would turn a badly written link into a 400 rather than
+# into what the reader meant.
+fn decoded(s) =
+  if str_find(s, "%") < 0 && str_find(s, "+") < 0 then s
+  else
+    b = strbuf()
+    walk_decoded(b, s, 0, str_len(s))
+    strbuf_str(b)
+
+fn walk_decoded(b: StrBuf, s, i, n) =
+  if i >= n then 0
+  else
+    c = str_get(s, i)
+    if c == 43 then
+      b += 32
+      walk_decoded(b, s, i + 1, n)
+    else if c == 37 && i + 2 < n && hex_of(str_get(s, i + 1)) >= 0 && hex_of(str_get(s, i + 2)) >= 0 then
+      b += hex_of(str_get(s, i + 1)) * 16 + hex_of(str_get(s, i + 2))
+      walk_decoded(b, s, i + 3, n)
+    else
+      b += c
+      walk_decoded(b, s, i + 1, n)
+
+# The other way, for a link a server writes itself: everything but the
+# unreserved characters becomes `%XX`, so a value with a space or an ampersand
+# in it survives being put in a query string.
+fn encoded(s) =
+  b = strbuf()
+  for i in 0..str_len(s)
+    c = str_get(s, i)
+    if plain_byte(c) then
+      b += c
+    else
+      b += "%" + hex_byte(c / 16) + hex_byte(c % 16)
+  strbuf_str(b)
+
+fn plain_byte(c) =
+  c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 46 || c == 95 || c == 126
+
+fn hex_byte(n) = str_sub("0123456789ABCDEF", n, 1)
+
+fn hex_of(c) =
+  if c >= 48 && c <= 57 then c - 48 else if c >= 97 && c <= 102 then c - 87 else if c >= 65 && c <= 70 then c - 55 else 0 - 1
+
+# -- writing ------------------------------------------------------------------
+
+fn status_text(code) = match code
+  200 -> "OK"
+  201 -> "Created"
+  202 -> "Accepted"
+  204 -> "No Content"
+  301 -> "Moved Permanently"
+  302 -> "Found"
+  303 -> "See Other"
+  304 -> "Not Modified"
+  307 -> "Temporary Redirect"
+  308 -> "Permanent Redirect"
+  400 -> "Bad Request"
+  401 -> "Unauthorized"
+  403 -> "Forbidden"
+  404 -> "Not Found"
+  405 -> "Method Not Allowed"
+  409 -> "Conflict"
+  413 -> "Content Too Large"
+  415 -> "Unsupported Media Type"
+  422 -> "Unprocessable Content"
+  429 -> "Too Many Requests"
+  500 -> "Internal Server Error"
+  501 -> "Not Implemented"
+  503 -> "Service Unavailable"
+  _ -> "Unknown"
+
+# `HEAD` asks what a `GET` would answer without the answer itself: the same
+# status, the same headers, the same `Content-Length`, and no body. A server
+# that sends the body anyway is one whose HEAD costs what its GET costs.
+fn render_for(method, res: Response, keep) =
+  full = response_bytes(res, keep)
+  if method != "HEAD" then full
+  else
+    i = str_find(full, "\r\n\r\n")
+    if i < 0 then full else str_sub(full, 0, i + 4)
+
+# Named for what it makes rather than for the act of making it: `render` is the
+# trait method `lib/tmpl.rill` owns, and a program that serves pages built from
+# templates wants both files at once.
+fn response_bytes(res: Response, keep) =
+  render_parts(res.status, res.content_type, res.headers, res.body, keep)
+
+fn render_parts(status, kind, extra, body, keep) =
+  b = strbuf()
+  b += "HTTP/1.1 " + int_to_str(status) + " " + status_text(status) + "\r\n"
+  b += "Content-Type: " + kind + "\r\n"
+  b += "Content-Length: " + int_to_str(str_len(body)) + "\r\n"
+  b += "Connection: " + (if keep then "keep-alive" else "close") + "\r\n"
+  b += "Date: " + http_date(now_millis()) + "\r\n"
+  header_lines(b, extra)
+  b += "\r\n"
+  b += body
+  strbuf_str(b)
+
+# `Sun, 06 Nov 1994 08:49:37 GMT` — the one date format every HTTP client can
+# read. The calendar is worked out rather than looked up: days since 1970
+# become a civil date by counting four-hundred-year eras, which repeat
+# exactly, so there is no table to be wrong.
+fn http_date(millis) =
+  secs = millis / 1000
+  days = floor_div(secs, 86400)
+  rest = secs - days * 86400
+  clock = two(rest / 3600) + ":" + two(rest % 3600 / 60) + ":" + two(rest % 60)
+  weekday(days) + ", " + two(day_of(days)) + " " + month_name(month_of(days)) + " " + int_to_str(year_of(days)) + " " + clock + " GMT"
+
+fn floor_div(a, b) = if a >= 0 then a / b else 0 - (0 - a + b - 1) / b
+
+fn two(n) = if n < 10 then "0" + int_to_str(n) else int_to_str(n)
+
+# 1970-01-01 was a Thursday, the fifth day of a week that starts on Sunday.
+fn weekday(days) =
+  nth_or(Cons("Sun", Cons("Mon", Cons("Tue", Cons("Wed", Cons("Thu", Cons("Fri", Cons("Sat", Nil))))))), (days + 4) % 7, "Thu")
+
+fn month_name(m) =
+  nth_or(Cons("Jan", Cons("Feb", Cons("Mar", Cons("Apr", Cons("May", Cons("Jun", Cons("Jul", Cons("Aug", Cons("Sep", Cons("Oct", Cons("Nov", Cons("Dec", Nil)))))))))))), m - 1, "Jan")
+
+fn nth_or(l, i, fallback) = unwrap_or(nth(l, i), fallback)
+
+# Howard Hinnant's civil-from-days: shift the epoch to March so that a leap
+# day falls at the end of a year rather than in the middle of one, then count
+# eras of four hundred years, which are all the same length.
+fn era_of(days) = floor_div(days + 719468, 146097)
+
+fn doe_of(days) = days + 719468 - era_of(days) * 146097
+
+fn yoe_of(days) =
+  doe = doe_of(days)
+  (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+
+fn doy_of(days) = doe_of(days) - (365 * yoe_of(days) + yoe_of(days) / 4 - yoe_of(days) / 100)
+
+fn mp_of(days) = (5 * doy_of(days) + 2) / 153
+
+fn day_of(days) = doy_of(days) - (153 * mp_of(days) + 2) / 5 + 1
+
+fn month_of(days) =
+  mp = mp_of(days)
+  if mp < 10 then mp + 3 else mp - 9
+
+fn year_of(days) =
+  y = yoe_of(days) + era_of(days) * 400
+  if month_of(days) <= 2 then y + 1 else y
+
+fn header_lines(b: StrBuf, headers: List(Header)) = match headers
+  Nil -> 0
+  Cons(one, rest) ->
+    b += one.name + ": " + one.value + "\r\n"
+    header_lines(b, rest)
+
+# -- serving ------------------------------------------------------------------
+
+# A connection serves request after request until one side asks to stop, so a
+# client that makes many requests pays for a single accept.
+fn handle_conn(conn, handler) = next_request(conn, handler, \c, raw -> false, "")
+
+# The same loop with a way out of it: `taken` is shown every request before it
+# is answered and says whether it has taken the connection for itself. That is
+# what an upgrade is — a WebSocket, a stream, anything that stops being
+# request-and-answer — and once it says yes this loop lets go: the socket
+# belongs to whoever took it, closing included.
+#
+#     h.serve_taking(server, \req -> route(req), \conn, raw ->
+#       if ws.ws_wanted(raw) then live(conn, raw) else false)
+fn serve_taking(server, handler, taken) =
+  conn = tcp_accept(server)
+  spawn next_request(conn, handler, taken, "")
+  serve_taking(server, handler, taken)
+
+# `carried` is whatever the last read took past the end of the request before
+# it: a client may send two requests in one packet, and those bytes are the
+# beginning of the next one rather than something to throw away.
+fn next_request(conn, handler, taken, carried) =
+  head = read_head(conn, carried)
+  if !contains(head, "\r\n\r\n") then hang_up(conn) else if taken(conn, head) then 0 else if str_len(smuggled(head)) > 0 then refuse(conn, 400, smuggled(head)) else if body_wanted(head) > most_body() then refuse(conn, 413, "the body is larger than this server takes") else answer(conn, handler, taken, read_body(conn, head))
+
+# Where a request ends has to be one answer, not two. A request carrying both
+# a `Content-Length` and a `Transfer-Encoding` has told two different stories
+# about its own length, and the danger is not that this server picks the wrong
+# one — it is that the proxy in front picks the other, so that what this server
+# reads as one request the proxy read as two, and the second one was written by
+# whoever sent the first. That is request smuggling, and the only safe answer
+# to a request that cannot say how long it is, is no answer.
+#
+# Two `Content-Length` lines are the same trick with one header, and a length
+# that is not a plain number is the same trick with none.
+fn smuggled(head) =
+  hs = headers_of(head)
+  lengths = counted_headers(hs, "content-length", 0)
+  moving = str_len(header_in(hs, "transfer-encoding")) > 0
+  if lengths > 0 && moving then "a request may say its length or send it in pieces, not both" else if lengths > 1 then "two content lengths" else if lengths == 1 && !digits_only_str(header_in(hs, "content-length")) then "a length that is not a number" else if moving && !chunked(head) then "an encoding this server does not take" else ""
+
+fn counted_headers(headers: List(Header), name, acc) = match headers
+  Nil -> acc
+  Cons(one, rest) -> counted_headers(rest, name, if one.name == name then acc + 1 else acc)
+
+fn digits_only_str(s) =
+  if str_len(s) == 0 then false
+  else
+    for i in 0..str_len(s) with ok = true
+      ok && str_get(s, i) >= 48 && str_get(s, i) <= 57
+
+# Answered without reading what was promised: a request this server will not
+# carry is one it should not spend a megabyte finding out about.
+fn refuse(conn, status, why) =
+  sock_write(conn, response_bytes(json_response(status, "{\"error\":\"" + why + "\"}"), false))
+  hang_up(conn)
+
+# The connection is done with; the number is only so that every arm of the
+# loop above is worth the same thing.
+fn hang_up(conn) =
+  sock_close(conn)
+  0
+
+# A client is free to send its headers and its body in separate packets, and
+# many do — so the head arriving is not the request arriving. Reading stops at
+# the length the headers promised, or when the peer stops talking.
+fn read_body(conn, raw) =
+  if chunked(raw) then unchunked(conn, raw)
+  else
+    want = whole_length(raw)
+    if str_len(raw) >= want then raw else more_body(conn, raw, want)
+
+# The pieces, put back together. What comes out is the head as it arrived and
+# the body as it was meant, so `body_of` above hands the handler one string.
+fn unchunked(conn, raw) =
+  i = str_find(raw, "\r\n\r\n")
+  str_sub(raw, 0, i + 4) + pieces(conn, str_sub(raw, i + 4, str_len(raw) - i - 4), "")
+
+fn pieces(conn, rest, acc) =
+  j = str_find(rest, "\r\n")
+  if j < 0 then more_pieces(conn, rest, acc)
+  else
+    n = hex_int(str_sub(rest, 0, j))
+    if n <= 0 || str_len(acc) > most_body() then acc else if str_len(rest) < j + 2 + n + 2 then more_pieces(conn, rest, acc) else pieces(conn, str_sub(rest, j + 2 + n + 2, str_len(rest) - j - 4 - n), acc + str_sub(rest, j + 2, n))
+
+fn more_pieces(conn, rest, acc) =
+  if !sock_wait(conn, quiet_ms()) then acc
+  else
+    chunk = sock_read(conn)
+    if str_len(chunk) == 0 then acc else pieces(conn, rest + chunk, acc)
+
+# A chunk's length is written in hexadecimal, and may carry an extension after
+# a semicolon that nothing here needs.
+fn hex_int(line) =
+  cut = str_find(line, ";")
+  digits = trim(if cut < 0 then line else str_sub(line, 0, cut))
+  hex_walk(digits, 0, 0)
+
+fn hex_walk(s, i, acc) =
+  if i >= str_len(s) then acc
+  else
+    d = hex_of(str_get(s, i))
+    if d < 0 then acc else hex_walk(s, i + 1, acc * 16 + d)
+
+fn more_body(conn, raw, want) =
+  if !sock_wait(conn, quiet_ms()) then raw
+  else
+    chunk = sock_read(conn)
+    if str_len(chunk) == 0 then raw else read_body(conn, raw + chunk)
+
+fn answer(conn, handler, taken, raw) =
+  req = parse_request(raw)
+  keep = keeps_alive(first_line(raw), req)
+  sock_write(conn, render_for(req.method, handler(req), keep))
+  if keep then next_request(conn, handler, taken, after_request(raw)) else hang_up(conn)
+
+fn after_request(raw) =
+  ends = whole_length(raw)
+  if ends <= 0 || ends >= str_len(raw) then "" else str_sub(raw, ends, str_len(raw) - ends)
+
+# HTTP/1.1 keeps the connection open by default and HTTP/1.0 does not; a
+# `Connection:` header from the client overrides either default.
+#
+# It is read from the headers of THIS request rather than from the bytes in
+# hand, which may hold the one after it as well: a pipelined pair whose second
+# request said `close` used to close the connection before the first answer
+# was out of the door, and the second was never answered at all.
+fn until_crlf(rest) =
+  j = str_find(rest, "\r\n")
+  trim(if j < 0 then rest else str_sub(rest, 0, j))
+
+fn keeps_alive(line, req: Request) =
+  said = header(req, "connection")
+  if str_len(said) == 0 then contains(line, "HTTP/1.1") else !contains(lower(said), "close")
+
+# Serves `count` requests and then stops, which is what makes a server
+# testable. `serve` below never returns.
+fn serve_n(port, handler, count) = match listen_on(port)
+  Err(e) -> println(e)
+  Ok(server) -> accept_n(server, handler, count)
+
+fn accept_n(server, handler, count) =
+  conn = tcp_accept(server)
+  spawn handle_conn(conn, handler)
+  if count == 1 then sock_close(server) else accept_n(server, handler, count - 1)
+
+fn serve(port, handler) = match listen_on(port)
+  Err(e) -> println(e)
+  Ok(server) -> accept_forever(server, handler)
+
+fn accept_forever(server, handler) =
+  conn = tcp_accept(server)
+  spawn handle_conn(conn, handler)
+  accept_forever(server, handler)
+
+# -- middleware ----------------------------------------------------------------
+#
+# A handler answers a request: `Request -> Response`. A middleware is one
+# layer around that — it is handed the request and the handler underneath it,
+# and decides what to do with both:
+#
+#     fn timed(req, next) =
+#       t0 = now_nanos()
+#       res = next(req)
+#       println(req.path + " " + int_to_str((now_nanos() - t0) / 1000) + " us")
+#       res
+#
+# It may answer without calling `next` at all, which is what a rate limiter
+# and an authenticator are for; it may change the request it passes down; and
+# it may look at the answer on the way back out.
+#
+# `wrap` stacks them. The first in the list is the outermost — it sees the
+# request first and the answer last:
+#
+#     answer = wrap(Cons(rate_limit(20), Cons(timed, Nil)), \req -> route(db, req))
+#     accept_forever(server, answer)
+#
+# There is nothing else to it: what comes out of `wrap` is a handler like any
+# other, so a middleware stack can be built once and handed to `serve`,
+# `serve_n` or `accept_forever` unchanged.
+fn wrap(layers, handler) = match layers
+  Nil -> handler
+  Cons(outer, rest) ->
+    inner = wrap(rest, handler)
+    \req -> outer(req, inner)
+
+# How many requests a second a route may have, and what the rest are told.
+# Anything that only reads is let through: it is the writes that reach a
+# database, and a page that is being read has no reason to be throttled.
+#
+# The count is per method and path rather than per client, because a client is
+# not something an HTTP request carries — a real deployment keys this by
+# whatever its proxy puts in front (`X-Forwarded-For`, a session, an API key)
+# and the shape below does not change.
+fn rate_limit(per_second) =
+  seen = map_new()
+  \req, next -> under_limit(seen, per_second, req, next)
+
+fn under_limit(seen, per_second, req: Request, next) =
+  if req.method == "GET" || req.method == "HEAD" then next(req)
+  else
+    key = whose(req) + " " + req.method + " " + req.path
+    now = now_nanos() / 1000000000
+    forget_old(seen, now)
+    count = hits_this_second(seen, key, now)
+    if count > per_second then too_many(per_second) else next(req)
+
+# Who is asking, as far as this server can tell. Behind a proxy that is the
+# first name in `X-Forwarded-For` — the ones after it are the proxies. With
+# nothing in front there is no such header and every caller counts as the
+# same one, which is a limit on the route rather than on a client and is the
+# honest thing to say about a server that cannot see past its own socket.
+fn whose(req: Request) =
+  said = header(req, "x-forwarded-for")
+  if str_len(said) == 0 then "anyone" else trim(unwrap_or(nth(split(said, ","), 0), said))
+
+# One second's worth of counting: a key holds the second it is counting and
+# how many have arrived in it, and a new second starts the count again.
+# A key is a client and a route, and clients keep arriving: a map that only
+# grows is a leak with a slow fuse. Anything counted in an earlier second can
+# never be counted again, so it goes.
+fn forget_old(seen, now) =
+  if map_len(seen) > 4096 then forget_each(map_items(seen), seen, now) else 0
+
+fn forget_each(items, seen, now) = match items
+  Nil -> 0
+  Cons(one, rest) -> match one
+    (key, when) -> match when
+      (second, _) ->
+        second < now && map_del(seen, key)
+        forget_each(rest, seen, now)
+
+fn hits_this_second(seen, key, now) = match map_get(seen, key)
+  None ->
+    map_set(seen, key, (now, 1))
+    1
+  Some(had) -> match had
+    (second, n) ->
+      count = if second == now then n + 1 else 1
+      map_set(seen, key, (now, count))
+      count
+
+fn too_many(per_second) =
+  json_response(429, "{\"error\":\"too many writes — the limit is " + int_to_str(per_second) + " a second\"}")
+
+# -- a client, enough to talk to ourselves ------------------------------------
+
+# One request, spelled out: a method, headers of your own, a body. `get` and
+# `get_all` below are this with all three decided. The answer comes back raw,
+# for `status_of` and `response_body` to take apart.
+fn ask(host, port, method, path, headers, body) = match connect_to(host, port)
+  Err(e) -> e
+  Ok(fd) ->
+    answer = ask_on(fd, host, method, path, headers, body)
+    sock_close(fd)
+    answer
+
+fn ask_on(fd, host, method, path, headers, body) =
+  sock_write(fd, asking(host, method, path, headers, body))
+  read_response(fd, "")
+
+fn asking(host, method, path, headers, body) =
+  b = strbuf()
+  b += method + " " + path + " HTTP/1.1\r\n"
+  b += "Host: " + host + "\r\n"
+  header_lines(b, headers)
+  b += "Content-Length: " + int_to_str(str_len(body)) + "\r\n"
+  b += "Connection: close\r\n\r\n"
+  b += body
+  strbuf_str(b)
+
+fn request_text(host, path, keep) =
+  "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + (if keep then "keep-alive" else "close") + "\r\n\r\n"
+
+fn get(host, port, path) = match connect_to(host, port)
+  Err(e) -> e
+  Ok(fd) -> request_on(fd, request_text(host, path, false))
+
+fn request_on(fd, raw) =
+  sock_write(fd, raw)
+  reply = read_response(fd, "")
+  sock_close(fd)
+  reply
+
+# Every path down one connection, which is what keep-alive buys: one accept,
+# one handshake, one strand on the server.
+fn get_all(host, port, paths) = match connect_to(host, port)
+  Err(e) -> Cons(e, Nil)
+  Ok(fd) -> send_all(fd, host, paths, Nil)
+
+fn send_all(fd, host, paths, acc) = match paths
+  Nil -> close_after(fd, acc)
+  Cons(p, rest) -> send_all(fd, host, rest, Cons(exchange(fd, host, p, len(rest) > 0), acc))
+
+fn exchange(fd, host, path, keep) =
+  sock_write(fd, request_text(host, path, keep))
+  read_response(fd, "")
+
+fn close_after(fd, acc) =
+  sock_close(fd)
+  reverse(acc)
+
+# A keep-alive server never closes, so the client stops at Content-Length
+# rather than at end of stream.
+fn read_response(fd, acc) =
+  if is_complete(acc) then acc else read_response_more(fd, acc)
+
+fn read_response_more(fd, acc) =
+  chunk = sock_read(fd)
+  if str_len(chunk) == 0 then acc else read_response(fd, acc + chunk)
+
+fn is_complete(raw) =
+  i = str_find(raw, "\r\n\r\n")
+  i >= 0 && str_len(raw) - (i + 4) >= content_length(raw)
+
+# 18 = the length of "\r\nContent-Length: ".
+fn content_length(raw) =
+  i = str_find(raw, "\r\nContent-Length: ")
+  if i < 0 then 0 else str_to_int(until_crlf(str_sub(raw, i + 18, str_len(raw))))
+
+fn response_body(raw) =
+  i = str_find(raw, "\r\n\r\n")
+  if i < 0 then raw else str_sub(raw, i + 4, str_len(raw))
+
+fn status_of(raw) = str_to_int(unwrap_or(nth(split(first_line(raw), " "), 1), "0"))

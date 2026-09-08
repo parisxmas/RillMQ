@@ -49,6 +49,8 @@ type Cmd
   CBind(exchange: Str, queue: Str, key: Str)
   CXPub(exchange: Str, key: Str, body: Str)
   CPing
+  CDrain(queue: Str)
+  CAuth(name: Str, word: Str)
   CQuit
 
 # Taking a command out of what has been read, starting at `from`.
@@ -85,7 +87,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "DRAIN") == 0 then w_drain(parts, rest) else if str_cmp(verb, "AUTH") == 0 then w_auth(parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -182,6 +184,20 @@ fn w_take_xpub(buf, parts, at) =
   key = w_second(parts)
   len = str_to_int(unwrap_or(nth(parts, 3), "-1"))
   if str_len(ex) == 0 then Bad("an exchange is wanted", at, false) else if len < 0 then Bad("a body length is wanted", at, false) else if len > w_most_body() then Bad("body too long", 0, true) else if str_len(buf) - at < len then Need else Got(CXPub(ex, key, buf[at:at + len]), at + len)
+
+# `DRAIN queue` throws away everything waiting in it and answers with how
+# much that was. What is in flight is left alone.
+fn w_drain(parts, rest) =
+  name = w_name(parts)
+  if str_len(name) == 0 then Bad("a queue name is wanted", rest, false) else Got(CDrain(name), rest)
+
+fn w_drained(n) = "+DRAIN " + int_to_str(n) + crlf()
+
+# `AUTH name word`. The word is the rest of the line rather than one field, so
+# that a word with a space in it is a word with a space in it.
+fn w_auth(parts, rest) =
+  name = w_name(parts)
+  if str_len(name) == 0 then Bad("a name is wanted", rest, false) else Got(CAuth(name, w_second(parts)), rest)
 
 fn w_name(parts) = unwrap_or(nth(parts, 1), "")
 

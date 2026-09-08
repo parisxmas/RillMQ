@@ -1,0 +1,95 @@
+# The runtime half of the template engine: what a generated template calls.
+#
+# A template is not read at run time. `tools/tmplgen.rill` turns it into Rill
+# — one function per template, static text as string literals and everything
+# else as the code it stands for — and the Rill compiler compiles that. So a
+# render is a run of appends to a builder with nothing to parse, nothing to
+# look up by name, and no branch that asks what kind of tag this was.
+#
+# What is left for run time is here: how a value becomes text, and how text
+# becomes safe to put in a page.
+#
+#   b = strbuf()
+#   greet(b, "Ada & co")          # the generated function
+#   println(strbuf_str(b))
+#
+# `render` is a trait, so `<%= x %>` costs what the type of `x` costs and no
+# more: an `Int` goes into the builder as digits with no escaping and no
+# string in between, a `Str` is escaped, and a type of your own is whatever
+# its `impl Render` says. The choice is made when the program is compiled,
+# not when the page is rendered.
+
+# The value a render answers with means nothing and every caller drops it.
+# A Rill `for` is worth zero, and these end in one.
+trait Render(a)
+  render(StrBuf, a) -> Int
+
+impl Render(Str)
+  fn render(b, s) = esc_into(b, s)
+
+# `b += int_to_str(n)` is one call in the compiled program: the digits are
+# written into the builder, and the string that would have held them is
+# never made.
+impl Render(Int)
+  fn render(b, n) =
+    b += int_to_str(n)
+    0
+
+impl Render(Float)
+  fn render(b, x) =
+    b += float_to_str(x)
+    0
+
+impl Render(Bool)
+  fn render(b, x) =
+    b += bool_to_str(x)
+    0
+
+# What `<%! x %>` writes: the text as it stands, for a value that is already
+# markup. Nothing checks that claim, which is why it has a mark of its own.
+trait Raw(a)
+  raw(StrBuf, a) -> Int
+
+impl Raw(Str)
+  fn raw(b, s) =
+    b += s
+    0
+
+# -- escaping ------------------------------------------------------------------
+
+# The five bytes that can change what a page means: `&`, `<`, `>`, `"` and
+# `'`. Almost no string holds one, so the string is looked over first and
+# copied whole when it does not — one length and one copy, which is what a
+# static piece of the template costs too. Only a string that does hold one is
+# walked a byte at a time, and even then nothing is allocated: a byte goes
+# into the builder as a byte.
+fn esc_into(b: StrBuf, s) =
+  n = #s
+  k = first_special(s, 0, n)
+  if k >= n then
+    b += s
+    0
+  else esc_tail(b, s, k, n)
+
+fn esc_tail(b: StrBuf, s, k, n) =
+  b += s[0:k]
+  for i in k..n
+    c = str_get(s, i)
+    if is_special(c) then
+      b += escaped(c)
+    else
+      b += c
+
+fn first_special(s, i, n) =
+  if i >= n then i else if is_special(str_get(s, i)) then i else first_special(s, i + 1, n)
+
+fn is_special(c) = c == 38 || c == 60 || c == 62 || c == 34 || c == 39
+
+fn escaped(c) =
+  if c == 38 then "&amp;" else if c == 60 then "&lt;" else if c == 62 then "&gt;" else if c == 34 then "&quot;" else "&#39;"
+
+# The same as a string, for a caller that wants one rather than a builder.
+fn esc(s) =
+  b = strbuf()
+  esc_into(b, s)
+  strbuf_str(b)

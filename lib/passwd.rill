@@ -1,0 +1,115 @@
+# Storing a password, which is storing something you must never be able to
+# read back.
+#
+# Three standard pieces, no invented ones: HMAC-SHA-1 (RFC 2104), PBKDF2
+# (RFC 8018), and a salt. Everything here is checked against the published
+# vectors in `wt_passwd.rill` — a key derivation that is only tested against
+# itself is a key derivation that agrees with its own bugs.
+#
+# On how much work to do here, and why it is not much: this runs inside a game
+# server that owes sixteen people a snapshot every fifty milliseconds. SHA-1 in
+# Rill costs about thirty-five microseconds, so the hundreds of thousands of
+# rounds a password wants would be a visible stall in the valley every time
+# somebody signed in — a login would be a lag spike everyone else could see.
+#
+# So the expensive half is done in the browser before anything is sent: the
+# page runs PBKDF2-HMAC-SHA-256 six hundred thousand times over the typed word
+# and sends the result, and what arrives here is already a high-entropy key
+# rather than a word somebody chose. This side then salts and stretches *that*
+# — modestly, because the cost that matters to an attacker with a stolen store
+# is the six hundred thousand they must repeat for every guess they make.
+#
+# What the split does not do is make the wire safer: the derived key is
+# password-equivalent in flight, exactly as the password would have been, and
+# TLS is what protects both. What it buys is that the work an attacker must
+# redo per guess is paid by the machine that has a person waiting on it, not
+# by the machine that owes a valley its next tick.
+import "sha1"
+
+fn hmac_block() = 64
+
+# HMAC-SHA-1. A key longer than the block is hashed down to fit; a shorter one
+# is padded with zeros, which is why a key of nulls and an empty key are the
+# same key — a property of the construction, not of this writing of it.
+fn hmac_sha1(key, msg) =
+  k = if str_len(key) > hmac_block() then sha1(key) else key
+  padded = k + repeat(chr(0), hmac_block() - str_len(k))
+  sha1(xor_byte(padded, 92) + sha1(xor_byte(padded, 54) + msg))
+
+# Every byte of a string against one constant. The pads of HMAC are nothing
+# more than this.
+fn xor_byte(s, b) = xor_byte_from(s, b, 0, strbuf())
+
+fn xor_byte_from(s, b, i, out) =
+  if i >= str_len(s) then strbuf_str(out)
+  else
+    strbuf_add(out, chr(bit_xor(str_get(s, i), b)))
+    xor_byte_from(s, b, i + 1, out)
+
+# Two strings of the same length, byte against byte. PBKDF2 folds its rounds
+# together this way.
+fn xor_str(a, b) = xor_str_from(a, b, 0, strbuf())
+
+fn xor_str_from(a, b, i, out) =
+  if i >= str_len(a) || i >= str_len(b) then strbuf_str(out)
+  else
+    strbuf_add(out, chr(bit_xor(str_get(a, i), str_get(b, i))))
+    xor_str_from(a, b, i + 1, out)
+
+# PBKDF2-HMAC-SHA-1, one block of it: twenty bytes, which is all this asks for
+# and all a SHA-1 has to give. The block index the specification appends is
+# therefore always one.
+#
+# `rounds` is a count, not a duration. It is written down where the accounts
+# are made rather than here, so that raising it later is one number in one
+# place — and so that a stored password can say which count made it.
+fn pbkdf2_sha1(key, salt, rounds) =
+  u = hmac_sha1(key, salt + chr(0) + chr(0) + chr(0) + chr(1))
+  pbkdf2_fold(key, u, u, rounds - 1)
+
+fn pbkdf2_fold(key, u, acc, left) =
+  if left <= 0 then acc
+  else
+    nxt = hmac_sha1(key, u)
+    pbkdf2_fold(key, nxt, xor_str(acc, nxt), left - 1)
+
+# -- writing bytes down -------------------------------------------------------
+
+fn hex_digits() = "0123456789abcdef"
+
+fn to_hex(s) = to_hex_from(s, 0, strbuf())
+
+fn to_hex_from(s, i, out) =
+  if i >= str_len(s) then strbuf_str(out)
+  else
+    b = str_get(s, i)
+    strbuf_add(out, str_sub(hex_digits(), shr(b, 4), 1))
+    strbuf_add(out, str_sub(hex_digits(), bit_and(b, 15), 1))
+    to_hex_from(s, i + 1, out)
+
+fn from_hex(s) = from_hex_from(s, 0, strbuf())
+
+fn from_hex_from(s, i, out) =
+  if i + 1 >= str_len(s) then strbuf_str(out)
+  else
+    strbuf_add(out, chr(shl(hex_val(str_get(s, i)), 4) + hex_val(str_get(s, i + 1))))
+    from_hex_from(s, i + 2, out)
+
+fn hex_val(c) =
+  if c >= 48 && c <= 57 then c - 48 else if c >= 97 && c <= 102 then c - 87 else if c >= 65 && c <= 70 then c - 55 else 0
+
+# -- comparing them -----------------------------------------------------------
+
+# Whether two secrets are the same, in a time that does not depend on how far
+# along they first differ.
+#
+# The obvious `a == b` returns the moment it finds a mismatched byte, and how
+# long it took is a measurement of how much of the answer was right — over
+# enough tries, that is the answer. This walks both in full and folds the
+# differences together. Unequal lengths are refused up front: that much is
+# public, since the length of a hash is a constant of the scheme.
+fn same_secret(a, b) =
+  if str_len(a) != str_len(b) then 0 else if secret_diff(a, b, 0, 0) == 0 then 1 else 0
+
+fn secret_diff(a, b, i, acc) =
+  if i >= str_len(a) then acc else secret_diff(a, b, i + 1, bit_or(acc, bit_xor(str_get(a, i), str_get(b, i))))

@@ -32,6 +32,11 @@ fn j_kind_ack() = 65
 # and because a copy then learns it the same way it learns anything.
 fn j_kind_term() = 84
 
+# A published message with the properties a client sent alongside it. 'P' is
+# the older record with a body and nothing else, and is still read, so a
+# journal written before this still replays.
+fn j_kind_msg() = 77
+
 fn j_head() = 13
 
 fn j_overhead() = 17
@@ -66,6 +71,25 @@ fn j_record(kind: Int, id, body) =
 fn j_name_record(name) = j_record(j_kind_name(), 0, name)
 
 fn j_pub_record(id, body) = j_record(j_kind_pub(), id, body)
+
+# Properties and body in one string: two bytes of length, the properties, then
+# the rest. One place encodes it and one place takes it apart, and everything
+# between carries it without looking.
+fn j_msg_record(id, props, body) = j_record(j_kind_msg(), id, j_wrap(props, body))
+
+fn j_wrap(props, body) =
+  b = strbuf()
+  b += bit_and(str_len(props), 255)
+  b += bit_and(shr(str_len(props), 8), 255)
+  b += props
+  b += body
+  strbuf_str(b)
+
+fn j_props_of(blob) = blob[2:2 + j_wrap_len(blob)]
+
+fn j_body_of(blob) = blob[2 + j_wrap_len(blob):]
+
+fn j_wrap_len(blob) = if str_len(blob) < 2 then 0 else str_get(blob, 0) + shl(str_get(blob, 1), 8)
 
 fn j_ack_record(id) = j_record(j_kind_ack(), id, "")
 
@@ -131,13 +155,14 @@ fn j_scan(buf, at, r: Replay) = match j_take(buf, at)
 fn j_apply(r: Replay, kind, id, body) =
   if kind == j_kind_term() then Replay(r.name, r.live, r.order, r.top, r.upto, if id > r.term then id else r.term)
   else if kind == j_kind_name() then Replay(body, r.live, r.order, r.top, r.upto, r.term)
-  else if kind == j_kind_pub() then
+  else if kind == j_kind_msg() || kind == j_kind_pub() then
     # The same message may be written twice: a rewrite puts the live queue in
     # a new file while a publish that was already on its way is still going to
     # be appended to it. Reading the second one again changes nothing, so long
     # as it is not counted as a second message.
     fresh = !map_has(r.live, id)
-    r.live[id] = body
+    # An older record has no properties, so it becomes one with none.
+    r.live[id] = if kind == j_kind_msg() then body else j_wrap("", body)
     Replay(r.name, r.live, if fresh then Cons(id, r.order) else r.order, if id > r.top then id else r.top, r.upto, r.term)
   else
     map_del(r.live, id)

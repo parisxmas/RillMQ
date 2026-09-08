@@ -11,7 +11,7 @@ import "wire"
 import "journal"
 
 type Msg
-  Msg(id: Int, body: Str)
+  Msg(id: Int, body: Str, props: Str)
 
 # A subscriber, named by the connection that made it. `out` is buffered, and a
 # subscriber whose buffer is full is a subscriber the queue will skip rather
@@ -41,12 +41,16 @@ type QCount
   QCount(ready: Int, inflight: Int, subs: Int, published: Int)
 
 type QReq
-  QPub(body: Str, out: Chan(Out))
+  QPub(body: Str, props: Str, out: Chan(Out))
   QSub(sub: Sub, reply: Chan(Int))
   QUnsub(sub_id: Int, reply: Chan(Int))
   QAck(id: Int, reply: Chan(Int))
   QNack(id: Int, reply: Chan(Int))
   QStat(reply: Chan(QCount))
+  # Everything waiting, thrown away, and how much that was. What is in flight
+  # is left alone: it is somebody's to answer for, and taking it back would be
+  # taking it out of a consumer's hands rather than out of the queue.
+  QDrain(reply: Chan(Int))
 
 # How long a message may be out before the queue decides the consumer is not
 # coming back with an answer. Five seconds unless the second argument on the
@@ -152,7 +156,7 @@ fn q_seed(q: Q, live: Map(Int, Str), ids) = match ids
   Cons(id, rest) -> match live[id]
     None -> q_seed(q, live, rest)
     Some(body) ->
-      q.ready[q.tail] = Msg(id, body)
+      q.ready[q.tail] = Msg(id, j_body_of(body), j_props_of(body))
       q_seed(Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr), live, rest)
 
 fn q_loop(q: Q, inbox, done) = q_turn(q, inbox, done, Guard(false, 0))
@@ -191,12 +195,12 @@ fn q_flight_recs(fl: Map(Int, Flight), ks, acc) = match ks
   Nil -> acc
   Cons(k, rest) -> match fl[k]
     None -> q_flight_recs(fl, rest, acc)
-    Some(f) -> q_flight_recs(fl, rest, Cons(j_pub_record(f.msg.id, f.msg.body), acc))
+    Some(f) -> q_flight_recs(fl, rest, Cons(j_msg_record(f.msg.id, f.msg.props, f.msg.body), acc))
 
 fn q_ready_recs(q: Q, i, acc) =
   if i < q.head then acc else match q.ready[i]
     None -> q_ready_recs(q, i - 1, acc)
-    Some(m) -> q_ready_recs(q, i - 1, Cons(j_pub_record(m.id, m.body), acc))
+    Some(m) -> q_ready_recs(q, i - 1, Cons(j_msg_record(m.id, m.props, m.body), acc))
 
 # The deadline the `select` above is given. With nothing in flight there is
 # nothing to wake up for, and with something in flight the wait is exactly as
@@ -227,12 +231,13 @@ fn q_soonest(m: Map(Int, Flight), ks, best) = match ks
 # -- what a request does --------------------------------------------------------
 
 fn q_handle(q: Q, r, full) = match r
-  QPub(body, out) -> if full then q_refuse(q, out) else q_accept(q, body, out)
+  QPub(body, props, out) -> if full then q_refuse(q, out) else q_accept(q, body, props, out)
   QSub(s, reply) -> q_handle_rest(q, r)
   QUnsub(sub_id, reply) -> q_handle_rest(q, r)
   QAck(id, reply) -> q_handle_rest(q, r)
   QNack(id, reply) -> q_handle_rest(q, r)
   QStat(reply) -> q_handle_rest(q, r)
+  QDrain(reply) -> q_handle_rest(q, r)
 
 # The refusal goes down the journal's channel with everything else, so that it
 # arrives in the place the client asked for it. Nothing is written.
@@ -240,10 +245,10 @@ fn q_refuse(q: Q, out) =
   send(q.jr.puts, JSay(out, OFrame(w_err("broker is holding all it was told it could"))))
   q
 
-fn q_accept(q: Q, body, out) = q_handle_rest(q, QPub(body, out))
+fn q_accept(q: Q, body, props, out) = q_handle_rest(q, QPub(body, props, out))
 
 fn q_handle_rest(q: Q, r) = match r
-  QPub(body, out) ->
+  QPub(body, props, out) ->
     id = q.next_id
     # The message is ready at once, and the `+OK` is written by the journal
     # rather than from here — once the record is on the disk.
@@ -259,8 +264,8 @@ fn q_handle_rest(q: Q, r) = match r
     # So a consumer may see a message a moment before its publisher is told it
     # is safe. That is the right way round: the publisher has been promised
     # nothing yet, and a message delivered twice is what at-least-once means.
-    q.ready[q.tail] = Msg(id, body)
-    send(q.jr.puts, JPut(j_pub_record(id, body), out, OPublished(q.name, id)))
+    q.ready[q.tail] = Msg(id, body, props)
+    send(q.jr.puts, JPut(j_msg_record(id, props, body), out, OPublished(q.name, id)))
     Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held, q.jr)
   QSub(s, reply) ->
     send(reply, 1)
@@ -283,6 +288,31 @@ fn q_handle_rest(q: Q, r) = match r
   QStat(reply) ->
     send(reply, QCount(q.tail - q.head, #q.inflight, len(q.subs), q.next_id - 1))
     q
+  QDrain(reply) -> q_drain(q, reply)
+
+# Everything ready, dropped, and the journal told about each one in the way it
+# is told about an acknowledgement — so a broker that comes back does not find
+# them again. What is in flight is not touched: somebody is holding it.
+fn q_drain(q: Q, reply) =
+  n = q.tail - q.head
+  q_forget_ready(q, q.head)
+  send(reply, n)
+  Q(q.name, q.ready, q.tail, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr)
+
+fn q_forget_ready(q: Q, i) =
+  if i >= q.tail then 0
+  else
+    q_drop_one(q, i)
+    q_forget_ready(q, i + 1)
+
+fn q_drop_one(q: Q, i) = match q.ready[i]
+  None -> 0
+  Some(m) ->
+    map_del(q.ready, i)
+    send(q.jr.puts, JNote(j_ack_record(q_id_of(m))))
+    0
+
+fn q_id_of(m: Msg) = m.id
 
 # An acknowledged message is gone, and the credit it was using goes back.
 fn q_forget(q: Q, id) = match q.inflight[id]
@@ -370,7 +400,7 @@ fn q_offer(q: Q, m: Msg, tried) =
         # buffer being full means it is not keeping up with what it already
         # has. Either way the message stays ready and somebody else may take
         # it.
-        if q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body)) then q_took(moved, m, q_sub_id(s)) else q_offer(moved, m, tried + 1)
+        if q_held(q, q_sub_id(s)) >= q_prefetch() then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props)) then q_took(moved, m, q_sub_id(s)) else q_offer(moved, m, tried + 1)
 
 fn q_try_send(out, frame) =
   ok = select
