@@ -1190,11 +1190,14 @@ All hundred and thirty-six of them pass, with or without a journal.
   client that wrote `{"count", 3}` on both sides gets and is right; a nested
   table or an array in either is skipped rather than compared, so a binding
   that mentions one matches nothing.
-- **`exclusive` and `auto-delete` are not choices.** `durable` is: a queue or
-  exchange declared without it is held in memory only, and neither it nor its
-  bindings come back from a restart. The other two flags are read and ignored,
-  so nothing is private to the connection that declared it and nothing goes
-  away when its last consumer does.
+- **`internal` is read and ignored.** An exchange declared internal, which is
+  a client saying that only other exchanges may publish to it, takes a
+  publish from anybody. The other four declaration flags mean what they say:
+  `passive` asks rather than makes and is answered with a 404 when the thing
+  is not there, `durable` decides whether it is written down, a queue's
+  `exclusive` gives it to one connection and refuses it to others with a 405,
+  and `auto-delete` ends a queue with its last consumer and an exchange with
+  its last binding.
 - **One virtual host, and one permission.** `Connection.Open` takes whatever
   virtual host it is given. A name and a word are checked; what that person
   may then do is not, beyond a tag the management pages read.

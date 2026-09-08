@@ -196,6 +196,40 @@ class Program
             return 0;
         }
 
+        // `declareonly <name> <excl> <auto>` declares one queue and stops, so
+        // that what is on the disk afterwards can be looked at.
+        if (args.Length > 4 && args[1] == "declareonly")
+        {
+            var qf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var qc = qf.CreateConnection();
+            using var qm = qc.CreateModel();
+            var qn = qm.QueueDeclare(args[2] == "-" ? "" : args[2], false, args[3] == "true", args[4] == "true", null).QueueName;
+            Console.WriteLine(qn);
+            Thread.Sleep(400);
+            return 0;
+        }
+
+        // `autodel` walks the auto-delete case one step at a time and prints
+        // what it sees, for when the acceptance check says it did not happen.
+        if (args.Length > 1 && args[1] == "autodel")
+        {
+            var df = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var dc = df.CreateConnection();
+            using var dm = dc.CreateModel();
+            var dq = dm.QueueDeclare("", false, true, true, null).QueueName;
+            Console.WriteLine("declared " + dq);
+            var dtag = dm.BasicConsume(dq, true, "", new EventingBasicConsumer(dm));
+            Thread.Sleep(300);
+            dm.BasicCancel(dtag);
+            Thread.Sleep(600);
+            var dgone = new BlockingCollection<string>();
+            using var dm2 = dc.CreateModel();
+            dm2.ModelShutdown += (_, e) => dgone.Add(e.ReplyCode + " " + e.ReplyText);
+            try { dm2.BasicConsume(dq, true, "", new EventingBasicConsumer(dm2)); } catch (Exception) { }
+            Console.WriteLine("after cancel: " + (dgone.TryTake(out var dg, 3000) ? dg : "still there"));
+            return 0;
+        }
+
         // `manycons` is two consumers on one channel, taking from one queue.
         // A worker pool is usually written this way, and the question is
         // whether each delivery arrives under the tag of the consumer it was
@@ -773,6 +807,75 @@ class Program
             back == null ? "(nothing)" : back.BasicProperties.ContentType, "application/json");
         Check("and a header a client put there",
             back == null ? "(nothing)" : Encoding.UTF8.GetString((byte[])back.BasicProperties.Headers["tenant"]), "acme");
+
+        // A queue with no name is the broker's to name, and two of them are
+        // two queues. They used to both be a queue genuinely called the empty
+        // string, so a program that asked for two temporary queues got one.
+        using var tmpch = conn.CreateModel();
+        var tmpa = tmpch.QueueDeclare("", false, true, true, null).QueueName;
+        var tmpb = tmpch.QueueDeclare("", false, true, true, null).QueueName;
+        Check("a queue with no name is given one", tmpa.StartsWith("amq.gen-") ? "named" : tmpa, "named");
+        Check("and two of them are two queues", tmpa == tmpb ? "the same" : "different", "different");
+        tmpch.BasicPublish("", tmpa, null, Encoding.UTF8.GetBytes("one"));
+        Thread.Sleep(400);
+        Check("what goes into one does not come out of the other",
+            tmpch.BasicGet(tmpb, true) == null ? "(nothing)" : "something", "(nothing)");
+
+        // `auto-delete`: the queue lasts as long as its consumers do.
+        var acon = new EventingBasicConsumer(tmpch);
+        var acontag = tmpch.BasicConsume(tmpa, true, "", acon);
+        Thread.Sleep(300);
+        tmpch.BasicCancel(acontag);
+        Thread.Sleep(400);
+        var afterCancel = new BlockingCollection<string>();
+        using (var probe = conn.CreateModel())
+        {
+            probe.ModelShutdown += (_, e) => afterCancel.Add(e.ReplyCode.ToString());
+            try { probe.BasicConsume(tmpa, true, "", new EventingBasicConsumer(probe)); } catch (Exception) { }
+        }
+        Check("a queue that lasts as long as its consumers goes when they do",
+            afterCancel.TryTake(out var ac1, 3000) ? ac1 : "still there", "404");
+
+        // `exclusive`: the queue belongs to the connection that declared it,
+        // and another connection is refused it rather than given it.
+        using var oconn = factory.CreateConnection();
+        using var och2 = oconn.CreateModel();
+        var locked = new BlockingCollection<string>();
+        och2.ModelShutdown += (_, e) => locked.Add(e.ReplyCode.ToString());
+        try { och2.BasicConsume(tmpb, true, "", new EventingBasicConsumer(och2)); } catch (Exception) { }
+        Check("a queue one connection has to itself is refused to another",
+            locked.TryTake(out var l1, 3000) ? l1 : "allowed", "405");
+
+        // `passive` asks whether a queue is there. Answering it by making the
+        // queue answers yes to every question ever asked.
+        var pgone = new BlockingCollection<string>();
+        using (var pch = conn.CreateModel())
+        {
+            pch.ModelShutdown += (_, e) => pgone.Add(e.ReplyCode.ToString());
+            try { pch.QueueDeclarePassive("no-such-queue-at-all"); } catch (Exception) { }
+        }
+        Check("asking passively after a queue that is not there is a 404",
+            pgone.TryTake(out var pg, 3000) ? pg : "made one", "404");
+        using var pch2 = conn.CreateModel();
+        pch2.QueueDeclare("here-i-am", true, false, false, null);
+        Check("and after one that is, its count",
+            (int)pch2.QueueDeclarePassive("here-i-am").MessageCount, 0);
+
+        // An exchange that lasts as long as something is bound to it.
+        using var xch = conn.CreateModel();
+        xch.ExchangeDeclare("going-x", ExchangeType.Direct, durable: false, autoDelete: true, arguments: null);
+        var xq = xch.QueueDeclare("", false, true, true, null).QueueName;
+        xch.QueueBind(xq, "going-x", "k");
+        xch.QueueUnbind(xq, "going-x", "k");
+        Thread.Sleep(400);
+        var xgone = new BlockingCollection<string>();
+        using (var xprobe = conn.CreateModel())
+        {
+            xprobe.ModelShutdown += (_, e) => xgone.Add(e.ReplyCode.ToString());
+            try { xprobe.ExchangeDeclarePassive("going-x"); } catch (Exception) { }
+        }
+        Check("an exchange that lasts as long as its bindings goes when the last one does",
+            xgone.TryTake(out var xg, 3000) ? xg : "still there", "404");
 
         // A worker pool: several consumers on one channel, all on one queue.
         // Their names to the queue used to be the channel's, so the second

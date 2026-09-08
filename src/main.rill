@@ -155,7 +155,7 @@ fn b_drop_exchange(reg, name) =
 
 fn b_exchange_of(reg, name, kind) =
   back = channel(1)
-  send(reg, RExchange(name, kind, true, true, back))
+  send(reg, RExchange(name, kind, true, true, false, back))
   recv(back)
 
 fn ends_with_log(f) = str_len(f) > 4 && str_cmp(f[str_len(f) - 4:], ".log") == 0

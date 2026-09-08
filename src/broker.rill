@@ -27,7 +27,7 @@ type RReq
   # settled by whoever names it first; naming it again with another kind is
   # answered with the one it already is rather than refused, which is friendlier
   # than the specification and no less safe.
-  RExchange(name: Str, kind: Str, quiet: Bool, durable: Bool, reply: Chan(Chan(XReq)))
+  RExchange(name: Str, kind: Str, quiet: Bool, durable: Bool, fleeting: Bool, reply: Chan(Chan(XReq)))
   # An exchange if there is one and nothing if there is not. `RExchange` makes
   # what it cannot find, which is right for a protocol with no declaration step
   # in it and wrong for AMQP, where a client that mistypes an exchange's name
@@ -45,6 +45,21 @@ type RReq
   # Deleting one of each. The reply is how much was in it, which is what AMQP
   # answers a `Queue.Delete` with, and -1 for a name that was not there.
   RDropQueue(name: Str, if_unused: Bool, if_empty: Bool, reply: Chan(Int))
+  # A connection saying what it means to do with a queue: whether it wants it
+  # to itself, and whether it wants it to last no longer than its consumers.
+  # The answer is whether it may have it at all, because a queue somebody else
+  # has to themselves is one this connection is refused.
+  RClaim(name: Str, cid: Int, only: Bool, fleeting: Bool, reply: Chan(Int))
+  # A consumer has gone. A queue that was declared to last as long as its
+  # consumers and has none left goes with it.
+  RIdle(name: Str, reply: Chan(Int))
+  # A binding has gone. An exchange declared to last as long as something is
+  # bound to it, and with nothing bound to it, goes with it.
+  RIdleExchange(name: Str, reply: Chan(Int))
+  # A connection has gone, and every queue it had to itself goes with it,
+  # whatever is in them — which is what a client asking for one to itself has
+  # asked for.
+  RTheirs(cid: Int, reply: Chan(Int))
   RDropExchange(name: Str, quiet: Bool, if_unused: Bool, reply: Chan(Int))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
@@ -132,13 +147,18 @@ type Conn
 # journal the routing table goes in, and a way to hand itself to a stand-in —
 # which needs it, because a stand-in that finds its node gone has to ask the
 # registry for a vote and may end up asking it to make the queue local.
+# `auto` and `owner` are the two ways a queue can be temporary: one that goes
+# when its last consumer does, and one that belongs to a single connection and
+# goes when that connection does. They live here rather than in the queue
+# because the queue is what gets stopped, and a thing cannot be the one that
+# decides to stop itself and the one that is asked whether it should.
 type Reg
-  Reg(dir: Str, jr: Jr, self: Chan(RReq))
+  Reg(dir: Str, jr: Jr, self: Chan(RReq), auto: Map(Str, Int), owner: Map(Str, Int), xauto: Map(Str, Int))
 
 fn r_run(dir, inbox, done) =
   jr = Jr(channel(256), channel(1))
   if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
-  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox), inbox, done)
+  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox, map_new(), map_new(), map_new()), inbox, done)
 
 fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, inbox, done) =
   step = select
@@ -178,7 +198,8 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RFindKind(name, durable, reply) ->
     send(reply, r_queue(qs, mine, if durable then g.dir else "", g.self, name, done))
     0
-  RExchange(name, kind, quiet, durable, reply) ->
+  RExchange(name, kind, quiet, durable, fleeting, reply) ->
+    r_mark_x(g, name, fleeting)
     send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, durable, done))
     0
   RFindIf(name, reply) ->
@@ -186,6 +207,19 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RDropQueue(name, if_unused, if_empty, reply) ->
     send(reply, r_drop_queue(qs, mine, g.dir, name, if_unused, if_empty))
+    0
+  RClaim(name, cid, only, fleeting, reply) ->
+    send(reply, r_claim(g, name, cid, only, fleeting))
+    0
+  RIdle(name, reply) ->
+    send(reply, r_idle(qs, mine, g, name))
+    0
+  RIdleExchange(name, reply) ->
+    send(reply, r_idle_x(xs, g, name))
+    0
+  RTheirs(cid, reply) ->
+    r_gone(qs, mine, g, map_keys(g.owner), cid)
+    send(reply, 1)
     0
   RDropExchange(name, quiet, if_unused, reply) ->
     send(reply, r_drop_exchange(xs, name, quiet, if_unused))
@@ -314,6 +348,66 @@ fn r_ask_kind(ch) =
   back = channel(1)
   send(ch, XKind(back))
   recv(back)
+
+# Somebody else's, or nobody's yet. A queue is only ever claimed by the
+# connection that declared it exclusive, and the claim is dropped when that
+# connection goes or when the queue does.
+fn r_claim(g: Reg, name, cid, only, fleeting) =
+  if map_has(g.owner, name) && map_or(g.owner, name, 0) != cid then 0
+  else
+    r_mark(g, name, cid, only, fleeting)
+    1
+
+fn r_mark(g: Reg, name, cid, only, fleeting) =
+  if only then r_own(g, name, cid) else 0
+  if fleeting then r_fleeting(g, name) else 0
+  0
+
+fn r_own(g: Reg, name, cid) =
+  g.owner[name] = cid
+  0
+
+fn r_fleeting(g: Reg, name) =
+  g.auto[name] = 1
+  0
+
+fn r_mark_x(g: Reg, name, fleeting) =
+  if fleeting then r_fleeting_x(g, name) else 0
+
+fn r_fleeting_x(g: Reg, name) =
+  g.xauto[name] = 1
+  0
+
+fn r_idle_x(xs: Map(Str, Chan(XReq)), g: Reg, name) =
+  if !map_has(g.xauto, name) then 0 else r_forgot_x(g, name, r_drop_exchange(xs, name, false, true))
+
+fn r_forgot_x(g: Reg, name, held) =
+  if held < 0 then held
+  else
+    map_del(g.xauto, name)
+    held
+
+# Asked after a consumer has gone, and answered by the queue rather than here:
+# `if_unused` is the whole of the condition, and a queue with a consumer left
+# refuses it.
+fn r_idle(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), g: Reg, name) =
+  if !map_has(g.auto, name) then 0 else r_forgot(g, name, r_drop_queue(qs, mine, g.dir, name, true, false))
+
+fn r_forgot(g: Reg, name, held) =
+  if held < 0 then held
+  else
+    map_del(g.auto, name)
+    map_del(g.owner, name)
+    held
+
+fn r_gone(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), g: Reg, ks, cid) = match ks
+  Nil -> 0
+  Cons(k, rest) ->
+    r_gone_one(qs, mine, g, k, cid)
+    r_gone(qs, mine, g, rest, cid)
+
+fn r_gone_one(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), g: Reg, name, cid) =
+  if map_or(g.owner, name, 0) != cid then 0 else r_forgot(g, name, r_drop_queue(qs, mine, g.dir, name, false, false))
 
 fn r_drop_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, if_unused, if_empty) = match qs[name]
   None -> -1
@@ -809,7 +903,7 @@ fn q_count_of(ch) =
 
 fn b_exchange(c: Conn, name, kind) =
   back = channel(1)
-  send(c.reg, RExchange(name, kind, false, true, back))
+  send(c.reg, RExchange(name, kind, false, true, false, back))
   recv(back)
 
 fn b_find(reg, name) =
