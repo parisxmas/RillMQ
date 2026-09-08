@@ -89,6 +89,12 @@ type RReq
   # How much of a queue's journal this node has, which is what a candidate for
   # its leadership has to say when it asks for votes.
   RSize(name: Str, reply: Chan(Int))
+  # The part of a queue's journal past an offset, for a node that is behind.
+  RTail(name: Str, from: Int, reply: Chan(Str))
+  # The other side of that: bytes from a node that is ahead, appended to the
+  # copy this node keeps. It is what a `REPL` does, asked for rather than
+  # pushed.
+  RCatchUp(name: Str, bytes: Str, reply: Chan(Int))
 
 type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
@@ -261,6 +267,13 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RTerm(name, reply) ->
     send(reply, r_known_term(ts, g.dir, name))
     0
+  RTail(name, from, reply) ->
+    send(reply, j_tail(g.dir, name, from))
+    0
+  RCatchUp(name, bytes, reply) ->
+    r_catch_up(r_copy(cs, g.dir, name, done), bytes)
+    send(reply, str_len(bytes))
+    0
   RSize(name, reply) ->
     send(reply, r_journal_size(g.dir, name))
     0
@@ -278,6 +291,16 @@ fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, durable,
   if quiet || !durable then 0 else r_note_x(jr, name, kind)
   xs[name] = ch
   ch
+
+# The same append a `REPL` makes, waited for rather than answered down a
+# connection: this is a node bringing itself up to date before it stands
+# again, and standing on records that are not on the disk yet would be
+# standing on nothing.
+fn r_catch_up(j: Jr, bytes) =
+  out = channel(1)
+  send(r_puts(j), JPut(bytes, out, OFrame(w_ok())))
+  recv(out)
+  0
 
 fn r_copy(cs: Map(Str, Jr), dir, name, done) = match cs[name]
   Some(j) -> j
@@ -729,6 +752,8 @@ fn b_always(cmd) = match cmd
   CRepl(q, t, n) -> false
   CVote(q, t, n, f) -> false
   CWho(q) -> false
+  CTail(q, f) -> false
+  CSize(q) -> false
   CPromote(q) -> false
 
 # A second at a time, rather than until something arrives. The wait costs one
@@ -792,6 +817,12 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     back = channel(1)
     send(c.reg, RVote(qname, term, size, node, back))
     send(c.out, OFrame(if recv(back) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
+    b_read(c, buf, next, subs, 0, who)
+  CTail(qname, from) ->
+    b_say_tail(c, qname, b_tail(c, qname, from))
+    b_read(c, buf, next, subs, 0, who)
+  CSize(qname) ->
+    send(c.out, OFrame(w_size_line(b_size(c, qname))))
     b_read(c, buf, next, subs, 0, who)
   CWho(qname) ->
     back = channel(1)
@@ -888,6 +919,20 @@ fn b_keep_copy(c: Conn, w: Where, qname, bytes) =
 fn b_refuse_copy(c: Conn, w: Where) =
   send(c.out, OFrame(w_stale()))
   b_read(c, w.buf, w.next, w.subs, 0, w.who)
+
+fn b_size(c: Conn, name) =
+  back = channel(1)
+  send(c.reg, RSize(name, back))
+  recv(back)
+
+fn b_tail(c: Conn, name, from) =
+  back = channel(1)
+  send(c.reg, RTail(name, from, back))
+  recv(back)
+
+fn b_say_tail(c: Conn, name, t) =
+  send(c.out, OFrame(w_tail_line(str_len(t)) + t))
+  0
 
 fn b_term(c: Conn, name) =
   back = channel(1)

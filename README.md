@@ -1166,12 +1166,20 @@ All hundred and thirty-six of them pass, with or without a journal.
   queue nobody is watching over. It has nothing in it, which is why this is
   liveable, but the first message to a cold queue on a dead node still waits
   for somebody to ask.
-- **A term is per queue, and there is no log to catch up on.** A candidate
-  that is behind is refused and stays behind; nothing copies it the records it
-  is missing. In a cluster that has been up long enough for a majority to have
-  everything this is a distinction without a difference, and in one that has
-  not, it means the election waits for a node that is ahead to be asked for
-  the queue.
+- **A term is per queue, and catching up is a whole file's tail.** A node that
+  is behind asks the others how much of the queue they have, fetches
+  everything past what it has from the one with the most, and then stands.
+  That is enough because a journal is only ever appended to and replaced
+  whole, so there is nothing to reconcile — but it is a byte range, not a log
+  comparison, and a copy that has diverged rather than fallen behind is not a
+  case this can tell apart or repair.
+- **Only the lowest-numbered node that is still there stands.** Two standing
+  at once for the same turn can each grant the other, because a vote is one
+  round and nothing here steps down on seeing a later turn. Until catching up
+  existed, what kept them apart was that their copies were usually different
+  lengths; now it is said rather than left to luck. The cost is that a node
+  which cannot see the lowest one, but can see a majority, waits for a
+  heartbeat rather than standing at once.
 - **A copy is a file, not a queue.** The node keeping it does not serve it,
   count it, or list it. Making it serve is a restart with a different
   `peers`.

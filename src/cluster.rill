@@ -197,6 +197,26 @@ fn cl_alive(where) = match where
 # is won the queue starts here and the next client to want it finds it, rather
 # than finding a node that is not there and waiting for a turn to be decided.
 fn cl_step_up(reg, peers, name) =
+  if !cl_mine_to_stand(peers) then 0 else cl_step_up_now(reg, peers, name)
+
+# Only the lowest-numbered node that is still there stands. Two standing at
+# the same moment for the same turn can each grant the other — a vote is one
+# round and nothing here steps down when it is out-termed — and what kept them
+# apart until now was that their copies were usually different lengths, since
+# a leader waits for one copy rather than for both. Catching up makes them the
+# same length, so the thing that kept them apart has to be said rather than
+# left to luck.
+#
+# A node that does not stand is not a queue that waits: every node's heartbeat
+# asks this, so the lowest one that is there gets to it within a beat.
+fn cl_mine_to_stand(peers) = !cl_lower_alive(peers, 0)
+
+fn cl_lower_alive(peers, i) = match peers
+  Nil -> false
+  Cons(p, rest) -> if i >= cl_me() then false else cl_alive(Some(p)) || cl_lower_alive(rest, i + 1)
+
+fn cl_step_up_now(reg, peers, name) =
+  cl_catch_up(reg, peers, name, cl_rounds())
   term = cl_term_at(reg, name) + 1
   if !cl_stand(name, term, cl_size_at(reg, name), peers, cl_me()) then 0 else cl_stepped_up(reg, name, term)
 
@@ -403,6 +423,89 @@ fn cl_ask_who_rest(peers, name, i, me) = match peers
 # of, and how much of that queue's journal it has. A majority is needed, and
 # this node counts as one of them because it has already voted for itself by
 # asking.
+# What a round of asking came back with: how many said yes, and — among those
+# that said no because they had more of the queue than the asker — which node
+# had the most and how much. That last pair is who to catch up from.
+# Catching up before standing, not instead of it. A node that is behind asks
+# every other how much of the queue it has, fetches what it is missing from
+# the one with the most, and then holds exactly the one election it would have
+# held anyway.
+#
+# It was written the other way round first — stand, and if the answer is "you
+# are behind", catch up and stand again for a later turn — and that was wrong
+# in a way worth writing down. Two nodes whose owner has just died stand at the
+# same moment for the same turn, and each grants the other, because a vote is
+# one round and a leader here never steps down. Standing once, both can win and
+# one of them finds out; standing until it wins, the slower one always
+# eventually out-numbers the leader and takes the queue off it. The failover
+# suite caught it three times out of three: two survivors, two different
+# answers to who had the queue.
+fn cl_rounds() = 8
+
+fn cl_catch_up(reg, peers, name, left) =
+  have = cl_size_at(reg, name)
+  best = cl_most(peers, name, 0, 0 - 1, have)
+  if left <= 0 || best < 0 then 0 else if cl_pull(reg, peers, name, best, have) <= 0 then 0 else cl_catch_up(reg, peers, name, left - 1)
+
+# Which node has the most of this queue, and more than this one, or -1.
+fn cl_most(peers, name, i, best, most) = match peers
+  Nil -> best
+  Cons(p, rest) -> cl_most_of(rest, name, i, best, most, if i == cl_me() then 0 - 1 else cl_size_asked(p, name))
+
+fn cl_most_of(rest, name, i, best, most, theirs) =
+  if theirs > most then cl_most(rest, name, i + 1, i, theirs) else cl_most(rest, name, i + 1, best, most)
+
+fn cl_size_asked(p: Peer, name) =
+  cl_said_size(cl_one_shot(cl_host(p), cl_port(p), "SIZE " + name + crlf2()))
+
+fn cl_said_size(line) = if !starts_with(line, "+SIZE ") then 0 - 1 else str_to_int(line[6:])
+
+fn cl_pull(reg, peers, name, from, have) = match nth(peers, from)
+  None -> 0
+  Some(pe) -> cl_pulled(reg, name, cl_fetch(cl_host(pe), cl_port(pe), "TAIL " + name + " " + int_to_str(have) + crlf2()))
+
+fn cl_pulled(reg, name, bytes) =
+  if str_len(bytes) == 0 then 0 else cl_appended(reg, name, bytes)
+
+fn cl_appended(reg, name, bytes) =
+  back = channel(1)
+  send(reg, RCatchUp(name, bytes, back))
+  recv(back)
+
+# A reply with a body behind it, which is the only one in the cluster's
+# language: a line saying how many bytes, and then that many.
+type Heard
+  Heard(line: Str, rest: Str)
+
+fn cl_fetch(host, port, text) = match connect_to(host, port)
+  Err(e) -> ""
+  Ok(fd) -> cl_fetching(fd, text)
+
+fn cl_fetching(fd, text) =
+  sock_write(fd, cl_greeting() + text)
+  if str_len(cl_greeting()) > 0 then cl_headed(fd, cl_line(fd, cl_rest_of(cl_line(fd, "")))) else cl_headed(fd, cl_line(fd, ""))
+
+fn cl_rest_of(s: Heard) = s.rest
+
+fn cl_line(fd, buf) =
+  at = str_find(buf, crlf2())
+  if at >= 0 then Heard(buf[:at], buf[at + 2:])
+  else
+    more = if sock_wait(fd, 5000) then sock_read(fd) else ""
+    if str_len(more) == 0 then Heard("", "") else cl_line(fd, buf + more)
+
+fn cl_headed(fd, said: Heard) =
+  n = cl_how_many(said.line)
+  if n <= 0 then cl_hang_up(fd, "") else cl_hang_up(fd, cl_fill(fd, said.rest, n))
+
+fn cl_how_many(line) = if !starts_with(line, "+TAIL ") then 0 else str_to_int(line[6:])
+
+fn cl_fill(fd, buf, n) =
+  if str_len(buf) >= n then buf[:n]
+  else
+    more = if sock_wait(fd, 5000) then sock_read(fd) else ""
+    if str_len(more) == 0 then "" else cl_fill(fd, buf + more, n)
+
 fn cl_stand(name, term, size, peers, me) =
   cl_won(cl_count_votes(peers, name, term, size, 0, 1), len(peers))
 
@@ -442,7 +545,11 @@ fn cl_go_to(p: P, r, ses, where) = match where
 # that has less than they do, and a majority has everything anybody was told
 # was safe.
 fn cl_maybe_stand(p: P, r, peers) =
-  if len(peers) <= 1 then cl_no(p, r) else if cl_stand(p.name, cl_term_of(p) + 1, cl_size_of(p), peers, cl_me()) then cl_elected(p, r, cl_term_of(p) + 1) else cl_no(p, r)
+  if len(peers) <= 1 || !cl_mine_to_stand(peers) then cl_no(p, r) else cl_standing(p, r, peers, cl_catch_up(p.reg, peers, p.name, cl_rounds()))
+
+fn cl_standing(p: P, r, peers, caught) =
+  term = cl_term_of(p) + 1
+  if !cl_stand(p.name, term, cl_size_of(p), peers, cl_me()) then cl_no(p, r) else cl_elected(p, r, term)
 
 fn cl_term_of(p: P) =
   back = channel(1)

@@ -482,6 +482,29 @@ fn j_run_memory(jr: Jr, done) =
 # the encoding only has to be unique, not reversible.
 fn j_file(name) = j_safe(name, 0, strbuf()) + ".log"
 
+# The bytes of a queue's journal past an offset. A journal is appended to and
+# replaced whole, never written into, so what is past an offset is exactly
+# what a node holding that much does not have.
+#
+# Capped, because a node that has been away a long time should not be sent a
+# hundred megabytes in one answer. It asks again from where it got to.
+fn j_tail_most() = 8388608
+
+fn j_tail(dir, name, from) =
+  if str_len(dir) == 0 then ""
+  else
+    fd = file_open(dir + "/" + j_file(name), "r")
+    if fd < 0 then "" else j_tail_at(fd, from)
+
+fn j_tail_at(fd, from) =
+  left = file_size(fd) - from
+  n = if left > j_tail_most() then j_tail_most() else left
+  if n <= 0 then j_shut(fd, "") else j_shut(fd, file_pread(fd, from, n))
+
+fn j_shut(fd, s) =
+  file_close(fd)
+  s
+
 fn j_safe(name, i, b: StrBuf) =
   if i >= str_len(name) then strbuf_str(b)
   else

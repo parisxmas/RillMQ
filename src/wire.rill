@@ -44,6 +44,15 @@ type Cmd
   CRepl(queue: Str, term: Int, bytes: Str)
   CVote(queue: Str, term: Int, size: Int, node: Int)
   CWho(queue: Str)
+  # `TAIL <queue> <from>` is a node that has fallen behind asking a node that
+  # has not for the part of a queue's journal it is missing. A journal is only
+  # ever appended to, so everything past an offset is exactly what the asker
+  # does not have.
+  CTail(queue: Str, from: Int)
+  # `SIZE <queue>` asks how much of a queue's journal a node has. It changes
+  # nothing and decides nothing: it is what a node asks before standing, to
+  # find out whether it is the one that is behind.
+  CSize(queue: Str)
   CPromote(queue: Str)
   CXDecl(exchange: Str, kind: Str)
   CBind(exchange: Str, queue: Str, key: Str)
@@ -87,7 +96,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "DRAIN") == 0 then w_drain(parts, rest) else if str_cmp(verb, "AUTH") == 0 then w_auth(parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "TAIL") == 0 then w_tail(parts, rest) else if str_cmp(verb, "SIZE") == 0 then w_size(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "DRAIN") == 0 then w_drain(parts, rest) else if str_cmp(verb, "AUTH") == 0 then w_auth(parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -156,6 +165,19 @@ fn w_vote(parts, rest) =
 fn w_who(parts, rest) =
   queue = w_name(parts)
   if str_len(queue) == 0 then Bad("a queue name is wanted", rest, false) else Got(CWho(queue), rest)
+
+fn w_tail(parts, rest) =
+  queue = w_name(parts)
+  from = str_to_int(unwrap_or(nth(parts, 2), "-1"))
+  if str_len(queue) == 0 || from < 0 then Bad("a queue and an offset are wanted", rest, false) else Got(CTail(queue, from), rest)
+
+fn w_tail_line(n) = "+TAIL " + int_to_str(n) + crlf()
+
+fn w_size(parts, rest) =
+  queue = w_name(parts)
+  if str_len(queue) == 0 then Bad("a queue name is wanted", rest, false) else Got(CSize(queue), rest)
+
+fn w_size_line(n) = "+SIZE " + int_to_str(n) + crlf()
 
 fn w_vote_yes() = "+VOTE" + crlf()
 
