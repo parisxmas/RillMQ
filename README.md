@@ -568,6 +568,9 @@ body is bytes; a Rill string is a byte string, so nothing cares what is in one.
 | `XPUB <exchange> <key> <len>\r\n<body>` | `+OK` |
 | `STATS` | `+STATS <queues> <ready> <inflight>` |
 | `QUEUES` | `+QUEUES <n>`, then `n` rows of `Q <name> <ready> <inflight> <subs> <published>` |
+| `QSTAT <queue>` | `+QSTAT <ready> <inflight> <subs> <published>` |
+| `DRAIN <queue>` | `+DRAIN <n>` — everything waiting thrown away, what is in flight left alone |
+| `AUTH <name> <word>` | `+OK`, or `-ERR no`; wanted first when the broker was given a `users=` file |
 | `PING` | `+PONG` |
 | `QUIT` | `+OK`, then the socket closes |
 
@@ -802,6 +805,13 @@ All eighty-nine pass, with or without a journal.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.
+- **The cluster checks want a quiet machine.** `majority.sh` and
+  `failover.sh` publish and wait on deadlines of a second or two. On a machine
+  also running RabbitMQ, a .NET build and three other brokers they time out,
+  and on a quiet one they pass sixty runs out of sixty. Whether that is only
+  load or whether there is a lost wake-up behind it is not settled: a reply
+  was once observed sitting in a connection's channel until the next command
+  arrived and shook it loose, and that has not been reproduced since.
 - **Nothing is measured over time.** `QUEUES` says what is true now; there is
   no rate, no age of the oldest message, and no way to see how big a queue's
   journal has grown.
