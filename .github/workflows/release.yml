@@ -13,7 +13,8 @@
 # there either, and a broker is nothing but sockets. Both are work in the
 # language rather than in this file.
 #
-# Wants a secret: RILL_TOKEN, which may read the compiler's own repository.
+# Wants a secret: RILL_SSH_KEY, a deploy key that may read the compiler's own
+# repository and nothing else.
 name: release
 
 on:
@@ -61,7 +62,7 @@ jobs:
         with:
           repository: parisxmas/rill
           ref: rillmq-foundations
-          token: ${{ secrets.RILL_TOKEN }}
+          ssh-key: ${{ secrets.RILL_SSH_KEY }}
           path: rill-lang
 
       - name: What the compiler needs (Linux)
