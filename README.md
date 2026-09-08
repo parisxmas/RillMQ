@@ -486,6 +486,7 @@ swallow any prefix and the only way to know whether it should is to try.
 
 ```
 XDECL logs topic
+XDECL inner fanout internal
 BIND logs errs *.error
 BIND logs under app.#
 XPUB logs app.error 9
@@ -1269,10 +1270,13 @@ All hundred and thirty-six of them pass, with or without a journal.
   client that wrote `{"count", 3}` on both sides gets and is right; a nested
   table or an array in either is skipped rather than compared, so a binding
   that mentions one matches nothing.
-- **`internal` is read and ignored.** An exchange declared internal — a client
-  saying that only other exchanges may publish to it, which now means
-  something, since an exchange can be bound to an exchange — takes a publish
-  from anybody. The other four declaration flags mean what they say:
+- **`internal` is a choice the .NET client cannot make.** The flag means what
+  it says here — an exchange declared internal takes what another exchange
+  routes to it and refuses a client's publish with a 403, across a restart —
+  but `RabbitMQ.Client` 6 has no way to send it, so this broker's own protocol
+  says it instead: `XDECL <name> <kind> internal`. Other client libraries can,
+  and the specification has it. The other four declaration flags mean what
+  they say:
   `passive` asks rather than makes and is answered with a 404 when the thing
   is not there, `durable` decides whether it is written down, a queue's
   `exclusive` gives it to one connection and refuses it to others with a 405,

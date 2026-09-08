@@ -27,7 +27,7 @@ type RReq
   # settled by whoever names it first; naming it again with another kind is
   # answered with the one it already is rather than refused, which is friendlier
   # than the specification and no less safe.
-  RExchange(name: Str, kind: Str, quiet: Bool, durable: Bool, fleeting: Bool, reply: Chan(Chan(XReq)))
+  RExchange(name: Str, kind: Str, quiet: Bool, durable: Bool, fleeting: Bool, inner: Bool, reply: Chan(Chan(XReq)))
   # An exchange if there is one and nothing if there is not. `RExchange` makes
   # what it cannot find, which is right for a protocol with no declaration step
   # in it and wrong for AMQP, where a client that mistypes an exchange's name
@@ -204,9 +204,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RFindKind(name, durable, reply) ->
     send(reply, r_queue(qs, mine, if durable then g.dir else "", g.self, name, done))
     0
-  RExchange(name, kind, quiet, durable, fleeting, reply) ->
+  RExchange(name, kind, quiet, durable, fleeting, inner, reply) ->
     r_mark_x(g, name, fleeting)
-    send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, durable, done))
+    send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, durable, inner, done))
     0
   RFindIf(name, reply) ->
     send(reply, r_known(qs, mine, g.dir, g.self, name, done))
@@ -278,17 +278,17 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     send(reply, r_journal_size(g.dir, name))
     0
 
-fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, durable, done) = match xs[name]
+fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, durable, inner, done) = match xs[name]
   Some(ch) -> ch
-  None -> r_make_exchange(xs, r_only(jr), name, kind, quiet, durable, done)
+  None -> r_make_exchange(xs, r_only(jr), name, kind, quiet, durable, inner, done)
 
 # `quiet` is what startup uses. Reading the table back in and writing every
 # line of it out again would make the file longer every time the broker was
 # restarted, for a table that had not changed.
-fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, durable, done) =
+fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, durable, inner, done) =
   ch = channel()
-  spawn x_run(name, kind, durable, jr, ch, done)
-  if quiet || !durable then 0 else r_note_x(jr, name, kind)
+  spawn x_run(name, kind, durable, inner, jr, ch, done)
+  if quiet || !durable then 0 else r_note_x(jr, name, kind, inner)
   xs[name] = ch
   ch
 
@@ -347,8 +347,8 @@ fn r_size_of(fd) =
   file_close(fd)
   n
 
-fn r_note_x(jr: Jr, name, kind) =
-  send(jr.puts, JNote(rt_x_record(name, kind)))
+fn r_note_x(jr: Jr, name, kind, inner) =
+  send(jr.puts, JNote(rt_x_record(name, kind, inner)))
   0
 
 # The one journal the registry carries, in a list because a record cannot hold
@@ -746,7 +746,7 @@ fn b_always(cmd) = match cmd
   CQueues -> false
   CQStat(q) -> false
   CDrain(q) -> false
-  CXDecl(x, k) -> false
+  CXDecl(x, k, i) -> false
   CBind(x, q, k) -> false
   CXPub(x, k, b) -> false
   CRepl(q, t, n) -> false
@@ -793,8 +793,8 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     t = recv(back)
     send(c.out, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
     b_read(c, buf, next, subs, 0, who)
-  CXDecl(ex, kind) ->
-    b_exchange(c, ex, kind)
+  CXDecl(ex, kind, inner) ->
+    b_exchange_as(c, ex, kind, inner)
     send(c.out, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CBind(ex, qname, key) ->
@@ -946,9 +946,11 @@ fn q_count_of(ch) =
   send(ch, QStat(back))
   recv(back)
 
-fn b_exchange(c: Conn, name, kind) =
+fn b_exchange(c: Conn, name, kind) = b_exchange_as(c, name, kind, false)
+
+fn b_exchange_as(c: Conn, name, kind, inner) =
   back = channel(1)
-  send(c.reg, RExchange(name, kind, false, true, false, back))
+  send(c.reg, RExchange(name, kind, false, true, false, inner, back))
   recv(back)
 
 fn b_find(reg, name) =

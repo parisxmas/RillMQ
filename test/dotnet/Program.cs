@@ -237,6 +237,21 @@ class Program
             return 0;
         }
 
+        // `innerpub <exchange>` publishes to one exchange and says what came
+        // back, which is how the restart suite asks whether `internal`
+        // survived being written down and read again.
+        if (args.Length > 2 && args[1] == "innerpub")
+        {
+            var pf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var pc = pf.CreateConnection();
+            using var pm = pc.CreateModel();
+            var pstop = new BlockingCollection<string>();
+            pm.ModelShutdown += (_, e) => pstop.Add(e.ReplyCode.ToString());
+            try { pm.BasicPublish(args[2], "", null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(400); } catch (Exception) { }
+            Console.WriteLine(pstop.TryTake(out var pc2, 3000) ? pc2 : "took it");
+            return 0;
+        }
+
         // `vhost <open|split|name> [host]` is the virtual host, which is a
         // namespace and nothing else: the same queue name in two of them is
         // two queues, and a host this broker was not told about is refused
@@ -923,6 +938,35 @@ class Program
         xch2.QueueDelete(xq2);
         xch2.ExchangeDelete("down-x");
         xch2.ExchangeDelete("up-x");
+
+        // `internal`: only other exchanges may publish here. It means
+        // something now that an exchange can be bound to an exchange.
+        using var ich = conn.CreateModel();
+        ich.ExchangeDeclare("front-x", ExchangeType.Fanout, true);
+        // `shut-x` is declared over the broker's own protocol by the shell
+        // script that runs this, because RabbitMQ.Client 6 has no way to say
+        // `internal` — the flag is in the specification and in other client
+        // libraries, and not in this one.
+        ich.ExchangeBind("shut-x", "front-x", "");
+        var iq = "inner-" + Environment.TickCount;
+        ich.QueueDeclare(iq, true, false, false, null);
+        ich.QueueBind(iq, "shut-x", "");
+        ich.BasicPublish("front-x", "", null, Encoding.UTF8.GetBytes("allowed"));
+        Thread.Sleep(600);
+        var igot = ich.BasicGet(iq, true);
+        Check("an internal exchange takes what another exchange routes to it",
+            igot == null ? "(nothing)" : Encoding.UTF8.GetString(igot.Body.ToArray()), "allowed");
+        var istop = new BlockingCollection<string>();
+        using (var ich2 = conn.CreateModel())
+        {
+            ich2.ModelShutdown += (_, e) => istop.Add(e.ReplyCode.ToString());
+            try { ich2.BasicPublish("shut-x", "", null, Encoding.UTF8.GetBytes("refused")); Thread.Sleep(400); } catch (Exception) { }
+        }
+        Check("and refuses one a client sends it", istop.TryTake(out var ic, 3000) ? ic : "took it", "403");
+        using var ich3 = conn.CreateModel();
+        ich3.QueueDelete(iq);
+        ich3.ExchangeDelete("shut-x");
+        ich3.ExchangeDelete("front-x");
 
         // `multiple` on `Basic.Ack`: one frame settles everything this
         // channel is holding up to the tag it names. Ignoring the bit left

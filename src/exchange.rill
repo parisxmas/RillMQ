@@ -22,7 +22,7 @@ type Bind
   Bind(queue: Str, key: Str, to: Onward)
 
 type X
-  X(name: Str, kind: Str, binds: List(Bind), jr: Jr, lasting: Bool)
+  X(name: Str, kind: Str, binds: List(Bind), jr: Jr, lasting: Bool, inner: Bool)
 
 type XReq
   # `hops` is what keeps a ring of exchanges from being a message that never
@@ -36,6 +36,9 @@ type XReq
   # is told so that a restart does not bring back what somebody deleted.
   XStop(quiet: Bool, if_unused: Bool, reply: Chan(Int))
   XKind(reply: Chan(Str))
+  # Whether only other exchanges may publish here. A session asks once and
+  # remembers, the same way it remembers the kind.
+  XInner(reply: Chan(Int))
   # This exchange as records: what it is, and each of its bindings. It is what
   # a rewritten routing journal is made of, and only this strand knows it.
   XRecords(reply: Chan(List(Str)))
@@ -53,8 +56,8 @@ fn x_topic() = "topic"
 
 fn x_headers() = "headers"
 
-fn x_run(name, kind, lasting, jr: Jr, inbox, done) =
-  x_loop(X(name, kind, Nil, jr, lasting), inbox, done)
+fn x_run(name, kind, lasting, inner, jr: Jr, inbox, done) =
+  x_loop(X(name, kind, Nil, jr, lasting, inner), inbox, done)
 
 fn x_loop(x: X, inbox, done) =
   step = select
@@ -88,6 +91,7 @@ fn x_forget(x: X, quiet) =
 fn x_is_stop(r) = match r
   XStop(quiet, if_unused, reply) -> true
   XKind(reply) -> false
+  XInner(reply) -> false
   XRecords(reply) -> false
   XPub(key, body, props, out, back, hops) -> false
   XBind(queue, key, ch, quiet, reply) -> false
@@ -97,6 +101,7 @@ fn x_over(x: X, r) = match r
   XStop(quiet, if_unused, reply) -> x_asked_to_stop(x, quiet, if_unused, reply)
   XPub(key, body, props, out, back, hops) -> Some(x)
   XKind(reply) -> Some(x)
+  XInner(reply) -> Some(x)
   XRecords(reply) -> Some(x)
   XBind(queue, key, ch, quiet, reply) -> Some(x)
   XUnbind(queue, key, reply) -> Some(x)
@@ -112,17 +117,20 @@ fn x_handle(x: X, r) = match r
   XKind(reply) ->
     send(reply, x.kind)
     x
+  XInner(reply) ->
+    send(reply, if x.inner then 1 else 0)
+    x
   XRecords(reply) ->
-    send(reply, Cons(rt_x_record(x.name, x.kind), x_bind_records(x, x.binds)))
+    send(reply, Cons(rt_x_record(x.name, x.kind, x.inner), x_bind_records(x, x.binds)))
     x
   XUnbind(queue, key, reply) ->
     send(reply, 1)
     x_note(x, x_unrecord(x, x.binds, queue, key))
-    X(x.name, x.kind, x_without(x.binds, queue, key), x.jr, x.lasting)
+    X(x.name, x.kind, x_without(x.binds, queue, key), x.jr, x.lasting, x.inner)
 
 fn x_add(x: X, queue, key, to, quiet) =
   if quiet then 0 else x_note(x, x_record_of(x.name, queue, key, to))
-  X(x.name, x.kind, Cons(Bind(queue, key, to), x.binds), x.jr, x.lasting)
+  X(x.name, x.kind, Cons(Bind(queue, key, to), x.binds), x.jr, x.lasting, x.inner)
 
 fn x_record_of(ex, name, key, to) = match to
   ToQueue(ch) -> rt_bind_record(ex, name, key)

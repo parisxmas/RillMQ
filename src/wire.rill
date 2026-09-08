@@ -54,7 +54,7 @@ type Cmd
   # find out whether it is the one that is behind.
   CSize(queue: Str)
   CPromote(queue: Str)
-  CXDecl(exchange: Str, kind: Str)
+  CXDecl(exchange: Str, kind: Str, inner: Bool)
   CBind(exchange: Str, queue: Str, key: Str)
   CXPub(exchange: Str, key: Str, body: Str)
   CPing
@@ -194,10 +194,14 @@ fn w_stale() = "-STALE" + crlf()
 fn w_qstat_line(ready, inflight, subs, published, delivered, acked, oldest) =
   "+QSTAT " + int_to_str(ready) + " " + int_to_str(inflight) + " " + int_to_str(subs) + " " + int_to_str(published) + " " + int_to_str(delivered) + " " + int_to_str(acked) + " " + int_to_str(oldest) + crlf()
 
+# `XDECL <name> <kind> [internal]` — the third word is optional and the only
+# thing it may say is `internal`, which is the one exchange flag AMQP has that
+# this protocol had no word for. It is here because a client library that can
+# say it exists and the one this broker is tested against is not among them.
 fn w_xdecl(parts, rest) =
   ex = w_name(parts)
   kind = w_second(parts)
-  if str_len(ex) == 0 || str_len(kind) == 0 then Bad("an exchange and a kind are wanted", rest, false) else Got(CXDecl(ex, kind), rest)
+  if str_len(ex) == 0 || str_len(kind) == 0 then Bad("an exchange and a kind are wanted", rest, false) else Got(CXDecl(ex, kind, str_cmp(unwrap_or(nth(parts, 3), ""), "internal") == 0), rest)
 
 fn w_bind(parts, rest) =
   ex = w_name(parts)

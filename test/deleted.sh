@@ -26,6 +26,7 @@ start() {
 }
 
 client() { (cd test/dotnet && dotnet run --no-build -- "$AMQP" "$@" 2>&1 | tail -1); }
+ask() { printf "$1" | nc -w 2 127.0.0.1 "$A" >/dev/null 2>&1; }
 
 start
 say "an exchange is declared, bound and deleted" "$(client xdel make orders-x)" "deleted"
@@ -59,6 +60,17 @@ kill -TERM "$BROKER" 2>/dev/null
 wait "$BROKER" 2>/dev/null
 start
 say "and only it comes back" "$(client transient check)" "kept=1 passing=404"
+
+# An exchange only other exchanges may publish to. The flag is in the routing
+# journal's record for the exchange, in a third field older files do not have,
+# so this asks whether it is still there after the file has been read again.
+ask 'XDECL walled fanout internal\r\nQUIT\r\n' >/dev/null
+say "a client may not publish to an internal exchange" "$(client innerpub walled)" "403"
+
+kill -TERM "$BROKER" 2>/dev/null
+wait "$BROKER" 2>/dev/null
+start
+say "and still may not after a restart" "$(client innerpub walled)" "403"
 
 kill -TERM "$BROKER" 2>/dev/null
 sleep 0.3

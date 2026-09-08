@@ -134,17 +134,17 @@ fn apply_route(reg, r) = match r
   RGone(name) ->
     b_drop_exchange(reg, name)
     0
-  RX(name, kind) ->
-    b_exchange_of(reg, name, kind)
+  RX(name, kind, inner) ->
+    b_exchange_of(reg, name, kind, inner)
     0
   RB(ex, queue, key) ->
     back = channel(1)
-    send(b_exchange_of(reg, ex, x_direct()), XBind(queue, key, ToQueue(b_find(reg, queue)), true, back))
+    send(b_exchange_of(reg, ex, x_direct(), false), XBind(queue, key, ToQueue(b_find(reg, queue)), true, back))
     recv(back)
     1
   RU(ex, queue, key) ->
     back = channel(1)
-    send(b_exchange_of(reg, ex, x_direct()), XUnbind(queue, key, back))
+    send(b_exchange_of(reg, ex, x_direct(), false), XUnbind(queue, key, back))
     recv(back)
     0
   # The far end is another exchange, so it is looked up in the other table.
@@ -152,12 +152,12 @@ fn apply_route(reg, r) = match r
   # named here a fallback nobody reaches.
   RXB(source, dest, key) ->
     back = channel(1)
-    send(b_exchange_of(reg, source, x_direct()), XBind(dest, key, ToExchange(b_exchange_of(reg, dest, x_direct())), true, back))
+    send(b_exchange_of(reg, source, x_direct(), false), XBind(dest, key, ToExchange(b_exchange_of(reg, dest, x_direct(), false)), true, back))
     recv(back)
     1
   RXU(source, dest, key) ->
     back = channel(1)
-    send(b_exchange_of(reg, source, x_direct()), XUnbind(dest, key, back))
+    send(b_exchange_of(reg, source, x_direct(), false), XUnbind(dest, key, back))
     recv(back)
     0
 
@@ -166,9 +166,9 @@ fn b_drop_exchange(reg, name) =
   send(reg, RDropExchange(name, true, false, back))
   recv(back)
 
-fn b_exchange_of(reg, name, kind) =
+fn b_exchange_of(reg, name, kind, inner) =
   back = channel(1)
-  send(reg, RExchange(name, kind, true, true, false, back))
+  send(reg, RExchange(name, kind, true, true, false, inner, back))
   recv(back)
 
 fn ends_with_log(f) = str_len(f) > 4 && str_cmp(f[str_len(f) - 4:], ".log") == 0
