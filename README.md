@@ -1370,18 +1370,20 @@ All hundred and eighty-four of them pass, with or without a journal.
   that carries on is refused a message at a time as before. The difference
   matters for a client that does not listen; for one that does, it is the same
   thing.
-- **The server properties name the broker and nothing else.** `Connection.Start`
-  says `product` and `version` — `rillmq` and the version this is — and stops
-  there. RabbitMQ puts a `capabilities` table beside them, and a client that
-  reads it rather than trying is told whether publisher confirms, `basic.nack`,
-  consumer cancel notify and exchange-to-exchange bindings are there. All four
-  are, and none of them is advertised, so a client that asks by reading is told
-  wrong; the .NET client the acceptance test uses asks by doing, and all
-  seventy-two of those pass. The asymmetry is the awkward part: this broker
-  goes looking for `connection.blocked` in the client's table and offers
-  nothing back in its own. What stands in the way is small — the writer here
-  knows how to write a long string, and a capabilities table is a table inside
-  a table.
+- **The server properties say five capabilities and no more.**
+  `Connection.Start` carries `product`, `version`, and a `capabilities` table
+  naming the five things a client branches on that are actually here:
+  `publisher_confirms`, `exchange_exchange_bindings`, `basic.nack`,
+  `consumer_cancel_notify`, `connection.blocked`. An entry is a promise made
+  to a client that reads rather than tries, so the ones RabbitMQ also
+  advertises are left out for reasons rather than by oversight.
+  `authentication_failure_close` is the pointed one: a word that is wrong ends
+  the connection with no method and no reason, which is what the
+  authentication section ends on and the opposite of what that capability
+  promises. Direct reply-to and consumer priorities are not here at all.
+  `per_consumer_qos` would be true of the half of `Basic.Qos` that is not
+  shared and false of the half that is — see the `global` bullet above — and
+  the word admits no halves.
 - **How full is how big this process has got.** `rss_bytes()` counts
   everything — the journal's buffers, a connection's, the binary itself — not
   the messages. It is checked every two hundred and fifty-sixth publish on a

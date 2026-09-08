@@ -88,14 +88,43 @@ fn a_str_field(t: StrBuf, name, value) =
   a_u8(t, 83)
   a_longstr(t, value)
 
+# A boolean is a byte, and the byte is one or nothing.
+fn a_bool_field(t: StrBuf, name, yes) =
+  a_shortstr(t, name)
+  a_u8(t, 116)
+  a_u8(t, if yes then 1 else 0)
+
+# `F` is a table inside a table: the type byte, and then a whole table where a
+# value would be.
+fn a_table_field(t: StrBuf, name, entries) =
+  a_shortstr(t, name)
+  a_u8(t, 70)
+  a_table(t, entries)
+
+# What this server can do that the specification does not require, under the
+# names RabbitMQ gave them, because those are the names a client goes looking
+# for. Each one is here because the thing itself is: a client reads this table
+# instead of trying, so an entry is a promise, and one the broker cannot keep
+# is worse than one it never made. What is missing is missing on purpose — see
+# the README on what the table still does not say.
+fn a_capabilities(t: StrBuf) =
+  e = strbuf()
+  a_bool_field(e, "publisher_confirms", true)
+  a_bool_field(e, "exchange_exchange_bindings", true)
+  a_bool_field(e, "basic.nack", true)
+  a_bool_field(e, "consumer_cancel_notify", true)
+  a_bool_field(e, "connection.blocked", true)
+  a_table_field(t, "capabilities", strbuf_str(e))
+
 # What the server says it is. No client requires this table to hold anything,
 # and it was empty until there was a version to put in it — but a client that
-# logs what it connected to logs these two fields, and a line naming a broker
-# and a version is worth more than a blank one.
+# logs what it connected to logs the first two fields, and one that decides
+# what it may ask for reads the third.
 fn a_server_properties(b: StrBuf, product, version) =
   t = strbuf()
   a_str_field(t, "product", product)
   a_str_field(t, "version", version)
+  a_capabilities(t)
   a_table(b, strbuf_str(t))
 
 # A whole frame around a payload that is already built.
