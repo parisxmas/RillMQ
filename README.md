@@ -445,13 +445,14 @@ never coming back, in a cluster too small to elect anybody.
 ## Routing
 
 An exchange is a strand, like a queue, and for the same reason: its bindings
-are its own and nothing else touches them. Three kinds:
+are its own and nothing else touches them. Four kinds:
 
 | kind | takes a message when |
 |---|---|
 | `direct` | the binding key is the routing key |
 | `fanout` | always — every queue bound to it |
 | `topic` | the binding pattern matches the routing key |
+| `headers` | the message's own headers match what the binding asked for |
 
 A topic pattern is words separated by dots, where `*` stands for one word and
 `#` for any number of them, none included. `*.error` takes `app.error` and
@@ -469,6 +470,29 @@ not found
 
 and the same three things over AMQP are `Exchange.Declare`, `Queue.Bind` and a
 `Basic.Publish` that names an exchange.
+
+**`headers` is the one that reads inside a message.** It routes by what a
+message says about itself rather than by a word in a key, so somebody has to
+look at the properties this broker otherwise carries as bytes and hands back
+untouched — and that somebody is the session, not the exchange.
+
+A binding's arguments and a message's headers are both field tables, and both
+are turned into one canonical line: `key=value` joined by zero bytes, which no
+key or value of a real message holds. Then matching two tables is matching two
+strings, and a string is a thing the exchange, the routing journal and the
+cluster already know how to carry — none of them needed a line changed. The
+binding's line starts with `x-match`, `all` or `any`, which is the difference
+between every one of these and at least one of them.
+
+```
+ExchangeDeclare("audit", "headers")
+QueueBind("q", "audit", "", {x-match: all, shape: square, colour: red})
+```
+
+The cost is confined to where it is owed: a message on its way to any other
+kind of exchange is never read, because the session asks once what kind an
+exchange is — that cannot change, since whoever names it first settles it —
+and remembers.
 
 **The default exchange is not one of these.** Publishing to `""` means the
 routing key is a queue name, and a connection goes straight to that queue — no
@@ -1051,7 +1075,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 46 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 48 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 3 checks that a deleted exchange stays deleted
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 9 checks of passwords and TLS
@@ -1070,7 +1094,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and twenty-eight of them pass, with or without a journal.
+All hundred and thirty of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1120,7 +1144,11 @@ All hundred and twenty-eight of them pass, with or without a journal.
   does, so such a consumer is given whatever the connection will take as fast
   as it will take it. Nothing is between a fast queue and a slow reader but
   the socket, and that is what the flag asks for.
-- **No `headers` exchange.** Direct, fanout and topic, and no fourth kind.
+- **A `headers` binding compares values as text.** A header whose value is a
+  number matches a binding that asked for the digits of it, which is what a
+  client that wrote `{"count", 3}` on both sides gets and is right; a nested
+  table or an array in either is skipped rather than compared, so a binding
+  that mentions one matches nothing.
 - **`Queue.Delete` and `Exchange.Delete` read their conditions and do not
   honour them.** `if-unused`, `if-empty` and `if-unused` again are parsed off
   the wire and ignored, so a delete always deletes. A client that asked for a

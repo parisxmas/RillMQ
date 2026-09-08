@@ -458,6 +458,37 @@ class Program
             Check("and the channel is still up through all of it", rm.IsOpen, true);
         }
 
+        // A `headers` exchange routes by what a message says about itself
+        // rather than by a word in a key. It is the one place this broker
+        // reads inside a message; everywhere else the properties are bytes it
+        // hands back untouched.
+        string hx = q + "-headers";
+        ch.ExchangeDeclare(hx, "headers", true);
+        string hAll = q + "-h-all", hAny = q + "-h-any";
+        ch.QueueDeclare(hAll, true, false, false, null);
+        ch.QueueDeclare(hAny, true, false, false, null);
+        ch.QueueBind(hAll, hx, "", new Dictionary<string, object> {
+            { "x-match", "all" }, { "shape", "square" }, { "colour", "red" } });
+        ch.QueueBind(hAny, hx, "", new Dictionary<string, object> {
+            { "x-match", "any" }, { "shape", "square" }, { "colour", "blue" } });
+
+        void send(params (string, string)[] hs)
+        {
+            var hp = ch.CreateBasicProperties();
+            hp.Headers = new Dictionary<string, object>();
+            foreach (var (k, v) in hs) hp.Headers[k] = v;
+            ch.BasicPublish(hx, "ignored", hp, Encoding.UTF8.GetBytes("h"));
+        }
+        send(("shape", "square"), ("colour", "red"));   // all: yes   any: yes
+        send(("shape", "square"), ("colour", "green")); // all: no    any: yes
+        send(("shape", "round"), ("colour", "blue"));   // all: no    any: yes
+        send(("shape", "round"), ("colour", "green"));  // all: no    any: no
+        Thread.Sleep(700);
+        Check("x-match all wants every header to agree",
+            ch.QueueDeclare(hAll, true, false, false, null).MessageCount, 1u);
+        Check("and x-match any wants one of them to",
+            ch.QueueDeclare(hAny, true, false, false, null).MessageCount, 3u);
+
         // A channel is where a refusal lands. Each of these used to be
         // silence: the client waited for a reply that was never coming, or
         // went on believing something the broker had quietly not done.

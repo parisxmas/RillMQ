@@ -28,6 +28,9 @@ type RReq
   # in it and wrong for AMQP, where a client that mistypes an exchange's name
   # should be told so rather than handed a new one.
   RExchangeIf(name: Str, reply: Chan(Option(Chan(XReq))))
+  # What kind an exchange is, which only matters to a session deciding whether
+  # it has to read a message's headers before handing it over.
+  RKindOf(name: Str, reply: Chan(Str))
   # A queue if this node can say there is one, and nothing if it can say there
   # is not. On a broker by itself those are the only two answers. In a cluster
   # a queue somebody else holds is one this node has no way to ask about
@@ -152,6 +155,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RDropExchange(name, quiet, reply) ->
     send(reply, r_drop_exchange(xs, name, quiet))
     0
+  RKindOf(name, reply) ->
+    send(reply, r_kind_of(xs, name))
+    0
   RExchangeIf(name, reply) ->
     send(reply, xs[name])
     0
@@ -265,6 +271,15 @@ fn r_only(jr) = match jr
 # The queue is told to stop and answers with what it was holding; then it is
 # out of the table and its journal is off the disk. A name nobody has is -1,
 # which is not a count and cannot be mistaken for one.
+fn r_kind_of(xs: Map(Str, Chan(XReq)), name) = match xs[name]
+  None -> ""
+  Some(ch) -> r_ask_kind(ch)
+
+fn r_ask_kind(ch) =
+  back = channel(1)
+  send(ch, XKind(back))
+  recv(back)
+
 fn r_drop_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name) = match qs[name]
   None -> -1
   Some(ch) ->

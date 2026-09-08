@@ -22,12 +22,15 @@ type XReq
   # The end of this exchange. Its bindings go with it, and the routing journal
   # is told so that a restart does not bring back what somebody deleted.
   XStop(quiet: Bool, reply: Chan(Int))
+  XKind(reply: Chan(Str))
 
 fn x_direct() = "direct"
 
 fn x_fanout() = "fanout"
 
 fn x_topic() = "topic"
+
+fn x_headers() = "headers"
 
 fn x_run(name, kind, jr: Jr, inbox, done) = x_loop(X(name, kind, Nil, jr), inbox, done)
 
@@ -47,6 +50,7 @@ fn x_forget(x: X, quiet) =
 
 fn x_is_stop(r) = match r
   XStop(quiet, reply) -> true
+  XKind(reply) -> false
   XPub(key, body, props, out, back) -> false
   XBind(queue, key, ch, quiet, reply) -> false
   XUnbind(queue, key, reply) -> false
@@ -57,6 +61,7 @@ fn x_over(x: X, r) = match r
     x_forget(x, quiet)
     None
   XPub(key, body, props, out, back) -> Some(x)
+  XKind(reply) -> Some(x)
   XBind(queue, key, ch, quiet, reply) -> Some(x)
   XUnbind(queue, key, reply) -> Some(x)
 
@@ -68,6 +73,9 @@ fn x_handle(x: X, r) = match r
     send(reply, 1)
     if x_bound(x.binds, queue, key) then x else x_add(x, queue, key, ch, quiet)
   XStop(quiet, reply) -> x
+  XKind(reply) ->
+    send(reply, x.kind)
+    x
   XUnbind(queue, key, reply) ->
     send(reply, 1)
     x_note(x, rt_unbind_record(x.name, queue, key))
@@ -107,7 +115,43 @@ fn x_bind_key(b: Bind) = b.key
 fn x_bind_ch(b: Bind) = b.ch
 
 fn x_takes(kind, pattern, key) =
-  str_cmp(kind, x_fanout()) == 0 || (if str_cmp(kind, x_topic()) == 0 then x_topic_takes(pattern, key) else str_cmp(pattern, key) == 0)
+  str_cmp(kind, x_fanout()) == 0 || (if str_cmp(kind, x_topic()) == 0 then x_topic_takes(pattern, key) else if str_cmp(kind, x_headers()) == 0 then x_headers_takes(pattern, key) else str_cmp(pattern, key) == 0)
+
+# A `headers` exchange routes by what the message says about itself rather
+# than by a word in a key. Both sides arrive here as the same canonical line —
+# `key=value` joined by zero bytes — because the session reads the tables and
+# this does not: an exchange comparing two strings is an exchange the routing
+# journal and the cluster can carry unchanged.
+#
+# The binding's line begins with `x-match`, which is `all` or `any` and is the
+# difference between "every one of these" and "at least one".
+fn x_headers_takes(pattern, key) =
+  want = split(pattern, chr(0))
+  x_match_all(want) && x_all_of(x_rest(want), split(key, chr(0))) || !x_match_all(want) && x_any_of(x_rest(want), split(key, chr(0)))
+
+# `all` unless it says otherwise, which is what AMQP asks for and also what a
+# binding with no `x-match` at all most likely meant.
+fn x_match_all(want) = match want
+  Nil -> true
+  Cons(first, rest) -> str_cmp(first, "x-match=any") != 0
+
+fn x_rest(want) = match want
+  Nil -> Nil
+  Cons(first, rest) -> if starts_with(first, "x-match=") then rest else want
+
+# A binding that asks for nothing matches nothing, which is the one case where
+# `all` and `any` disagree about the empty set and AMQP sides with `any`.
+fn x_all_of(want, has) = match want
+  Nil -> true
+  Cons(w, rest) -> x_one_of(w, has) && x_all_of(rest, has)
+
+fn x_any_of(want, has) = match want
+  Nil -> false
+  Cons(w, rest) -> x_one_of(w, has) || x_any_of(rest, has)
+
+fn x_one_of(w, has) = match has
+  Nil -> false
+  Cons(h, rest) -> str_cmp(w, h) == 0 || x_one_of(w, rest)
 
 # A topic pattern is words separated by dots, where `*` stands for one word and
 # `#` for any number of them, none included. Matching it is the one piece of

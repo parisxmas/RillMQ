@@ -138,3 +138,79 @@ fn a_take_sized(buf, from, size) =
 fn a_header() = "AMQP" + chr(0) + chr(0) + chr(9) + chr(1)
 
 fn a_is_header(buf) = str_len(buf) >= 8 && str_cmp(buf[:8], a_header()) == 0
+
+# -- field tables ----------------------------------------------------------------
+#
+# The one place this broker reads inside a message rather than carrying it. A
+# `headers` exchange routes by what a message says about itself, so somebody
+# has to look, and this is where. Everything else still treats a message's
+# properties as bytes to hand back untouched.
+#
+# What comes out is one canonical line — `key=value` joined by zero bytes,
+# which no key or value of a real message contains — because that turns
+# matching two tables into matching two strings, and a string is a thing the
+# exchange, the routing journal and the cluster already know how to carry.
+
+fn a_nul() = chr(0)
+
+# A table is a length in bytes and then that many bytes of key and value.
+fn a_table_text(s, at) = a_pairs(s, at + 4, at + 4 + a_get_u32(s, at), strbuf())
+
+fn a_pairs(s, at, end, b: StrBuf) =
+  if at >= end || at >= str_len(s) then strbuf_str(b)
+  else
+    key = a_get_shortstr(s, at)
+    v = a_value(s, a_after_shortstr(s, at))
+    a_wrote(b, key, v)
+    a_pairs(s, a_val_end(v), end, b)
+
+fn a_wrote(b: StrBuf, key, v: AVal) =
+  if !v.usable then 0
+  else
+    a_gap(b)
+    b += key + "=" + v.text
+    0
+
+fn a_gap(b: StrBuf) =
+  if #b == 0 then 0
+  else
+    b += a_nul()
+    0
+
+# A value, what it reads as, and where the next one starts. `usable` is false
+# for the shapes a header match has no business comparing — a nested table, an
+# array — which are skipped over rather than refused: a binding that does not
+# mention them still has to work.
+type AVal
+  AVal(text: Str, at: Int, usable: Bool)
+
+fn a_val_end(v: AVal) = v.at
+
+fn a_value(s, at) =
+  k = str_get(s, at)
+  if k == 83 then a_str_val(a_get_longstr(s, at + 1), a_after_longstr(s, at + 1)) else if k == 115 then a_str_val(a_get_shortstr(s, at + 1), a_after_shortstr(s, at + 1)) else if k == 116 then a_str_val(if str_get(s, at + 1) == 0 then "0" else "1", at + 2) else if k == 98 || k == 66 then a_str_val(int_to_str(str_get(s, at + 1)), at + 2) else if k == 85 || k == 117 then a_str_val(int_to_str(a_get_u16(s, at + 1)), at + 3) else if k == 73 || k == 105 then a_str_val(int_to_str(a_get_u32(s, at + 1)), at + 5) else if k == 76 || k == 108 || k == 84 then a_str_val(int_to_str(a_get_u64(s, at + 1)), at + 9) else if k == 86 then AVal("", at + 1, false) else if k == 70 then AVal("", at + 1 + 4 + a_get_u32(s, at + 1), false) else if k == 65 then AVal("", at + 1 + 4 + a_get_u32(s, at + 1), false) else if k == 102 then AVal("", at + 5, false) else if k == 100 then AVal("", at + 9, false) else if k == 68 then AVal("", at + 6, false) else AVal("", str_len(s), false)
+
+fn a_str_val(text, at) = AVal(text, at, true)
+
+# -- what a message says about itself ---------------------------------------------
+#
+# The property block is a word of flags and then the properties whose bits are
+# set, in order. `headers` is the third, so the two in front of it have to be
+# stepped over — and both are short strings, which is the whole of the work.
+fn a_has_content_type() = 32768
+
+fn a_has_encoding() = 16384
+
+fn a_has_headers() = 8192
+
+fn a_headers_text(props) =
+  if str_len(props) < 2 then "" else a_headers_at(props, a_get_u16(props, 0))
+
+fn a_headers_at(props, flags) =
+  if bit_and(flags, a_has_headers()) == 0 then "" else a_table_text(props, a_past_strings(props, flags))
+
+fn a_past_strings(props, flags) =
+  a_past_encoding(props, flags, if bit_and(flags, a_has_content_type()) == 0 then 2 else a_after_shortstr(props, 2))
+
+fn a_past_encoding(props, flags, at) =
+  if bit_and(flags, a_has_encoding()) == 0 then at else a_after_shortstr(props, at)
