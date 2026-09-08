@@ -520,6 +520,7 @@ answering those would be answering questions asked of a channel that is gone.
 | acknowledging a tag it was never given | 406 | `unknown delivery tag` |
 | a consumer tag already in use | 406 | `consumer tag ... is already in use` |
 | publishing to or binding an exchange nobody declared | 404 | `no exchange ... in vhost /` |
+| consuming, getting from or binding a queue nobody declared | 404 | `no queue ... in vhost /` |
 
 Each of those used to be silence, and silence is the worst of the three
 answers a broker can give. A client calling `Queue.Purge` waited for a reply
@@ -529,14 +530,23 @@ double-delivery bug — was told nothing by the one party that knew. A second
 consumer registered under a name already in use quietly replaced the first,
 which stayed subscribed in the queue with nothing left pointing at it.
 
+Publishing to a queue that is not there is not on that list and is not an
+error: the default exchange routes by name, a name matching nothing routes
+nowhere, and AMQP drops the message — which is what RabbitMQ does. What it
+must not do is make the queue, and it no longer does. A publisher that wants
+to hear about it asks with `mandatory`, which RillMQ does not answer yet.
+
 The 404 is the one a client earns most often, by typing a name wrong, and
 making the exchange instead was the expensive kind of silence: the messages
 went somewhere real, with nothing bound to it, and were dropped one at a time
 by something that looked like it was working. The registry gained a look that
 does not make — `RExchangeIf`, answering with the exchange or with nothing —
-so this costs no round trip that a publish was not already paying. The default
-exchange is not in that table and does not need to be: a queue is reachable by
-its own name through it, and always was.
+so this costs no round trip that a publish was not already paying. `RFindIf`
+is the same for queues, and is the one place where a cluster changes the
+answer: see the last section.
+
+The default exchange is not in that table and does not need to be: a queue is
+reachable by its own name through it, and always was.
 
 Channel zero is the connection's own and cannot be closed this way, so what is
 not written there is passed over instead.
@@ -853,7 +863,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 30 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 35 checks through RabbitMQ's own .NET client
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -869,7 +879,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and two of them pass, with or without a journal.
+All hundred and seven of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -904,12 +914,11 @@ All hundred and two of them pass, with or without a journal.
   made and per binding taken away, and nothing ever shortens it. A queue's
   journal is compacted; this one is not, on the grounds that a table which
   changes as often as messages arrive is not a routing table.
-- **A queue is still made the first time it is named, over AMQP too.**
-  Exchanges are not any more, but `Basic.Consume` on a queue nobody declared
-  makes it and then hands over nothing, where RabbitMQ answers 404. It is the
-  same silence the exchange had, and the same fix; it is not done because a
-  queue is made on demand by the cluster and by replay as well as by a client,
-  and telling those apart is the work.
+- **In a cluster, only the node that owns a queue can say it is not there.**
+  A queue somebody else holds is one this node has no way to ask about without
+  a round trip it does not owe, so it answers with a stand-in and lets the
+  owner be the one who knows. On a broker by itself, and for the queues a
+  clustered node holds itself, the answer is the real one.
 - **`Basic.Qos` counts per consumer, not per channel.** Two consumers made on
   one channel each get the window the channel asked for, rather than sharing
   it, and `global=true` is read and treated as `false`. For the usual shape —

@@ -577,8 +577,15 @@ fn am_bind_to(am: Am, chan, queue, key, found, ex) = match found
   Some(x) -> am_bound(am, chan, queue, key, x)
 
 fn am_bound(am: Am, chan, queue, key, x) =
+  am_bind_from(am, chan, queue, key, x, am_queue_if(am, queue))
+
+fn am_bind_from(am: Am, chan, queue, key, x, found) = match found
+  None -> am_no_queue(am, chan, queue, 20)
+  Some(qh) -> am_binding(am, chan, queue, key, x, qh)
+
+fn am_binding(am: Am, chan, queue, key, x, qh) =
   back = channel(1)
-  sent = am_hand(am, x, XBind(queue, key, am_queue(am, queue), false, back))
+  sent = am_hand(am, x, XBind(queue, key, qh, false, back))
   am_answer(am_wait(sent, back).am, am_queue_bind_ok(chan))
 
 # 404, and the one refusal a client most often earns: a name it typed wrong.
@@ -589,6 +596,14 @@ fn am_not_found() = 404
 
 fn am_no_exchange(am: Am, chan, name, method) =
   am_refuse(am, chan, am_not_found(), "no exchange `" + name + "` in vhost `/`", a_class_exchange(), method)
+
+fn am_no_queue(am: Am, chan, name, method) =
+  am_refuse(am, chan, am_not_found(), "no queue `" + name + "` in vhost `/`", a_class_queue(), method)
+
+fn am_queue_if(am: Am, name) =
+  back = channel(1)
+  send(am.reg, RFindIf(name, back))
+  recv(back)
 
 fn am_exchange_if(am: Am, name) =
   back = channel(1)
@@ -647,7 +662,16 @@ fn am_body(am: Am, chan, payload) =
 # is what it means and is the path most messages take. A named exchange is a
 # strand that decides, so the message goes there instead.
 fn am_deposit(am: Am, body) =
-  if str_len(am.pub_x) == 0 then am_deposited(am_hand(am, am_queue(am, am.pub_to), QPub(body, am.pub_props, am.out))) else am_deposit_at(am, body, am_exchange_if(am, am.pub_x))
+  if str_len(am.pub_x) == 0 then am_deposit_direct(am, body, am_queue_if(am, am.pub_to)) else am_deposit_at(am, body, am_exchange_if(am, am.pub_x))
+
+# The default exchange routes to the queue its key names, and a key naming no
+# queue routes nowhere. That is not an error and AMQP does not make it one:
+# the message is dropped, exactly as RabbitMQ drops it, and a publisher that
+# wants to hear about it asks with `mandatory` — which this does not answer
+# yet. Making the queue instead was the third place a typo went quiet.
+fn am_deposit_direct(am: Am, body, found) = match found
+  None -> am_deposited(am_confirm(am))
+  Some(qh) -> am_deposited(am_hand(am, qh, QPub(body, am.pub_props, am.out)))
 
 fn am_deposit_at(am: Am, body, found) = match found
   # Nothing is counted for a publish that did not happen: the confirm numbers
@@ -692,13 +716,17 @@ fn am_consume(am: Am, chan, payload) =
   tag = if str_len(given) > 0 then given else "ctag-" + int_to_str(am.cid) + "-" + int_to_str(am.tag)
   back = channel(1)
   quick = bit_and(bits, am_no_ack()) != 0
-  if map_has(am.consumers, tag) then am_taken_tag(am, chan, tag) else am_consume_as(am, chan, queue, tag, quick, back)
+  if map_has(am.consumers, tag) then am_taken_tag(am, chan, tag) else am_consume_from(am, chan, queue, tag, quick, back, am_queue_if(am, queue))
+
+fn am_consume_from(am: Am, chan, queue, tag, quick, back, found) = match found
+  None -> am_no_queue(am, chan, queue, 20)
+  Some(qh) -> am_consume_as(am, chan, queue, tag, quick, back, qh)
 
 fn am_taken_tag(am: Am, chan, tag) =
   am_refuse(am, chan, am_precondition(), "consumer tag `" + tag + "` is already in use", a_class_basic(), 20)
 
-fn am_consume_as(am: Am, chan, queue, tag, quick, back) =
-  sent = am_hand(am, am_queue(am, queue), QSub(Sub(am_sub_id(am.cid, chan), am.out, quick, am_window(am, chan)), back))
+fn am_consume_as(am: Am, chan, queue, tag, quick, back, qh) =
+  sent = am_hand(am, qh, QSub(Sub(am_sub_id(am.cid, chan), am.out, quick, am_window(am, chan)), back))
   am_consuming(am_wait(sent, back).am, chan, queue, tag, quick)
 
 fn am_consuming(am: Am, chan, queue, tag, quick) =
@@ -750,10 +778,16 @@ fn am_deliver_on(am: Am, queue, body, props, tag) =
 # `Basic.Get` takes one without subscribing. It is a poll, so it subscribes,
 # waits a moment for something to arrive, and unsubscribes again.
 fn am_get(am: Am, chan, payload) =
-  queue = a_get_shortstr(payload, am_after_reserved())
+  am_get_from(am, chan, a_get_shortstr(payload, am_after_reserved()))
+
+fn am_get_from(am: Am, chan, queue) = match am_queue_if(am, queue)
+  None -> am_no_queue(am, chan, queue, 70)
+  Some(qh) -> am_getting_from(am, chan, queue, qh)
+
+fn am_getting_from(am: Am, chan, queue, qh) =
   one = channel(1)
   back = channel(1)
-  sent = am_hand(am, am_queue(am, queue), QSub(Sub(am_get_id(am.cid), one, false, 1), back))
+  sent = am_hand(am, qh, QSub(Sub(am_get_id(am.cid), one, false, 1), back))
   am_getting(am_wait(sent, back).am, chan, queue, one)
 
 fn am_getting(am: Am, chan, queue, one) =

@@ -28,6 +28,12 @@ type RReq
   # in it and wrong for AMQP, where a client that mistypes an exchange's name
   # should be told so rather than handed a new one.
   RExchangeIf(name: Str, reply: Chan(Option(Chan(XReq))))
+  # A queue if this node can say there is one, and nothing if it can say there
+  # is not. On a broker by itself those are the only two answers. In a cluster
+  # a queue somebody else holds is one this node has no way to ask about
+  # without a round trip it does not owe, so it answers with the stand-in and
+  # lets the owner be the one who knows.
+  RFindIf(name: Str, reply: Chan(Option(Chan(QReq))))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
   # The same numbers as `RRows`, as numbers rather than as the lines this
@@ -122,6 +128,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RExchange(name, kind, quiet, reply) ->
     send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, done))
+    0
+  RFindIf(name, reply) ->
+    send(reply, r_known(qs, mine, g.dir, g.self, name, done))
     0
   RExchangeIf(name, reply) ->
     send(reply, xs[name])
@@ -230,6 +239,18 @@ fn r_only(jr) = match jr
 # A queue is made here, or stood in for. Which of the two is the name's hash
 # over the list of nodes, so this node does not have to ask anybody and cannot
 # disagree with anybody: every node runs the same arithmetic on the same list.
+# What this node can honestly say about a queue it has not got. It is not the
+# same question as `r_queue`, which makes one: a name nobody has ever used is
+# a mistake worth telling a client about, and telling it costs nothing here
+# where the table already knows.
+fn r_known(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, reg, name, done) = match qs[name]
+  Some(ch) -> Some(ch)
+  None -> if r_somebody_elses(name) then Some(r_queue(qs, mine, dir, reg, name, done)) else None
+
+fn r_somebody_elses(name) =
+  peers = cl_peers()
+  len(peers) > 1 && cl_owner(name, len(peers)) != cl_me()
+
 fn r_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, reg, name, done) = match qs[name]
   Some(ch) -> ch
   None ->

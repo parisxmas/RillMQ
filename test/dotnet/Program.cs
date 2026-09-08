@@ -388,6 +388,27 @@ class Program
             refused(m => { m.BasicPublish("", q, null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(600); }),
             "(nothing was said)");
 
+        // The same for a queue. Consuming from one nobody declared used to make
+        // it and then hand over nothing, which looks exactly like a queue with
+        // no messages in it — the failure a mistyped queue name deserves to be
+        // told about rather than left to look like an empty Tuesday.
+        Check("consuming from a queue nobody declared closes the channel",
+            refused(m => m.BasicConsume("no-such-queue", true, new EventingBasicConsumer(m))),
+            "404 no queue `no-such-queue` in vhost `/`");
+        Check("and so does getting from one",
+            refused(m => m.BasicGet("nor-this-one", true)).Split(' ')[0], "404");
+        Check("and binding one that is not there",
+            refused(m => { m.ExchangeDeclare(q + "-x404", "direct", true); m.QueueBind("missing-queue", q + "-x404", "k"); }).Split(' ')[0], "404");
+
+        // But publishing to a queue that is not there is not an error: the
+        // default exchange routes by name, a name matching nothing routes
+        // nowhere, and AMQP drops it. What it must not do is make the queue.
+        Check("publishing to a queue that is not there is not an error",
+            refused(m => { m.BasicPublish("", "vanishes-quietly", null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(600); }),
+            "(nothing was said)");
+        Check("and it did not make the queue either",
+            refused(m => m.BasicGet("vanishes-quietly", true)).Split(' ')[0], "404");
+
         // And the connection is not what closes: everything above happened on
         // a channel of its own, and this one is still up.
         Check("the connection survives all of that", conn.IsOpen, true);
