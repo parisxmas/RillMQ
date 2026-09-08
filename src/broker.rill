@@ -23,6 +23,11 @@ type RReq
   # answered with the one it already is rather than refused, which is friendlier
   # than the specification and no less safe.
   RExchange(name: Str, kind: Str, quiet: Bool, reply: Chan(Chan(XReq)))
+  # An exchange if there is one and nothing if there is not. `RExchange` makes
+  # what it cannot find, which is right for a protocol with no declaration step
+  # in it and wrong for AMQP, where a client that mistypes an exchange's name
+  # should be told so rather than handed a new one.
+  RExchangeIf(name: Str, reply: Chan(Option(Chan(XReq))))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
   # The same numbers as `RRows`, as numbers rather than as the lines this
@@ -117,6 +122,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RExchange(name, kind, quiet, reply) ->
     send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, done))
+    0
+  RExchangeIf(name, reply) ->
+    send(reply, xs[name])
     0
   RTotals(reply) ->
     send(reply, r_totals(qs, map_keys(qs), 0, 0))

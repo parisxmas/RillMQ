@@ -374,6 +374,20 @@ class Program
                 Thread.Sleep(800);
             }).Split(' ')[0], "406");
 
+        // A name nobody declared. This is the refusal a mistyped exchange
+        // earns, and making the exchange instead was the expensive kind of
+        // silence: the messages went somewhere real, with nothing bound to it,
+        // and were dropped one at a time by a thing that looked like it worked.
+        Check("publishing to an exchange nobody declared closes the channel",
+            refused(m => { m.BasicPublish("no-such-exchange", "k", null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(800); }),
+            "404 no exchange `no-such-exchange` in vhost `/`");
+        Check("and so does binding to one",
+            refused(m => { m.QueueDeclare(q + "-b404", true, false, false, null); m.QueueBind(q + "-b404", "also-not-there", "k"); }).Split(' ')[0],
+            "404");
+        Check("but the default exchange is always there",
+            refused(m => { m.BasicPublish("", q, null, Encoding.UTF8.GetBytes("x")); Thread.Sleep(600); }),
+            "(nothing was said)");
+
         // And the connection is not what closes: everything above happened on
         // a channel of its own, and this one is still up.
         Check("the connection survives all of that", conn.IsOpen, true);
