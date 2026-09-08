@@ -73,10 +73,30 @@ fn a_longstr(b: StrBuf, s) =
   b += s
   0
 
-# A field table with nothing in it. The server's properties could say its name
-# and version and no client requires them, so the empty table is the honest
-# minimum and four bytes long.
-fn a_empty_table(b: StrBuf) = a_u32(b, 0)
+# A field table is its length in bytes and then that many bytes of entries,
+# which is why the entries are built before the table they go in: the length
+# is not known until they are.
+fn a_table(b: StrBuf, entries) =
+  a_u32(b, str_len(entries))
+  b += entries
+  0
+
+# One entry: a short string naming the field, a byte naming its type, and the
+# value. `S` is a long string, and is the only type anything here writes.
+fn a_str_field(t: StrBuf, name, value) =
+  a_shortstr(t, name)
+  a_u8(t, 83)
+  a_longstr(t, value)
+
+# What the server says it is. No client requires this table to hold anything,
+# and it was empty until there was a version to put in it — but a client that
+# logs what it connected to logs these two fields, and a line naming a broker
+# and a version is worth more than a blank one.
+fn a_server_properties(b: StrBuf, product, version) =
+  t = strbuf()
+  a_str_field(t, "product", product)
+  a_str_field(t, "version", version)
+  a_table(b, strbuf_str(t))
 
 # A whole frame around a payload that is already built.
 fn a_frame(kind, chan, payload) =
