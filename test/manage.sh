@@ -36,7 +36,7 @@ say "the overview says nothing is there yet" "$(get /api/queues)" "[]"
 
 printf 'AUTH alice hunter2\r\nPUB orders 5\r\nhelloPUB orders 5\r\nworld' | nc -w 2 127.0.0.1 "$A" >/dev/null
 sleep 0.5
-say "and then says what is" "$(get /api/queues | sed 's/,"oldest_ms":[0-9]*//')" '[{"name":"orders","ready":2,"inflight":0,"consumers":0,"published":2,"delivered":0,"acked":0,"in_per_sec":0,"out_per_sec":0}]'
+say "and then says what is" "$(get /api/queues | sed -e 's/,"oldest_ms":[0-9]*//' -e 's/"bytes":[0-9]*/"bytes":n/')" '[{"name":"orders","ready":2,"inflight":0,"consumers":0,"published":2,"delivered":0,"acked":0,"bytes":n,"in_per_sec":0,"out_per_sec":0}]'
 say "the page names the queue" "$(get / | grep -c '<code>orders</code>')" "1"
 
 say "publishing from a form works" "$(post /publish 'queue=orders&body=from+the+page')" "303"
@@ -51,6 +51,13 @@ say "adding somebody works" "$(post /remember 'name=carol&word=w0rd&tag=monitori
 say "and they can get in at once" "$(code -u carol:w0rd "$U/")" "200"
 say "removing them works" "$(post /forget 'name=carol')" "303"
 say "and they cannot get in after" "$(code -u carol:w0rd "$U/")" "401"
+
+# A durable queue costs something on the disk and the pages now say how much.
+# The number is a real size and not a guess, so this asks that it is at least
+# as big as the message that is in there.
+BYTES=$(get /api/queues | tr ',' '\n' | grep '"bytes"' | tr -d '"bytes:' )
+say "a queue's journal size is reported" "$([ "${BYTES:-0}" -gt 0 ] && echo some || echo "${BYTES:-none}")" "some"
+say "and the page has a column for it" "$(get / | grep -c 'On disk')" "1"
 
 say "a page nobody wrote is a 404" "$(code -u alice:hunter2 "$U/nowhere")" "404"
 

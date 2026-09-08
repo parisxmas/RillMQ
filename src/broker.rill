@@ -79,7 +79,7 @@ type Totals
   Totals(queues: Int, ready: Int, inflight: Int)
 
 type QRow
-  QRow(name: Str, ready: Int, inflight: Int, subs: Int, published: Int, delivered: Int, acked: Int, oldest: Int)
+  QRow(name: Str, ready: Int, inflight: Int, subs: Int, published: Int, delivered: Int, acked: Int, oldest: Int, bytes: Int)
 
 fn qr_name(r: QRow) = r.name
 
@@ -96,6 +96,10 @@ fn qr_delivered(r: QRow) = r.delivered
 fn qr_acked(r: QRow) = r.acked
 
 fn qr_oldest(r: QRow) = r.oldest
+
+# What this queue is costing on the disk. A queue held in memory only has no
+# file and so no size, which is a true zero rather than a missing one.
+fn qr_bytes(r: QRow) = r.bytes
 
 fn tot_queues(t: Totals) = t.queues
 
@@ -199,7 +203,7 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     send(reply, r_rows(qs, map_keys(qs), Nil))
     0
   RTable(reply) ->
-    send(reply, r_table(qs, map_keys(qs), Nil))
+    send(reply, r_table(qs, map_keys(qs), Nil, g.dir))
     0
   RCopies(reply) ->
     send(reply, map_keys(cs))
@@ -451,15 +455,15 @@ fn r_rows(qs: Map(Str, Chan(QReq)), ks, acc) = match ks
     None -> r_rows(qs, rest, acc)
     Some(ch) -> r_rows(qs, rest, Cons(r_row(k, r_ask(ch)), acc))
 
-fn r_table(qs: Map(Str, Chan(QReq)), ks, acc) = match ks
+fn r_table(qs: Map(Str, Chan(QReq)), ks, acc, dir) = match ks
   Nil -> acc
   Cons(k, rest) -> match qs[k]
-    None -> r_table(qs, rest, acc)
-    Some(ch) -> r_table(qs, rest, Cons(r_one(k, r_ask(ch)), acc))
+    None -> r_table(qs, rest, acc, dir)
+    Some(ch) -> r_table(qs, rest, Cons(r_one(k, r_ask(ch), r_journal_size(dir, k)), acc), dir)
 
-fn r_one(name, answer) = match answer
-  None -> QRow(name, 0, 0, 0, 0, 0, 0, 0)
-  Some(c) -> QRow(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c), q_count_delivered(c), q_count_acked(c), q_count_oldest(c))
+fn r_one(name, answer, bytes) = match answer
+  None -> QRow(name, 0, 0, 0, 0, 0, 0, 0, bytes)
+  Some(c) -> QRow(name, q_count_ready(c), q_count_inflight(c), q_count_subs(c), q_count_published(c), q_count_delivered(c), q_count_acked(c), q_count_oldest(c), bytes)
 
 fn r_row(name, answer) = match answer
   None -> w_queue_busy(name)
@@ -729,7 +733,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     # message overtake the `+OK` that promised it.
     send(c.out, OFrame(w_ok()))
     back = channel()
-    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false, q_prefetch()), back))
+    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false, q_prefetch(), c.cid), back))
     recv(back)
     b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0, who)
   CUnsub(qname) ->

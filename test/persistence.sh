@@ -79,8 +79,18 @@ stop
 
 start 60000
 ./rillmq-compact "$PORT" bulk 6000 5000 >/dev/null
-sleep 2
+# Waited for rather than slept through. A rewrite happens off the strand that
+# answered, so how long it takes is how busy the machine is, and a fixed sleep
+# was making this check fail when the rest of the suite was running beside it.
+# What is asserted is unchanged: if it never shrinks, the wait runs out and the
+# size that comes back is the size that fails.
 BULK=$(wc -c < "$DIR/bulk.log" | tr -d ' ')
+WAITED=0
+while [ "$BULK" -ge 40000 ] && [ "$WAITED" -lt 60 ]; do
+  sleep 0.5
+  WAITED=$((WAITED + 1))
+  BULK=$(wc -c < "$DIR/bulk.log" | tr -d ' ')
+done
 # Ready and in flight together: a hard kill gives the in-flight ones back as
 # ready, so counting only what is ready would be counting a different thing on
 # either side of the crash.

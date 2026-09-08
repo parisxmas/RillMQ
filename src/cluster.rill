@@ -246,6 +246,9 @@ fn cl_say_no(r) = match r
   QSub(s, reply) ->
     send(reply, 0)
     0
+  QTune(sub_id, window, group, reply) ->
+    send(reply, 0)
+    0
   QUnsub(sub_id, reply) ->
     send(reply, 0)
     0
@@ -522,6 +525,12 @@ fn cl_ask(p: P, r) = match r
     cl_send(p, "SUB " + p.name + crlf2())
     send(reply, 1)
     P(p.name, p.fd, append(p.subs, Cons(s, Nil)), p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg)
+  # A window is the owner's business, and the owner is the far end. There is
+  # nothing on this side to retune and no word for it in the link's language,
+  # so the consumer keeps the window it subscribed with.
+  QTune(sub_id, window, group, reply) ->
+    send(reply, 1)
+    p
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     cl_unsub(p, sub_id)

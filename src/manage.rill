@@ -293,8 +293,14 @@ fn mg_rows_json(b: StrBuf, rows, past, n) = match rows
 
 fn mg_row_json(b: StrBuf, r: QRow, past, n) =
   mg_comma(b, n)
-  b += "{\"name\":\"" + mg_quoted(qr_name(r)) + "\",\"ready\":" + int_to_str(qr_ready(r)) + ",\"inflight\":" + int_to_str(qr_inflight(r)) + ",\"consumers\":" + int_to_str(qr_subs(r)) + ",\"published\":" + int_to_str(qr_published(r)) + ",\"delivered\":" + int_to_str(qr_delivered(r)) + ",\"acked\":" + int_to_str(qr_acked(r)) + ",\"oldest_ms\":" + int_to_str(mg_age(qr_oldest(r))) + ",\"in_per_sec\":" + int_to_str(mg_rate_in(past, qr_name(r))) + ",\"out_per_sec\":" + int_to_str(mg_rate_out(past, qr_name(r))) + "}"
+  b += "{\"name\":\"" + mg_quoted(qr_name(r)) + "\",\"ready\":" + int_to_str(qr_ready(r)) + ",\"inflight\":" + int_to_str(qr_inflight(r)) + ",\"consumers\":" + int_to_str(qr_subs(r)) + ",\"published\":" + int_to_str(qr_published(r)) + ",\"delivered\":" + int_to_str(qr_delivered(r)) + ",\"acked\":" + int_to_str(qr_acked(r)) + ",\"bytes\":" + int_to_str(qr_bytes(r)) + ",\"oldest_ms\":" + int_to_str(mg_age(qr_oldest(r))) + ",\"in_per_sec\":" + int_to_str(mg_rate_in(past, qr_name(r))) + ",\"out_per_sec\":" + int_to_str(mg_rate_out(past, qr_name(r))) + "}"
   0
+
+# A size in bytes, as somebody worried about a disk would say it. A queue with
+# no file gets a dash rather than "0 B", because none and empty are different
+# answers and the difference is whether the queue is durable at all.
+fn mg_bytes(n) =
+  if n <= 0 then "—" else if n < 1024 then int_to_str(n) + " B" else if n < 1048576 then int_to_str(n / 1024) + " KB" else if n < 1073741824 then int_to_str(n / 1048576) + " MB" else int_to_str(n / 1073741824) + "." + int_to_str(n / 107374182 - n / 1073741824 * 10) + " GB"
 
 # The queue keeps the moment a message arrived; a page wants how long ago that
 # was. An empty queue has no oldest message rather than one from 1970.

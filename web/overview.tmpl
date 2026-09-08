@@ -14,7 +14,7 @@
 <p class="empty">Nothing yet. A queue appears the first time somebody publishes to it or subscribes to it.</p>
 <% else %>
 <table>
-<tr><th>Name</th><th>Last minute</th><th class="n">In /s</th><th class="n">Out /s</th><th class="n">Ready</th><th class="n">In flight</th><th class="n">Consumers</th><th class="n">Oldest</th><th></th></tr>
+<tr><th>Name</th><th>Last minute</th><th class="n">In /s</th><th class="n">Out /s</th><th class="n">Ready</th><th class="n">In flight</th><th class="n">Consumers</th><th class="n">Oldest</th><th class="n">On disk</th><th></th></tr>
 <% each r in rows %>
 <tr>
 <td><code><%= qr_name(r) %></code></td>
@@ -25,6 +25,7 @@
 <td class="n"><%= qr_inflight(r) %></td>
 <td class="n"><%= qr_subs(r) %></td>
 <td class="n age"><%= mg_ago(qr_oldest(r)) %></td>
+<td class="n"><%= mg_bytes(qr_bytes(r)) %></td>
 <td class="n"><form method="post" action="/drain" style="border:none;padding:0;background:none">
 <input type="hidden" name="queue" value="<%= qr_name(r) %>">
 <button class="plain" type="submit">Empty it</button></form></td>

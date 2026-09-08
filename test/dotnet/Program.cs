@@ -31,6 +31,25 @@ class Program
         }
     }
 
+    // Two consumers on one channel with a prefetch of two, given ten and
+    // acknowledging none. What they end up holding is the whole answer.
+    static int Outstanding(IConnection conn, bool shared)
+    {
+        using var och = conn.CreateModel();
+        var oq = och.QueueDeclare("", false, true, true, null).QueueName;
+        och.BasicQos(0, 2, global: shared);
+        var held = 0;
+        for (var i = 0; i < 2; i++)
+        {
+            var ocon = new EventingBasicConsumer(och);
+            ocon.Received += (_, e) => Interlocked.Increment(ref held);
+            och.BasicConsume(oq, false, "o" + i, ocon);
+        }
+        for (var i = 0; i < 10; i++) och.BasicPublish("", oq, null, Encoding.UTF8.GetBytes("m"));
+        Thread.Sleep(1200);
+        return Volatile.Read(ref held);
+    }
+
     static int Main(string[] args)
     {
         int port = args.Length > 0 ? int.Parse(args[0]) : 5672;
@@ -151,6 +170,55 @@ class Program
             um.BasicReturn += (_, e) => returns.Add("came back");
             um.BasicPublish(args[2], args[3], true, null, Encoding.UTF8.GetBytes("x"));
             Console.WriteLine(returns.TryTake(out var u, 4000) ? u : "went somewhere");
+            return 0;
+        }
+
+        // `sharedqos <true|false>` asks what `global` on `Basic.Qos` buys: two
+        // consumers on one channel, a count of two, and nothing acknowledged.
+        // Shared, the pair holds two between them; not shared, two each.
+        if (args.Length > 2 && args[1] == "sharedqos")
+        {
+            var sf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var sc = sf.CreateConnection();
+            using var sm = sc.CreateModel();
+            var sqn = sm.QueueDeclare("", false, true, true, null).QueueName;
+            sm.BasicQos(0, 2, global: args[2] == "true");
+            var held = 0;
+            for (var i = 0; i < 2; i++)
+            {
+                var scon = new EventingBasicConsumer(sm);
+                scon.Received += (_, e) => Interlocked.Increment(ref held);
+                sm.BasicConsume(sqn, false, "s" + i, scon);
+            }
+            for (var i = 0; i < 10; i++) sm.BasicPublish("", sqn, null, Encoding.UTF8.GetBytes("m"));
+            Thread.Sleep(1500);
+            Console.WriteLine("held=" + Volatile.Read(ref held));
+            return 0;
+        }
+
+        // `manycons` is two consumers on one channel, taking from one queue.
+        // A worker pool is usually written this way, and the question is
+        // whether each delivery arrives under the tag of the consumer it was
+        // actually given to.
+        if (args.Length > 1 && args[1] == "manycons")
+        {
+            var mf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var mc = mf.CreateConnection();
+            using var mm = mc.CreateModel();
+            var mqn = mm.QueueDeclare("", false, true, true, null).QueueName;
+            mm.BasicQos(0, 1, false);
+            var tags = new BlockingCollection<string>();
+            for (var i = 0; i < 2; i++)
+            {
+                var mcon = new EventingBasicConsumer(mm);
+                mcon.Received += (_, e) => { tags.Add(e.ConsumerTag); mm.BasicAck(e.DeliveryTag, false); };
+                mm.BasicConsume(mqn, false, "w" + i, mcon);
+            }
+            for (var i = 0; i < 6; i++) mm.BasicPublish("", mqn, null, Encoding.UTF8.GetBytes("m"));
+            var tally = new SortedDictionary<string, int>();
+            for (var i = 0; i < 6; i++)
+                if (tags.TryTake(out var mt, 3000)) tally[mt] = tally.TryGetValue(mt, out var mn) ? mn + 1 : 1;
+            Console.WriteLine(string.Join(" ", tally.Select(kv => kv.Key + "=" + kv.Value)));
             return 0;
         }
 
@@ -705,6 +773,32 @@ class Program
             back == null ? "(nothing)" : back.BasicProperties.ContentType, "application/json");
         Check("and a header a client put there",
             back == null ? "(nothing)" : Encoding.UTF8.GetString((byte[])back.BasicProperties.Headers["tenant"]), "acme");
+
+        // A worker pool: several consumers on one channel, all on one queue.
+        // Their names to the queue used to be the channel's, so the second
+        // consumer took the first one's place and everything went out under
+        // one tag.
+        using var wch = conn.CreateModel();
+        var wq = wch.QueueDeclare("", false, true, true, null).QueueName;
+        wch.BasicQos(0, 1, false);
+        var wtags = new BlockingCollection<string>();
+        for (var i = 0; i < 2; i++)
+        {
+            var wcon = new EventingBasicConsumer(wch);
+            wcon.Received += (_, e) => { wtags.Add(e.ConsumerTag); wch.BasicAck(e.DeliveryTag, false); };
+            wch.BasicConsume(wq, false, "w" + i, wcon);
+        }
+        for (var i = 0; i < 6; i++) wch.BasicPublish("", wq, null, Encoding.UTF8.GetBytes("m"));
+        var wtally = new SortedDictionary<string, int>();
+        for (var i = 0; i < 6; i++)
+            if (wtags.TryTake(out var wt, 3000)) wtally[wt] = wtally.TryGetValue(wt, out var wn) ? wn + 1 : 1;
+        Check("two consumers on one channel share the work",
+            string.Join(" ", wtally.Select(kv => kv.Key + "=" + kv.Value)), "w0=3 w1=3");
+
+        // `Basic.Qos` and its `global` bit, measured by what is outstanding
+        // when nothing is acknowledged: a count each, or a count between them.
+        Check("a prefetch of two, not shared, is two each", Outstanding(conn, false), 4);
+        Check("and shared, it is two between them", Outstanding(conn, true), 2);
 
         Console.WriteLine();
         Console.WriteLine($"{passed} of {passed + failed} passed");

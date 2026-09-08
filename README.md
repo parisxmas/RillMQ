@@ -1169,10 +1169,17 @@ All hundred and thirty-six of them pass, with or without a journal.
   a round trip it does not owe, so it answers with a stand-in and lets the
   owner be the one who knows. On a broker by itself, and for the queues a
   clustered node holds itself, the answer is the real one.
-- **`Basic.Qos` counts per consumer, not per channel.** Two consumers made on
-  one channel each get the window the channel asked for, rather than sharing
-  it, and `global=true` is read and treated as `false`. For the usual shape —
-  one consumer to a channel — these are the same thing.
+- **`Basic.Qos` with `global` shares a window per queue, not per channel.**
+  The bit is read, and a channel's consumers of one queue then share the count
+  between them rather than getting it each — which is what the specification
+  asks for and what a worker pool written on one channel wants. A channel
+  reading two queues gets the count on each of them instead of one count
+  across both, because the sharing is done by the queue and neither queue
+  knows about the other. RabbitMQ 4 does not share at all, having dropped
+  `global` altogether, so this is the nearer of the two to the specification.
+  A `Basic.Qos` arriving after the consumers it governs takes effect on what
+  is handed out from then on; what is already outstanding keeps the window it
+  went out under.
 - **A consumer that answers for nothing has no window.** Prefetch does not
   apply under `no-ack`, which is what the specification says and what RabbitMQ
   does, so such a consumer is given whatever the connection will take as fast
@@ -1219,5 +1226,3 @@ All hundred and thirty-six of them pass, with or without a journal.
   every message is as old as the restart. That is a smaller lie than it looks:
   what the number answers is "has anything moved in this queue lately", and a
   restart is a thing that moved.
-- **A queue's journal size is not reported.** The pages say what is in a
-  queue, not what its file has grown to between rewrites.

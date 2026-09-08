@@ -26,16 +26,21 @@ type Msg
 # nothing waits on it, which is what the client asked for and also what it
 # gives up — a message lost on the way is lost.
 # `window` is how much this one consumer may hold unacknowledged — what
-# `Basic.Qos` asks for, per consumer rather than per broker. Zero is no limit,
-# which is what AMQP's prefetch of zero means.
+# `Basic.Qos` asks for. Zero is no limit, which is what AMQP's prefetch of zero
+# means.
+# `group` is what that window is counted against, and it is usually the
+# consumer itself. Consumers sharing a group share one window between them,
+# which is what `Basic.Qos` with `global` asks for: a channel's whole count,
+# not a count each.
 type Sub
-  Sub(id: Int, out: Chan(Out), quick: Bool, window: Int)
+  Sub(id: Int, out: Chan(Out), quick: Bool, window: Int, group: Int)
 
 # A message handed out and not yet acknowledged. `due` is when the queue gives
-# up waiting and hands it to somebody else; `sub` is who is holding it, which
-# is what lets the queue count how much any one consumer has outstanding.
+# up waiting and hands it to somebody else; `group` is whose window it is
+# using, which is what lets the queue count how much is outstanding against
+# any one of them.
 type Flight
-  Flight(msg: Msg, due: Int, sub: Int)
+  Flight(msg: Msg, due: Int, group: Int)
 
 # `next_due` is when the loop next has to wake up for a deadline, or 0 when
 # nothing is in flight. It is carried rather than worked out, because working
@@ -60,6 +65,7 @@ type QCount
 type QReq
   QPub(body: Str, props: Str, out: Chan(Out))
   QSub(sub: Sub, reply: Chan(Int))
+  QTune(sub_id: Int, window: Int, group: Int, reply: Chan(Int))
   QUnsub(sub_id: Int, reply: Chan(Int))
   QAck(id: Int, reply: Chan(Int))
   QNack(id: Int, reply: Chan(Int))
@@ -229,6 +235,7 @@ fn q_is_stop(r) = match r
   QStop(if_unused, if_empty, reply) -> true
   QPub(b, p, o) -> false
   QSub(s, reply) -> false
+  QTune(i, w, g, reply) -> false
   QUnsub(i, reply) -> false
   QAck(i, reply) -> false
   QNack(i, reply) -> false
@@ -242,6 +249,7 @@ fn q_stopping(q: Q, r) = match r
   QStop(if_unused, if_empty, reply) -> q_asked_to_stop(q, if_unused, if_empty, reply)
   QPub(b, p, o) -> Some(q)
   QSub(s, reply) -> Some(q)
+  QTune(i, w, g, reply) -> Some(q)
   QUnsub(i, reply) -> Some(q)
   QAck(i, reply) -> Some(q)
   QNack(i, reply) -> Some(q)
@@ -291,11 +299,11 @@ fn q_wait_ms(q: Q) =
     left = q.next_due - now_millis()
     if left < 1 then 1 else left
 
-# How much this subscriber is holding.
-fn q_held(q: Q, sub_id) = map_or(q.held, sub_id, 0)
+# How much is outstanding against one window.
+fn q_held(q: Q, group) = map_or(q.held, group, 0)
 
-fn q_hold(q: Q, sub_id, by) =
-  q.held[sub_id] = q_held(q, sub_id) + by
+fn q_hold(q: Q, group, by) =
+  q.held[group] = q_held(q, group) + by
   0
 
 # Worked out once, when a timer has just fired and the answer has to be right
@@ -311,6 +319,7 @@ fn q_soonest(m: Map(Int, Flight), ks, best) = match ks
 fn q_handle(q: Q, r, full) = match r
   QPub(body, props, out) -> if full then q_refuse(q, out) else q_accept(q, body, props, out)
   QSub(s, reply) -> q_handle_rest(q, r)
+  QTune(i, w, g, reply) -> q_handle_rest(q, r)
   QUnsub(sub_id, reply) -> q_handle_rest(q, r)
   QAck(id, reply) -> q_handle_rest(q, r)
   QNack(id, reply) -> q_handle_rest(q, r)
@@ -350,6 +359,12 @@ fn q_handle_rest(q: Q, r) = match r
   QSub(s, reply) ->
     send(reply, 1)
     Q(q.name, q.ready, q.head, q.tail, append(q.subs, Cons(s, Nil)), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done)
+  QTune(sub_id, window, group, reply) ->
+    send(reply, 1)
+    # A window changed under a consumer that already has messages out. What it
+    # is holding stays counted where it was counted, so the new window governs
+    # what is handed out from here rather than what has already gone.
+    q_pump(Q(q.name, q.ready, q.head, q.tail, q_retune(q.subs, sub_id, window, group), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     # Whatever that subscriber was holding goes back to the front of the
@@ -401,7 +416,7 @@ fn q_forget(q: Q, id) = match q.inflight[id]
   None -> 0
   Some(f) ->
     map_del(q.inflight, id)
-    q_hold(q, f.sub, -1)
+    q_hold(q, f.group, -1)
 
 # An acknowledgement is written down but nothing waits for it to land. Losing
 # one costs a redelivery, which at-least-once delivery already allows, and it
@@ -417,7 +432,15 @@ fn q_without(subs, sub_id) = match subs
   Nil -> Nil
   Cons(s, rest) -> if q_sub_id(s) == sub_id then q_without(rest, sub_id) else Cons(s, q_without(rest, sub_id))
 
+fn q_retune(subs, sub_id, window, group) = match subs
+  Nil -> Nil
+  Cons(s, rest) ->
+    kept = if q_sub_id(s) == sub_id then Sub(q_sub_id(s), q_sub_out(s), q_sub_quick(s), window, group) else s
+    Cons(kept, q_retune(rest, sub_id, window, group))
+
 fn q_sub_id(s: Sub) = s.id
+
+fn q_sub_group(s: Sub) = s.group
 
 fn q_sub_out(s: Sub) = s.out
 
@@ -449,7 +472,7 @@ fn q_requeue(q: Q, id) = match q.inflight[id]
   None -> q
   Some(f) ->
     map_del(q.inflight, id)
-    q_hold(q, f.sub, -1)
+    q_hold(q, f.group, -1)
     q.ready[q.head - 1] = f.msg
     q_clear_due(Q(q.name, q.ready, q.head - 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
 
@@ -503,14 +526,14 @@ fn q_offer(q: Q, m: Msg, tried) =
         # buffer being full means it is not keeping up with what it already
         # has. Either way the message stays ready and somebody else may take
         # it.
-        if q_no_room(q, s) then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props, q_sub_id(s))) then q_took(moved, m, q_sub_id(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
+        if q_no_room(q, s) then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props, q_sub_id(s))) then q_took(moved, m, q_sub_group(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
 
 # A consumer that answers for nothing has no window: there is nothing
 # outstanding to count, which is what AMQP says of prefetch under `no-ack` and
 # what RabbitMQ does with it. A window of zero is the same, asked for.
 fn q_no_room(q: Q, s: Sub) =
   w = q_sub_window(s)
-  !q_sub_quick(s) && w > 0 && q_held(q, q_sub_id(s)) >= w
+  !q_sub_quick(s) && w > 0 && q_held(q, q_sub_group(s)) >= w
 
 fn q_try_send(out, frame) =
   ok = select
@@ -522,8 +545,8 @@ fn q_try_send(out, frame) =
 # the hottest path in the broker, and handing a counted record along it costs a
 # reference taken and given back for every message — worth about a fifth of the
 # delivery rate, which is more than the whole of what this function does.
-fn q_took(q: Q, m: Msg, sub_id, quick) =
-  if quick then q_handed_over(q, m) else q_in_flight(q, m, sub_id)
+fn q_took(q: Q, m: Msg, group, quick) =
+  if quick then q_handed_over(q, m) else q_in_flight(q, m, group)
 
 # Handed to a consumer that wants no acknowledgement, and therefore done with:
 # out of the ready table, written off in the journal at once, and never in the
@@ -534,9 +557,9 @@ fn q_handed_over(q: Q, m: Msg) =
   send(q.jr.puts, JNote(j_ack_record(m.id)))
   q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
 
-fn q_in_flight(q: Q, m: Msg, sub_id) =
+fn q_in_flight(q: Q, m: Msg, group) =
   due = now_millis() + q_ack_ms()
   map_del(q.ready, q.head)
-  q.inflight[m.id] = Flight(m, due, sub_id)
-  q_hold(q, sub_id, 1)
+  q.inflight[m.id] = Flight(m, due, group)
+  q_hold(q, group, 1)
   q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, if q.next_due == 0 then due else q.next_due, q.held, q.jr, q.out + 1, q.done))
