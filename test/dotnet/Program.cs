@@ -209,6 +209,44 @@ class Program
             return 0;
         }
 
+        // `vhost <open|split|name> [host]` is the virtual host, which is a
+        // namespace and nothing else: the same queue name in two of them is
+        // two queues, and a host this broker was not told about is refused
+        // rather than made.
+        if (args.Length > 2 && args[1] == "vhost")
+        {
+            if (args[2] == "open")
+            {
+                var vf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = args[3] };
+                try { using var vc = vf.CreateConnection(); Console.WriteLine("in"); }
+                catch (Exception) { Console.WriteLine("out"); }
+                return 0;
+            }
+            if (args[2] == "name")
+            {
+                var nf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = args[3] };
+                using var nc = nf.CreateConnection();
+                using var nm = nc.CreateModel();
+                Console.WriteLine(nm.QueueDeclare("vh-named", true, false, false, null).QueueName);
+                return 0;
+            }
+            var af = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            var bf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = args[3] };
+            using var ac2 = af.CreateConnection();
+            using var bc2 = bf.CreateConnection();
+            using var am2 = ac2.CreateModel();
+            using var bm2 = bc2.CreateModel();
+            am2.QueueDeclare("vh-shared", true, false, false, null);
+            bm2.QueueDeclare("vh-shared", true, false, false, null);
+            am2.BasicPublish("", "vh-shared", null, Encoding.UTF8.GetBytes("home"));
+            Thread.Sleep(500);
+            var mine = bm2.BasicGet("vh-shared", true);
+            var his = am2.BasicGet("vh-shared", true);
+            Console.WriteLine("there=" + (mine == null ? "(nothing)" : Encoding.UTF8.GetString(mine.Body.ToArray()))
+                + " home=" + (his == null ? "(nothing)" : Encoding.UTF8.GetString(his.Body.ToArray())));
+            return 0;
+        }
+
         // `autodel` walks the auto-delete case one step at a time and prints
         // what it sees, for when the acceptance check says it did not happen.
         if (args.Length > 1 && args[1] == "autodel")

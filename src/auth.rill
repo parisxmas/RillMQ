@@ -9,8 +9,11 @@
 #
 # The file is one person a line, and the word is not in it:
 #
-#     alice:9f3c…:4096:1a7b…:administrator
-#      name  salt  work  hash   what they may do
+#     alice:9f3c…:4096:1a7b…:administrator:/,prod
+#      name  salt  work  hash   what they may do  where they may do it
+#
+# The last field is optional and empty means everywhere, which is what every
+# line written before there was more than one virtual host says.
 #
 # The salt is why two people who chose the same word do not share a line, and
 # why a table computed in advance is a table for this broker's one user. The
@@ -96,6 +99,23 @@ fn au_hash(word, salt_hex, rounds) = to_hex(pbkdf2_sha1(word, from_hex(salt_hex)
 fn au_tag(path, name) = match au_load(path)[name]
   None -> ""
   Some(rest) -> au_field(rest, 3)
+
+# Which virtual hosts this person may open. Nothing written down means all of
+# them: a file from before virtual hosts existed says nothing, and what it
+# meant then was the one host there was.
+fn au_where(path, name) = match au_load(path)[name]
+  None -> ""
+  Some(rest) -> au_field(rest, 4)
+
+fn au_may(path, name, vhost) =
+  !au_wanted(path) || au_among(au_where(path, name), vhost)
+
+fn au_among(where, vhost) =
+  str_len(where) == 0 || au_listed(split(where, ","), vhost)
+
+fn au_listed(names, vhost) = match names
+  Nil -> false
+  Cons(n, rest) -> str_cmp(n, vhost) == 0 || au_listed(rest, vhost)
 
 fn au_names(path) = map_keys(au_load(path))
 

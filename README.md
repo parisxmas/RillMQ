@@ -16,7 +16,7 @@ Everything else is optional and named. Ports: `amqp=<port>` AMQP 0-9-1,
 `tls=<port>` and `amqps=<port>` the same two wrapped in TLS, `manage=<port>`
 the management pages. Files: `cert=` and `key=` a certificate and its key in
 PEM, `ca=` certificates a client's own must be signed by, `users=` who may
-connect. Cluster: `peers=<host:port,...>`, `node=<i>`,
+connect, `vhosts=` the virtual hosts this broker will open. Cluster: `peers=<host:port,...>`, `node=<i>`,
 `peer=<name:word>` for what one node signs in to another as, and `beat=<ms>`
 for how often a node checks that the ones whose copies it keeps are still
 there. Limits:
@@ -601,6 +601,35 @@ SASL `PLAIN`, which is what every client already sends. A word that is wrong
 ends an AMQP connection with no method and no reason given — what the
 specification asks for, and the only answer that does not say whether the
 *name* was the part that was wrong.
+
+## Virtual hosts
+
+A virtual host is a namespace: the same queue name in two of them is two
+queues, with two journals and nothing in common. `vhosts=` says which ones
+this broker will open, and a client that asks for any other is refused the
+connection with a 530 rather than handed an empty broker — which is what a
+typo should get.
+
+```sh
+./rillmq 6789 amqp=5672 dir=data users=data/users vhosts=/,prod,staging
+```
+
+The first name in the list is home, and it is written plain. Everything that
+is not AMQP lives there — the broker's own protocol, a replayed journal, a
+cluster link, the management pages — so a broker with one virtual host has
+exactly the names, files and behaviour it had before there were any. A queue
+in any other host is stored under the host, a slash, and the name, which is
+what the management pages show and what a cluster hashes and replicates.
+
+Who may open which is the last field of a line in `users=`:
+
+```
+alice:9f3c…:4096:1a7b…:administrator:/,prod
+carol:2b81…:4096:0e4f…:monitoring:/
+```
+
+An empty field means every host, which is what every line written before
+there was more than one says.
 
 ## TLS
 
@@ -1221,9 +1250,13 @@ All hundred and thirty-six of them pass, with or without a journal.
   `exclusive` gives it to one connection and refuses it to others with a 405,
   and `auto-delete` ends a queue with its last consumer and an exchange with
   its last binding.
-- **One virtual host, and one permission.** `Connection.Open` takes whatever
-  virtual host it is given. A name and a word are checked; what that person
-  may then do is not, beyond a tag the management pages read.
+- **A permission is a door, not a grammar.** `users=` says which virtual hosts
+  a person may open. RabbitMQ says, for each host, which names they may
+  configure, write to and read from, as three regular expressions. Here,
+  once in, everybody may do everything.
+- **The management pages do not know about virtual hosts.** They show every
+  queue this broker holds, and one in a host other than the first is shown by
+  the name it is stored under: the host, a slash, and the name.
 - **A client certificate is a door, not a name.** `ca=` decides who may reach
   the broker; who they then are is still the name and word they send, and a
   certificate's subject is not read or mapped to one. Between nodes there is

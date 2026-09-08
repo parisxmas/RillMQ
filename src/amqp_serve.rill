@@ -12,7 +12,7 @@ import "auth"
 
 # Everything a connection remembers.
 type Am
-  Am(fd: Int, ssl: Ptr, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), tag: Int, whose: Map(Int, Str), which: Map(Int, Int), consumers: Map(Str, Str), where: Map(Str, Int), qos: Map(Int, Int), serving: Map(Int, Str), closing: Map(Int, Int), kinds: Map(Str, Str), subs: List(Str), pub_x: Str, pub_to: Str, pub_chan: Int, pub_back: Bool, pub_want: Int, pub_body: Str, pub_props: Str, confirms: Bool, on_chan: Int, wants_blocked: Bool, blocked: Bool, looked: Int, seq: Int, acked: Int, told: Int, quick: Bool, made: Int, what: Map(Str, Int), wide: Map(Int, Int), named: Int)
+  Am(fd: Int, ssl: Ptr, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), tag: Int, whose: Map(Int, Str), which: Map(Int, Int), consumers: Map(Str, Str), where: Map(Str, Int), qos: Map(Int, Int), serving: Map(Int, Str), closing: Map(Int, Int), kinds: Map(Str, Str), subs: List(Str), pub_x: Str, pub_to: Str, pub_chan: Int, pub_back: Bool, pub_want: Int, pub_body: Str, pub_props: Str, confirms: Bool, on_chan: Int, wants_blocked: Bool, blocked: Bool, looked: Int, seq: Int, acked: Int, told: Int, quick: Bool, made: Int, what: Map(Str, Int), wide: Map(Int, Int), named: Int, vh: Str)
 
 # What reaches the session.
 type ASes
@@ -27,7 +27,7 @@ type ASes
 # the first byte to the loop. A record rather than seven arguments, because
 # seven arguments is where a Rill call stops being a jump.
 type Who
-  Who(fd: Int, ssl: Ptr, reg: Chan(RReq), done: Chan(Int), cid: Int, gone: Chan(Int), users: Str, wants_blocked: Bool)
+  Who(fd: Int, ssl: Ptr, reg: Chan(RReq), done: Chan(Int), cid: Int, gone: Chan(Int), users: Str, wants_blocked: Bool, who: Str, vh: Str)
 
 # -- the handshake ---------------------------------------------------------------
 
@@ -53,10 +53,10 @@ fn am_fill_header(w: Who, buf) =
 
 fn am_serve(fd, reg, done, cid, gone, d: Door) =
   sock_nodelay(fd)
-  if is_null(d.tls.ctx) then am_greeted(fd, reg, done, cid, gone, Who(fd, null_ptr(), reg, done, cid, gone, d.users, false)) else am_shaken(fd, reg, done, cid, gone, d, tls_up(d.tls, fd))
+  if is_null(d.tls.ctx) then am_greeted(fd, reg, done, cid, gone, Who(fd, null_ptr(), reg, done, cid, gone, d.users, false, "", am_home())) else am_shaken(fd, reg, done, cid, gone, d, tls_up(d.tls, fd))
 
 fn am_shaken(fd, reg, done, cid, gone, d: Door, ssl) =
-  if is_null(ssl) then am_hang_up(fd, gone) else am_greeted(fd, reg, done, cid, gone, Who(fd, ssl, reg, done, cid, gone, d.users, false))
+  if is_null(ssl) then am_hang_up(fd, gone) else am_greeted(fd, reg, done, cid, gone, Who(fd, ssl, reg, done, cid, gone, d.users, false, "", am_home()))
 
 fn am_greeted(fd, reg, done, cid, gone, w: Who) =
   head = am_fill_header(w, "")
@@ -101,10 +101,13 @@ fn am_start_ok(payload) =
 # told something it did not ask for, which is a stranger thing to do on
 # purpose than to have happen.
 fn am_noted(w: Who, payload) =
-  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, str_find(payload, "connection.blocked") >= 0)
+  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, str_find(payload, "connection.blocked") >= 0, w.who, w.vh)
 
 fn am_said(w: Who, buf, said: Said) =
-  if au_ok(w.users, said.name, said.word) then am_tune(w, buf) else am_shut(w)
+  if au_ok(w.users, said.name, said.word) then am_tune(am_signed_in(w, said.name), buf) else am_shut(w)
+
+fn am_signed_in(w: Who, name) =
+  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, name, w.vh)
 
 fn am_tune(w: Who, buf) =
   p_write(w.ssl, w.fd, am_connection_tune())
@@ -112,11 +115,65 @@ fn am_tune(w: Who, buf) =
     ADead -> am_shut(w)
     ARead(kind, chan, payload, rest) -> am_open(w, rest)
 
+# `Connection.Open` names the virtual host, and until now the name was read off
+# the wire and dropped: a client that asked for `/prod` got the same broker as
+# one that asked for `/`, which is the failure a virtual host exists to
+# prevent — two things sharing a namespace and neither of them knowing.
+#
+# A host this broker was not told about is refused rather than made, because a
+# client that mistypes one should be told so, not handed an empty broker that
+# looks like a broker whose queues have all disappeared.
 fn am_open(w: Who, buf) = match am_read_frame(w, buf)
   ADead -> am_shut(w)
-  ARead(kind, chan, payload, rest) ->
+  ARead(kind, chan, payload, rest) -> am_opening(w, rest, a_get_shortstr(payload, am_args()))
+
+fn am_opening(w: Who, buf, vhost) =
+  if !am_has_vhost(vhost) then am_turn_away(w, "no virtual host `" + vhost + "` here")
+  else if !au_may(w.users, w.who, vhost) then am_turn_away(w, "`" + w.who + "` may not open `" + vhost + "`")
+  else
     p_write(w.ssl, w.fd, am_connection_open_ok())
-    am_run(w, rest)
+    am_run(am_in_vhost(w, vhost), buf)
+
+fn am_in_vhost(w: Who, vhost) =
+  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, w.who, vhost)
+
+# Refused at the connection rather than at a channel, which is what a client
+# expects here: there is no channel yet to close.
+fn am_turn_away(w: Who, why) =
+  p_write(w.ssl, w.fd, am_connection_close(am_not_allowed(), why))
+  am_shut(w)
+
+fn am_not_allowed() = 530
+
+fn am_has_vhost(vhost) = am_one_of(split(am_vhosts(), ","), vhost)
+
+fn am_one_of(names, vhost) = match names
+  Nil -> false
+  Cons(n, rest) -> str_cmp(n, vhost) == 0 || am_one_of(rest, vhost)
+
+# The hosts this broker will open, and the first of them is the one everything
+# that is not AMQP uses: the broker's own protocol, a replayed journal, a
+# cluster link and the management pages all live in it.
+fn am_vhosts() = opt("vhosts", am_home())
+
+fn am_home() = "/"
+
+# A name as this connection's virtual host writes it. The first host in
+# `vhosts=` is written plain, because it is the one everything that is not
+# AMQP already uses — the broker's own protocol, a replayed journal, a cluster
+# link, the management pages — so a broker with one host has exactly the names
+# it had before. Any other host puts its own name in front, and that prefix is
+# the whole of what keeps two hosts from sharing a queue.
+#
+# The empty name is never a host's: it is the default exchange, and it means
+# "no exchange" rather than a thing to look up.
+fn am_in(am: Am, name) =
+  if str_len(name) == 0 || str_cmp(am.vh, am_home()) == 0 then name else am.vh + "/" + name
+
+fn am_out(am: Am, name) =
+  if str_cmp(am.vh, am_home()) == 0 then name else am_bare(name, str_len(am.vh) + 1)
+
+fn am_bare(name, n) = if str_len(name) < n then name else name[n:]
 
 fn am_hang_up(fd, gone) =
   sock_close(fd)
@@ -136,7 +193,7 @@ fn am_run(w: Who, buf) =
   ses = channel(am_backlog())
   out = channel(am_backlog())
   spawn am_reader(w, ses, buf, 0)
-  am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1), ses, w.gone)
+  am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1, w.vh), ses, w.gone)
 
 # The reader: frames off the socket and nothing else.
 fn am_reader(w: Who, ses, buf, from) = match a_take(buf, from)
@@ -235,13 +292,13 @@ fn am_dropped_here(am: Am, body) =
   if !am.pub_back then am else am_hand_back(am, am.pub_chan, "", am.pub_to, body, am.pub_props)
 
 fn am_hand_back(am: Am, chan, exchange, key, body, props) =
-  am_say(am, am_return(chan, exchange, key) + am_content(chan, body, props))
+  am_say(am, am_return(chan, am_out(am, exchange), key) + am_content(chan, body, props))
   am
 
 fn am_confirm(am: Am) =
   if !am.confirms then am
   else
-    Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked + 1, am.told, am.quick, am.made, am.what, am.wide, am.named)
+    Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked + 1, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # A consumer that answers for nothing leaves the queue with no reason to look
 # again, so this is the reason: once, at the moment this connection has caught
@@ -268,7 +325,7 @@ fn am_flush_confirms(am: Am) =
 
 fn am_told_up_to(am: Am, upto) =
   am_say(am, am_basic_ack_upto(am.on_chan, upto))
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, upto, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, upto, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # -- asking a queue something ---------------------------------------------------
 
@@ -339,7 +396,7 @@ fn am_dropped(am: Am, tag) =
 fn am_less(am: Am, queue) =
   if am_still_reading(am, queue, map_keys(am.consumers)) then am
   else
-    Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am_without(am.subs, queue), am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+    Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am_without(am.subs, queue), am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 fn am_still_reading(am: Am, queue, tags) = match tags
   Nil -> false
@@ -367,7 +424,7 @@ fn am_say(am: Am, bytes) =
 # Marking a connection finished: the descriptor is set to -1 and the loop sees
 # it on the way round.
 fn am_finished(am: Am) =
-  Am(-1, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(-1, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # -- what the server says ------------------------------------------------------------
 
@@ -398,6 +455,14 @@ fn am_connection_open_ok() =
   am_method(0, a_class_connection(), 41, strbuf_str(b))
 
 fn am_connection_close_ok() = am_method(0, a_class_connection(), 51, "")
+
+fn am_connection_close(code, why) =
+  b = strbuf()
+  a_u16(b, code)
+  a_shortstr(b, why)
+  a_u16(b, 0)
+  a_u16(b, 0)
+  am_method(0, a_class_connection(), 50, strbuf_str(b))
 
 fn am_connection_blocked(why) =
   b = strbuf()
@@ -613,7 +678,7 @@ fn am_confirm_select(am: Am, chan, method) =
 
 fn am_turn_on_confirms(am: Am, chan) =
   am_say(am, am_confirm_select_ok(chan))
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, true, chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, true, chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # Channel zero is the connection's own and cannot be closed with a
 # `Channel.Close`, so what is not written here is passed over rather than
@@ -644,10 +709,10 @@ fn am_forget_on(am: Am, tags, chan) = match tags
 # `Exchange.Declare` names an exchange and says what kind it is. The kind is
 # the third field: past the reserved short, past the name.
 fn am_exchange_method(am: Am, chan, method, payload) =
-  if method == 20 then am_delete_exchange(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method != 10 then am_no_method(am, chan, a_class_exchange(), method) else am_exchange_declare(am, chan, payload, a_after_shortstr(payload, am_after_reserved()))
+  if method == 20 then am_delete_exchange(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method != 10 then am_no_method(am, chan, a_class_exchange(), method) else am_exchange_declare(am, chan, payload, a_after_shortstr(payload, am_after_reserved()))
 
 fn am_exchange_declare(am: Am, chan, payload, at) =
-  am_exchange_named(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_shortstr(payload, at), a_get_u8(payload, a_after_shortstr(payload, at)))
+  am_exchange_named(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_shortstr(payload, at), a_get_u8(payload, a_after_shortstr(payload, at)))
 
 fn am_exchange_named(am: Am, chan, name, kind, bits) =
   if bit_and(bits, am_passive()) != 0 then am_exchange_if_there(am, chan, name, am_exchange_if(am, name))
@@ -671,7 +736,7 @@ fn am_deleted_exchange(am: Am, chan, name, n) =
   if n == -1 then am_no_exchange(am, chan, name, 20) else if n < 0 then am_exchange_in_use(am, chan, name) else am_answer(am, am_exchange_delete_ok(chan))
 
 fn am_exchange_in_use(am: Am, chan, name) =
-  am_refuse(am, chan, am_precondition(), "exchange `" + name + "` still has something bound to it", a_class_exchange(), 20)
+  am_refuse(am, chan, am_precondition(), "exchange `" + am_out(am, name) + "` still has something bound to it", a_class_exchange(), 20)
 
 # The second bit of the flags on a declaration: whether the thing is meant to
 # outlive the broker. It was read and ignored, so a client that asked for
@@ -705,7 +770,7 @@ fn am_args() = 4
 fn am_after_reserved() = 6
 
 fn am_queue_method(am: Am, chan, method, payload) =
-  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 40 then am_delete_queue(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
+  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved()))) else if method == 40 then am_delete_queue(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
 
 # `Queue.Purge` throws away what is waiting and answers with how much that
 # was. It is `DRAIN` on RillMQ's own protocol, and the same request underneath.
@@ -738,7 +803,7 @@ fn am_deleted_queue(am: Am, chan, queue, n) =
   if n == -1 then am_no_queue(am, chan, queue, 40) else if n < 0 then am_queue_in_use(am, chan, queue) else am_answer(am_forgot_queue(am, queue), am_queue_delete_ok(chan, n))
 
 fn am_queue_in_use(am: Am, chan, queue) =
-  am_refuse(am, chan, am_precondition(), "queue `" + queue + "` is in use or not empty", a_class_queue(), 40)
+  am_refuse(am, chan, am_precondition(), "queue `" + am_out(am, queue) + "` is in use or not empty", a_class_queue(), 40)
 
 # Whatever this connection was reading from it is reading from nothing now,
 # and it is told so here rather than waiting for the queue to say it. The
@@ -757,8 +822,8 @@ fn am_forget_all_on(am: Am, tags, queue) = match tags
 fn am_unbind(am: Am, chan, payload) =
   at1 = a_after_shortstr(payload, am_after_reserved())
   at2 = a_after_shortstr(payload, at1)
-  queue = a_get_shortstr(payload, am_after_reserved())
-  ex = a_get_shortstr(payload, at1)
+  queue = am_in(am, a_get_shortstr(payload, am_after_reserved()))
+  ex = am_in(am, a_get_shortstr(payload, at1))
   key = a_get_shortstr(payload, at2)
   am_unbind_from(am, chan, queue, key, am_exchange_if(am, ex), ex)
 
@@ -784,8 +849,8 @@ fn am_idle_exchange(am: Am, ex) =
 fn am_bind(am: Am, chan, payload) =
   at1 = a_after_shortstr(payload, am_after_reserved())
   at2 = a_after_shortstr(payload, at1)
-  queue = a_get_shortstr(payload, am_after_reserved())
-  ex = a_get_shortstr(payload, at1)
+  queue = am_in(am, a_get_shortstr(payload, am_after_reserved()))
+  ex = am_in(am, a_get_shortstr(payload, at1))
   key = a_get_shortstr(payload, at2)
   am_bind_to(am, chan, queue, am_bind_on(am, ex, key, payload, at2), am_exchange_if(am, ex), ex)
 
@@ -823,10 +888,10 @@ fn am_binding(am: Am, chan, queue, key, x, qh) =
 fn am_not_found() = 404
 
 fn am_no_exchange(am: Am, chan, name, method) =
-  am_refuse(am, chan, am_not_found(), "no exchange `" + name + "` in vhost `/`", a_class_exchange(), method)
+  am_refuse(am, chan, am_not_found(), "no exchange `" + am_out(am, name) + "` in vhost `" + am.vh + "`", a_class_exchange(), method)
 
 fn am_no_queue(am: Am, chan, name, method) =
-  am_refuse(am, chan, am_not_found(), "no queue `" + name + "` in vhost `/`", a_class_queue(), method)
+  am_refuse(am, chan, am_not_found(), "no queue `" + am_out(am, name) + "` in vhost `" + am.vh + "`", a_class_queue(), method)
 
 fn am_queue_if(am: Am, name) =
   back = channel(1)
@@ -868,10 +933,10 @@ fn am_only() = 4
 fn am_fleeting() = 8
 
 fn am_declare(am: Am, chan, given, bits) =
-  if str_len(given) > 0 then am_declare_as(am, chan, given, bits) else am_declare_as(am_counted(am), chan, am_gen_name(am), bits)
+  if str_len(given) > 0 then am_declare_as(am, chan, am_in(am, given), bits) else am_declare_as(am_counted(am), chan, am_in(am, am_gen_name(am)), bits)
 
 fn am_counted(am: Am) =
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named + 1)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named + 1, am.vh)
 
 fn am_declare_if(am: Am, chan, name, found) = match found
   None -> am_no_queue(am, chan, name, 10)
@@ -901,7 +966,7 @@ fn am_claim(am: Am, name, only, fleeting) =
   recv(back)
 
 fn am_held_by_another(am: Am, chan, name, method) =
-  am_refuse(am, chan, am_locked(), "queue `" + name + "` belongs to another connection", a_class_queue(), method)
+  am_refuse(am, chan, am_locked(), "queue `" + am_out(am, name) + "` belongs to another connection", a_class_queue(), method)
 
 # A consumer has gone, so a queue that was to last only as long as its
 # consumers may be finished. The registry decides; this only says when to ask.
@@ -927,7 +992,7 @@ fn am_queue_kind(am: Am, name, durable) =
   recv(back)
 
 fn am_declared(w: AStat, chan, name) =
-  am_answer(w.am, am_queue_declare_ok(chan, name, q_count_ready(w.got) + q_count_inflight(w.got), q_count_subs(w.got)))
+  am_answer(w.am, am_queue_declare_ok(chan, am_out(w.am, name), q_count_ready(w.got) + q_count_inflight(w.got), q_count_subs(w.got)))
 
 fn am_basic(am: Am, chan, method, payload) =
   if method == 10 then am_qos(am, chan, payload) else if method == 20 then am_consume(am, chan, payload) else if method == 30 then am_cancel(am, chan, a_get_shortstr(payload, am_args())) else if method == 40 then am_publish(am, chan, payload) else if method == 70 then am_get(am, chan, payload) else if method == 80 then am_ack(am, chan, a_get_u64(payload, am_args())) else if method == 90 then am_requeue(am, chan, 90, a_get_u64(payload, am_args())) else if method == 120 then am_requeue(am, chan, 120, a_get_u64(payload, am_args())) else am_no_method(am, chan, a_class_basic(), method)
@@ -942,7 +1007,7 @@ fn am_mandatory() = 1
 
 fn am_publish(am: Am, chan, payload) =
   at = a_after_shortstr(payload, am_after_reserved())
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, a_get_shortstr(payload, am_after_reserved()), a_get_shortstr(payload, at), chan, bit_and(a_get_u8(payload, a_after_shortstr(payload, at)), am_mandatory()) != 0, 0, "", "", am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_shortstr(payload, at), chan, bit_and(a_get_u8(payload, a_after_shortstr(payload, at)), am_mandatory()) != 0, 0, "", "", am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # The properties are taken as they are, from where they start to the end of
 # the header. Nothing here reads them: a `reply-to` or a `correlation-id` means
@@ -956,14 +1021,14 @@ fn am_header(am: Am, payload) =
   am_header_seen(am, want, props)
 
 fn am_header_seen(am: Am, want, props) =
-  if str_len(am.pub_to) == 0 then am else if want == 0 then am_deposit(am_with_props(am, props), "") else Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, want, "", props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  if str_len(am.pub_to) == 0 then am else if want == 0 then am_deposit(am_with_props(am, props), "") else Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, want, "", props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 fn am_with_props(am: Am, props) =
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 fn am_body(am: Am, chan, payload) =
   whole = am.pub_body + payload
-  if str_len(whole) < am.pub_want then Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, whole, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named) else am_deposit(am, whole)
+  if str_len(whole) < am.pub_want then Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, whole, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh) else am_deposit(am, whole)
 
 # The queue is handed this connection's own channel either way. What changes
 # with confirms on is what the session does when the answer comes back: it
@@ -974,7 +1039,7 @@ fn am_body(am: Am, chan, payload) =
 # is what it means and is the path most messages take. A named exchange is a
 # strand that decides, so the message goes there instead.
 fn am_deposit(am: Am, body) =
-  if str_len(am.pub_x) == 0 then am_deposit_direct(am, body, am_queue_if(am, am.pub_to)) else am_deposit_at(am, body, am_exchange_if(am, am.pub_x))
+  if str_len(am.pub_x) == 0 then am_deposit_direct(am, body, am_queue_if(am, am_in(am, am.pub_to))) else am_deposit_at(am, body, am_exchange_if(am, am.pub_x))
 
 # The default exchange routes to the queue its key names, and a key naming no
 # queue routes nowhere. That is not an error and AMQP does not make it one:
@@ -1001,7 +1066,7 @@ fn am_route_by(am: Am, exchange, key, props) =
   if str_cmp(am_kind_of(am, exchange), x_headers()) != 0 then key else a_headers_text(props)
 
 fn am_done_with_publish(am: Am) =
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, "", "", 0, false, 0, "", "", am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, "", "", 0, false, 0, "", "", am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # How many publishes between one look at how big this process has got. The
 # queue asks the same question on the same clock; this is the other half of
@@ -1012,7 +1077,7 @@ fn am_watch_room(am: Am) =
   if !am.wants_blocked then am else if am.looked > 0 then am_counted_down(am) else am_looked(am, rss_bytes() > q_max_bytes())
 
 fn am_counted_down(am: Am) =
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked - 1, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked - 1, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # Said once when it becomes true and once when it stops being, because a
 # publisher that is told to pause every two hundred and fifty-sixth message is
@@ -1021,7 +1086,7 @@ fn am_looked(am: Am, full) =
   if full == am.blocked then am_said_nothing(am, full) else am_say_room(am, full)
 
 fn am_said_nothing(am: Am, full) =
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, full, am_look_every(), am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, full, am_look_every(), am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 fn am_say_room(am: Am, full) =
   am_say(am, if full then am_connection_blocked("low on memory") else am_connection_unblocked())
@@ -1030,7 +1095,7 @@ fn am_say_room(am: Am, full) =
 fn am_deposited(am: Am) = am_watch_room(am_took_it(am))
 
 fn am_took_it(am: Am) =
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, "", "", 0, false, 0, "", "", am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, if am.confirms then am.seq + 1 else am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, "", "", 0, false, 0, "", "", am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, if am.confirms then am.seq + 1 else am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 # `Basic.Qos` is a size nobody implements, then a count, then a bit saying
 # whether the count is a count each or a count between them. Both are kept per
@@ -1076,7 +1141,7 @@ fn am_no_ack() = 2
 
 fn am_consume(am: Am, chan, payload) =
   at = a_after_shortstr(payload, am_after_reserved())
-  queue = a_get_shortstr(payload, am_after_reserved())
+  queue = am_in(am, a_get_shortstr(payload, am_after_reserved()))
   given = a_get_shortstr(payload, at)
   bits = a_get_u8(payload, a_after_shortstr(payload, at))
   tag = if str_len(given) > 0 then given else "ctag-" + int_to_str(am.cid) + "-" + int_to_str(am.tag)
@@ -1109,7 +1174,7 @@ fn am_consuming(am: Am, chan, queue, tag, quick, sub) =
   am.where[tag] = chan
   am.what[tag] = sub
   am.serving[sub] = tag
-  am_answer(Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, if am_has(am.subs, queue) then am.subs else Cons(queue, am.subs), am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick || quick, am.made + 1, am.what, am.wide, am.named), am_basic_consume_ok(chan, tag))
+  am_answer(Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, if am_has(am.subs, queue) then am.subs else Cons(queue, am.subs), am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick || quick, am.made + 1, am.what, am.wide, am.named, am.vh), am_basic_consume_ok(chan, tag))
 
 fn am_has(names, name) = match names
   Nil -> false
@@ -1156,16 +1221,16 @@ fn am_send_delivery(am: Am, queue, id, body, props, sub) =
   am.whose[am.tag] = queue
   am.which[am.tag] = id
   am_deliver_on(am, queue, body, props, map_or(am.serving, sub, ""))
-  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag + 1, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named)
+  Am(am.fd, am.ssl, am.reg, am.done, am.cid, am.out, am.tag + 1, am.whose, am.which, am.consumers, am.where, am.qos, am.serving, am.closing, am.kinds, am.subs, am.pub_x, am.pub_to, am.pub_chan, am.pub_back, am.pub_want, am.pub_body, am.pub_props, am.confirms, am.on_chan, am.wants_blocked, am.blocked, am.looked, am.seq, am.acked, am.told, am.quick, am.made, am.what, am.wide, am.named, am.vh)
 
 fn am_deliver_on(am: Am, queue, body, props, tag) =
-  am_say(am, am_deliver(map_or(am.where, tag, 1), am.tag, tag, queue, body, props))
+  am_say(am, am_deliver(map_or(am.where, tag, 1), am.tag, tag, am_out(am, queue), body, props))
   0
 
 # `Basic.Get` takes one without subscribing. It is a poll, so it subscribes,
 # waits a moment for something to arrive, and unsubscribes again.
 fn am_get(am: Am, chan, payload) =
-  am_get_named(am, chan, a_get_shortstr(payload, am_after_reserved()))
+  am_get_named(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())))
 
 fn am_get_named(am: Am, chan, queue) =
   if am_claim(am, queue, false, false) == 0 then am_held_by_another(am, chan, queue, 70) else am_get_from(am, chan, queue)
@@ -1202,4 +1267,4 @@ fn am_one(am: Am, chan, queue, what) = match what
   ODeliver(q, id, body, props, sub) ->
     back = channel(1)
     sent = am_hand(am, am_queue(am, queue), QAck(id, back))
-    am_answer(am_wait(sent, back).am, am_get_ok(chan, am.tag, queue, 0, body, props))
+    am_answer(am_wait(sent, back).am, am_get_ok(chan, am.tag, am_out(am, queue), 0, body, props))
