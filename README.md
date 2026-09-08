@@ -645,10 +645,10 @@ of its own each run. Neither broker knows which it is.
 
 | over AMQP, through RabbitMQ's own .NET client | RabbitMQ | RillMQ |
 |---|---:|---:|
-| publish, transient | 256,000/sec | 918,000/sec |
-| deliver and acknowledge | 157,000/sec | 261,000/sec |
-| publish, durable, waiting for confirms | 285,000/sec | 792,000/sec |
-| resident after 120,000 messages | 196 MB | 96 MB |
+| publish, transient | 205,000/sec | 837,000/sec |
+| deliver and acknowledge | 163,000/sec | 272,000/sec |
+| publish, durable, waiting for confirms | 282,000/sec | 819,000/sec |
+| resident after 170,000 messages | 214 MB | 95 MB |
 
 The transient publish figure is the one to read carefully: with confirms off
 there is nothing to wait for, so it measures how fast a broker takes messages
