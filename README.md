@@ -52,6 +52,12 @@ bury a slow consumer. Messages are written down before a publisher is told they
 are safe, and a broker that is killed comes back with everything it had
 answered for. It stops cleanly on `SIGINT` or `SIGTERM`.
 
+Around that: four kinds of exchange, and exchanges that can be bound to
+exchanges; virtual hosts, so two of them can hold a queue of the same name;
+people with passwords or certificates, and three rights each per host; TLS on
+both protocols; management pages; and a cluster that shares queues out by
+name, keeps copies, and elects a new owner for one whose node has gone.
+
 ## Speaking AMQP
 
 `amqp=5672` opens a second port speaking AMQP 0-9-1, the protocol RabbitMQ
@@ -71,19 +77,34 @@ The two protocols are two doors into the same queues. A message published by
 the .NET client over AMQP is delivered to a subscriber on RillMQ's own port,
 is written to the same journal, and is there after a restart.
 
-What is implemented is what a client actually uses: the connection handshake,
-channels — several to a connection, each with its own consumers and its own
-prefetch — `Queue.Declare` (which is also how a client asks how many are
-waiting), `Exchange.Declare` and `Queue.Bind` — both of which now refuse a name nobody
-declared — `Basic.Qos`, `Basic.Publish`,
-`Basic.Consume` with `no-ack`, `Basic.Deliver`, `Basic.Ack`, `Basic.Nack` and
-`Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `mandatory` and `Basic.Return`,
-`Queue.Purge`, `Queue.Delete`,
-`Queue.Unbind`, `Exchange.Delete`, `Confirm.Select`, and closing a
-channel or a connection — from either side, since the broker closes a channel
-itself when it has to refuse something. A message's properties — `reply-to`,
-`correlation-id`, `content-type`, headers — are kept as they came and handed
-back untouched, which is what the request-and-reply pattern is made of.
+What is implemented is what a client actually uses.
+
+The handshake: `PLAIN`, or `EXTERNAL` where the name is the client
+certificate's, and `Connection.Open` naming a virtual host that has to be one
+this broker was told about. Channels — several to a connection, each with its
+own consumers and its own prefetch.
+
+Declaring: `Queue.Declare` (which is also how a client asks how many are
+waiting) and `Exchange.Declare`, both of which mean their flags — `passive`
+asks rather than makes, `durable` decides whether it is written down,
+`exclusive` gives a queue to one connection, `auto-delete` ends a queue with
+its last consumer and an exchange with its last binding, `internal` takes
+nothing from a client — and a queue asked for with no name is given one.
+`Queue.Bind`, `Queue.Unbind`, `Exchange.Bind` and `Exchange.Unbind`, so a
+topology can be built out of exchanges as well as out of queues.
+`Queue.Purge`, `Queue.Delete` and `Exchange.Delete` with their conditions.
+
+Moving messages: `Basic.Qos`, including `global`; `Basic.Publish` with
+`mandatory` and `Basic.Return`; `Basic.Consume` with `no-ack`,
+`Basic.Deliver`, `Basic.Cancel` from either side; `Basic.Get` that hands back
+a delivery tag meaning what it says; `Basic.Ack` with `multiple`,
+`Basic.Nack` and `Basic.Reject` with `requeue`; `Confirm.Select`.
+
+And closing a channel or a connection from either side, since the broker
+closes a channel itself when it has to refuse something. A message's
+properties — `reply-to`, `correlation-id`, `content-type`, headers — are kept
+as they came and handed back untouched, which is what the request-and-reply
+pattern is made of.
 
 **Being asked to stop.** A broker over its `mem=` limit says so with
 `Connection.Blocked`, and says `Connection.Unblocked` when there is room
@@ -586,9 +607,13 @@ pages alike.
 The file is one person a line and the word is not in it:
 
 ```
-alice:9f3c…:4096:1a7b…:administrator
- name  salt  work  hash   what they may do
+alice:9f3c…:4096:1a7b…:administrator:/,prod:crw
+ name  salt  work  hash   tag           where  what
 ```
+
+The last two fields are the virtual hosts this person may open and the rights
+they have there; both are optional and both are described under **Virtual
+hosts** below.
 
 The hash is PBKDF2-HMAC-SHA-1, which `lib/passwd.rill` had already written and
 checked against the published vectors. The salt is why two people who chose
@@ -609,10 +634,11 @@ the hashing runs either way, so the clock does not answer a question the
 broker declines to.
 
 On the wire it is `AUTH name word` before anything else, and over AMQP it is
-SASL `PLAIN`, which is what every client already sends. A word that is wrong
-ends an AMQP connection with no method and no reason given — what the
-specification asks for, and the only answer that does not say whether the
-*name* was the part that was wrong.
+SASL `PLAIN`, which is what every client already sends — or `EXTERNAL`, where
+the word is a client certificate instead and the name comes out of it; see
+**TLS**. A word that is wrong ends an AMQP connection with no method and no
+reason given — what the specification asks for, and the only answer that does
+not say whether the *name* was the part that was wrong.
 
 ## Virtual hosts
 
@@ -724,9 +750,10 @@ channel a publisher uses.
 open http://localhost:15672/
 ```
 
-It shows the totals and a row per queue — ready, in flight, consumers, and how
-many have ever been published — and it can publish a message, empty a queue,
-and add or remove a person. `/api/queues` and `/api/overview` are the same
+It shows the totals and a row per queue — ready, in flight, consumers, how
+long the oldest message has been waiting, and how much the queue is costing on
+the disk — and it can publish a message, empty a queue, and add or remove a
+person. `/api/queues` and `/api/overview` are the same
 numbers as JSON, for a program. Everything is behind the same password file as
 the brokers, over HTTP's own `Authorization: Basic`.
 
@@ -972,11 +999,25 @@ of its own each run. Neither broker knows which it is.
 
 | over AMQP, through RabbitMQ's own .NET client | RabbitMQ | RillMQ |
 |---|---:|---:|
-| publish, transient | 205,000/sec | 837,000/sec |
-| deliver and acknowledge | 160,000/sec | 265,000/sec |
-| deliver, `no-ack` | 285,000/sec | 470,000/sec |
-| publish, durable, waiting for confirms | 282,000/sec | 819,000/sec |
-| resident after 170,000 messages | 214 MB | 95 MB |
+| publish, transient | 211,000/sec | 686,000/sec |
+| deliver and acknowledge | 140,000/sec | 208,000/sec |
+| publish, durable, waiting for confirms | 274,000/sec | 720,000/sec |
+| grew by, holding 200,000 durable messages | 76 MB | 114 MB |
+
+Each rate is the median of three runs, taken in one sitting with the two
+brokers alternating. An earlier table here said 837,000 for the transient
+publish, and that figure is not reproducible on this machine now: the same
+build measures under 800,000 today, and so does the build from before this
+week's work. Something outside these numbers changed. The ratios are what
+they were.
+
+The memory row is the one that changed direction, and it is worth reading
+carefully. RabbitMQ starts at 86 MB where this starts at 2 MB, so on the whole
+figure this is far smaller — but per message held it is not: two hundred
+thousand 64-byte messages cost RabbitMQ 76 MB and cost this 114 MB. RabbitMQ
+writes a durable message down and lets go of it; this keeps every message it
+is holding in memory and uses the journal only to come back from. That is a
+deliberate difference and this is the side of it that costs.
 
 The transient publish figure is the one to read carefully: with confirms off
 there is nothing to wait for, so it measures how fast a broker takes messages
@@ -1023,21 +1064,21 @@ Twenty thousand publishes and then one `Queue.Declare` was enough. Two inboxes
 rather than one, and an offer to send made in the same breath as a readiness
 to receive, is the fix — `am_hand` and `am_wait` in `src/amqp_serve.rill`.
 
-### Why delivery is only two thirds ahead
+### Why delivery is only half as much again
 
-Publishing is four times RabbitMQ's rate and delivery is not, and the reason
-is that they are not the same kind of measurement. A publish is one way: the
+Publishing is three times RabbitMQ's rate and delivery is half as much again,
+and the reason is that they are not the same kind of measurement. A publish is one way: the
 client writes and the broker absorbs, and the number says how fast the broker
 absorbs. A delivery is a round: the broker writes, the client's own consumer
 dispatch takes it apart and hands it to a thread, and an acknowledgement goes
-back. Two thirds of that is the client's, and the client is the same one in
+back. Most of that is the client's, and the client is the same one in
 both columns, so it flattens the ratio.
 
 Acknowledging is what most of the cost is, and both brokers pay it in the same
 proportion. With the acknowledgements taken out — `no-ack`, where the client
-says it will not answer for what it is given — RillMQ goes from 265,000 to
-470,000 and RabbitMQ from 160,000 to 285,000. Each roughly doubles, so the
-ratio is what it was: the acknowledgement is not where RillMQ's advantage goes.
+says it will not answer for what it is given — both roughly double, so the
+ratio is what it was: the acknowledgement is not where RillMQ's advantage
+goes.
 
 With no journal and no acknowledgements the broker holds 568,000/sec, and does
 it three runs in a row within half a per cent of itself. A number that stable
@@ -1191,14 +1232,16 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 52 checks through RabbitMQ's own .NET client
-sh test/deleted.sh           # 5 checks on the routing table across restarts
+sh test/amqp.sh              # 72 checks through RabbitMQ's own .NET client
+sh test/deleted.sh           # 9 checks on what survives a restart and what does not
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
-sh test/secure.sh            # 9 checks of passwords and TLS
-sh test/manage.sh            # 15 checks of the management pages
+sh test/secure.sh            # 14 checks of passwords, TLS and certificates
+sh test/vhosts.sh            # 10 checks of virtual hosts and rights
+sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
 sh test/majority.sh          # 5 checks across three
 sh test/handover.sh          # 5 checks with clients working, and with none at all
+sh test/catchup.sh           # 7 checks on a node that fell behind and caught up
 sh test/failover.sh          # 8 checks, one node killed with nobody watching
 ```
 
@@ -1210,7 +1253,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and thirty-six of them pass, with or without a journal.
+All hundred and eighty-four of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1224,9 +1267,11 @@ All hundred and thirty-six of them pass, with or without a journal.
   each, and the record that goes to the file is built on the way there. So it
   costs a list rather than the queue's data twice over — but it is still a
   list of everything live, made in one go.
-- **An election is one round.** One ask, one majority, one turn — there is no
-  second phase and no log to reconcile, which is what makes a candidate that
-  is behind a candidate that stays behind.
+- **An election is one round.** One ask, one majority, one turn. There is no
+  second phase, and a leader that is out-termed is never told: it goes on
+  holding the queue until somebody asks it something. What keeps two of them
+  from both winning is that only the lowest-numbered node that is still there
+  stands at all, which is a rule rather than a proof.
 - **A node watches only what it is holding a copy of.** That is the only list
   of other nodes' queues it has, so a queue nobody has published to yet is a
   queue nobody is watching over. It has nothing in it, which is why this is
