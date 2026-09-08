@@ -352,6 +352,36 @@ which is what the proxy already did when a link came back.
 one node while the node that owns the queue is killed underneath them. Three
 messages published, three received, no error seen by either.
 
+### What a cluster costs
+
+Two nodes, the same client publishing twenty thousand messages five hundred
+deep, three runs of each:
+
+| | |
+|---|---:|
+| one node, with a journal | 60,000/sec |
+| clustered, a queue this node holds | 28,700/sec |
+| clustered, a queue another node holds | 28,800/sec |
+
+The two clustered figures being the same is the finding. This section used to
+say a proxy asked one thing at a time, so a queue's traffic across a link was
+a round trip deep rather than a pipeline — and that was simply wrong. `cl_ask`
+sends and `cl_wait` puts the answer it is owed on a list; nothing waits. Six
+runs could not tell the two columns apart, and reading the code says why they
+would not.
+
+What clustering does cost is half, and that is replication rather than
+distance: every batch goes to every copy and onto a disk there before anybody
+is told anything is safe. It is the same cost whichever node a client happens
+to be talking to, which is what the numbers say and is the useful thing to
+know when choosing where to point a publisher: it does not matter.
+
+Buffering the writes on the cluster links was tried, since that was worth
+forty per cent on a connection's own writer. It is worth nothing here — 28,700
+against 29,200 across six runs, inside the spread — because what these links
+wait for is a disk at the far end rather than a system call at this one. The
+change was made, measured, and taken out again.
+
 ### Noticing without being asked
 
 Until there were heartbeats nothing noticed a node was gone until somebody
@@ -1050,9 +1080,6 @@ All hundred and twenty-seven of them pass, with or without a journal.
   line, in the same order on every node, and nothing joins or leaves while it
   is running. Peers are addresses, because Rill's sockets have no name
   resolution.
-- **A proxy asks one thing at a time.** A queue standing in for a remote one
-  waits for each answer before sending the next question, so one queue's
-  traffic across a link is a round trip deep rather than a pipeline.
 - **The routing journal is never rewritten.** It gains a record per binding
   made and per binding taken away, and nothing ever shortens it. A queue's
   journal is compacted; this one is not, on the grounds that a table which
