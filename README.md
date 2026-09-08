@@ -522,6 +522,18 @@ routing key is a queue name, and a connection goes straight to that queue — no
 hop, no bindings, nothing to look up. That is the path most messages take and
 it costs what it costs; named exchanges are the ones with something to decide.
 
+**And it is rewritten.** The routing journal gained a record per binding made
+and per binding taken away and nothing ever shortened it, so a table that
+changed often was a file that only grew. It is compacted the same way a
+queue's journal is, by the same mechanism: the journal decides most of what it
+holds has been undone and asks for the table as it stands, and whoever owns
+that answers. For a queue that is the queue; here it is the registry, which
+asks each exchange for its own bindings — until it listened for the question,
+the journal asked and asked and nobody replied.
+
+Three thousand bind-and-unbind pairs took the file to 152 KB and then back
+down to 51 KB, and what is in it after a restart is the table as it stood.
+
 **The table is written down.** Exchanges and bindings go into `_routes.log`,
 the same journal a queue's messages go into — the same record, the same
 checksum, the same rule about what follows a record that does not add up —
@@ -693,6 +705,7 @@ answering those would be answering questions asked of a channel that is gone.
 | publishing to or binding an exchange nobody declared | 404 | `no exchange ... in vhost /` |
 | consuming, getting from or binding a queue nobody declared | 404 | `no queue ... in vhost /` |
 | deleting a queue that fails its own `if-unused` or `if-empty` | 406 | `queue ... is in use or not empty` |
+| deleting an exchange that fails its `if-unused` | 406 | `exchange ... still has something bound to it` |
 
 Each of those used to be silence, and silence is the worst of the three
 answers a broker can give. A client calling `Queue.Purge` waited for a reply
@@ -1100,7 +1113,7 @@ rill build test/bench.rill  -o rillmq-bench
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
 sh test/amqp.sh              # 52 checks through RabbitMQ's own .NET client
-sh test/deleted.sh           # 3 checks that a deleted exchange stays deleted
+sh test/deleted.sh           # 5 checks on the routing table across restarts
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
@@ -1118,7 +1131,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and thirty-four of them pass, with or without a journal.
+All hundred and thirty-six of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1151,10 +1164,6 @@ All hundred and thirty-four of them pass, with or without a journal.
   line, in the same order on every node, and nothing joins or leaves while it
   is running. Peers are addresses, because Rill's sockets have no name
   resolution.
-- **The routing journal is never rewritten.** It gains a record per binding
-  made and per binding taken away, and nothing ever shortens it. A queue's
-  journal is compacted; this one is not, on the grounds that a table which
-  changes as often as messages arrive is not a routing table.
 - **In a cluster, only the node that owns a queue can say it is not there.**
   A queue somebody else holds is one this node has no way to ask about without
   a round trip it does not owe, so it answers with a stand-in and lets the
@@ -1174,11 +1183,10 @@ All hundred and thirty-four of them pass, with or without a journal.
   client that wrote `{"count", 3}` on both sides gets and is right; a nested
   table or an array in either is skipped rather than compared, so a binding
   that mentions one matches nothing.
-- **`Exchange.Delete` reads `if-unused` and does not honour it.** The queue's
-  two conditions are honoured; the exchange's one is not, so deleting an
-  exchange something is still bound to takes the bindings with it.
-- **`durable` is not a choice.** Every exchange and every binding is written
-  down, whatever the flag said, exactly as every queue is.
+- **`durable` is not a choice.** Every queue, exchange and binding is written
+  down, whatever the flag said. A client that asked for a temporary queue gets
+  a permanent one, which is the safe direction to be wrong in and still the
+  wrong answer.
 - **One virtual host, and one permission.** `Connection.Open` takes whatever
   virtual host it is given. A name and a word are checked; what that person
   may then do is not, beyond a tag the management pages read.

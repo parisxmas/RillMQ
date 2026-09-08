@@ -117,6 +117,43 @@ class Program
             return 0;
         }
 
+        // `churn <n>` binds and unbinds the same queue n times. Every one of
+        // those is a record in the routing journal and none of them survives,
+        // so the file is a measure of how much a table that changes leaves
+        // behind.
+        if (args.Length > 2 && args[1] == "churn")
+        {
+            var chf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var chc = chf.CreateConnection();
+            using var chm = chc.CreateModel();
+            chm.ExchangeDeclare("churn-x", "direct", true);
+            chm.QueueDeclare("churn-q", true, false, false, null);
+            int rounds = int.Parse(args[2]);
+            for (int i = 0; i < rounds; i++)
+            {
+                chm.QueueBind("churn-q", "churn-x", "k");
+                chm.QueueUnbind("churn-q", "churn-x", "k");
+            }
+            Thread.Sleep(1500);
+            Console.WriteLine("churned " + rounds);
+            return 0;
+        }
+
+        // `unrouted <exchange> <key>` says whether a mandatory publish came
+        // back, which is how to ask whether anything is bound without asking
+        // the broker to list its bindings.
+        if (args.Length > 3 && args[1] == "unrouted")
+        {
+            var uf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var uc = uf.CreateConnection();
+            using var um = uc.CreateModel();
+            var returns = new BlockingCollection<string>();
+            um.BasicReturn += (_, e) => returns.Add("came back");
+            um.BasicPublish(args[2], args[3], true, null, Encoding.UTF8.GetBytes("x"));
+            Console.WriteLine(returns.TryTake(out var u, 4000) ? u : "went somewhere");
+            return 0;
+        }
+
         // `tls` connects over AMQPS and says whether it got in. The
         // certificate is one RillMQ made for itself, so the name is checked
         // and the chain is not: this says TLS works, not that a self-signed

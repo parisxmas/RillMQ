@@ -21,8 +21,11 @@ type XReq
   XUnbind(queue: Str, key: Str, reply: Chan(Int))
   # The end of this exchange. Its bindings go with it, and the routing journal
   # is told so that a restart does not bring back what somebody deleted.
-  XStop(quiet: Bool, reply: Chan(Int))
+  XStop(quiet: Bool, if_unused: Bool, reply: Chan(Int))
   XKind(reply: Chan(Str))
+  # This exchange as records: what it is, and each of its bindings. It is what
+  # a rewritten routing journal is made of, and only this strand knows it.
+  XRecords(reply: Chan(List(Str)))
 
 fn x_direct() = "direct"
 
@@ -44,24 +47,38 @@ fn x_loop(x: X, inbox, done) =
 
 # Replay must not write the record it is reading, which is the whole of what
 # `quiet` means here and everywhere else in this broker.
+# `if-unused` is a client saying it wants the exchange gone only if nothing is
+# bound to it. One that is refuses, with -2 — not a count, as -1 is not, for a
+# name nobody has.
+fn x_asked_to_stop(x: X, quiet, if_unused, reply) =
+  if if_unused && len(x.binds) > 0 then x_stays(x, reply) else x_goes(x, quiet, reply)
+
+fn x_stays(x: X, reply) =
+  send(reply, -2)
+  Some(x)
+
+fn x_goes(x: X, quiet, reply) =
+  send(reply, len(x.binds))
+  x_forget(x, quiet)
+  None
+
 fn x_forget(x: X, quiet) =
   if quiet then 0 else x_note(x, rt_gone_record(x.name))
   0
 
 fn x_is_stop(r) = match r
-  XStop(quiet, reply) -> true
+  XStop(quiet, if_unused, reply) -> true
   XKind(reply) -> false
+  XRecords(reply) -> false
   XPub(key, body, props, out, back) -> false
   XBind(queue, key, ch, quiet, reply) -> false
   XUnbind(queue, key, reply) -> false
 
 fn x_over(x: X, r) = match r
-  XStop(quiet, reply) ->
-    send(reply, len(x.binds))
-    x_forget(x, quiet)
-    None
+  XStop(quiet, if_unused, reply) -> x_asked_to_stop(x, quiet, if_unused, reply)
   XPub(key, body, props, out, back) -> Some(x)
   XKind(reply) -> Some(x)
+  XRecords(reply) -> Some(x)
   XBind(queue, key, ch, quiet, reply) -> Some(x)
   XUnbind(queue, key, reply) -> Some(x)
 
@@ -72,9 +89,12 @@ fn x_handle(x: X, r) = match r
   XBind(queue, key, ch, quiet, reply) ->
     send(reply, 1)
     if x_bound(x.binds, queue, key) then x else x_add(x, queue, key, ch, quiet)
-  XStop(quiet, reply) -> x
+  XStop(quiet, if_unused, reply) -> x
   XKind(reply) ->
     send(reply, x.kind)
+    x
+  XRecords(reply) ->
+    send(reply, Cons(rt_x_record(x.name, x.kind), x_bind_records(x, x.binds)))
     x
   XUnbind(queue, key, reply) ->
     send(reply, 1)
@@ -109,6 +129,12 @@ fn x_without(binds, queue, key) = match binds
 fn x_route(x: X, binds, key, acc) = match binds
   Nil -> acc
   Cons(b, rest) -> x_route(x, rest, key, if x_takes(x.kind, x_bind_key(b), key) then Cons(x_bind_ch(b), acc) else acc)
+
+fn x_bind_records(x: X, binds) = match binds
+  Nil -> Nil
+  Cons(b, rest) -> Cons(rt_bind_record(x.name, x_bind_queue(b), x_bind_key(b)), x_bind_records(x, rest))
+
+fn x_bind_queue(b: Bind) = b.queue
 
 fn x_bind_key(b: Bind) = b.key
 

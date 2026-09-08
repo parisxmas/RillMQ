@@ -601,7 +601,7 @@ fn am_forget_on(am: Am, tags, chan) = match tags
 # `Exchange.Declare` names an exchange and says what kind it is. The kind is
 # the third field: past the reserved short, past the name.
 fn am_exchange_method(am: Am, chan, method, payload) =
-  if method == 20 then am_delete_exchange(am, chan, a_get_shortstr(payload, am_after_reserved()))
+  if method == 20 then am_delete_exchange(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved())))
   else if method != 10 then am_no_method(am, chan, a_class_exchange(), method)
   else
     at = a_after_shortstr(payload, am_after_reserved())
@@ -611,13 +611,16 @@ fn am_exchange_method(am: Am, chan, method, payload) =
 # `Exchange.Delete` takes its bindings with it and writes a record saying so,
 # because a restart replays the routing journal and would otherwise bring back
 # what somebody deleted.
-fn am_delete_exchange(am: Am, chan, name) =
+fn am_delete_exchange(am: Am, chan, name, bits) =
   back = channel(1)
-  send(am.reg, RDropExchange(name, false, back))
+  send(am.reg, RDropExchange(name, false, bit_and(bits, am_if_unused()) != 0, back))
   am_deleted_exchange(am, chan, name, recv(back))
 
 fn am_deleted_exchange(am: Am, chan, name, n) =
-  if n < 0 then am_no_exchange(am, chan, name, 20) else am_answer(am, am_exchange_delete_ok(chan))
+  if n == -1 then am_no_exchange(am, chan, name, 20) else if n < 0 then am_exchange_in_use(am, chan, name) else am_answer(am, am_exchange_delete_ok(chan))
+
+fn am_exchange_in_use(am: Am, chan, name) =
+  am_refuse(am, chan, am_precondition(), "exchange `" + name + "` still has something bound to it", a_class_exchange(), 20)
 
 fn am_exchange(am: Am, name, kind) =
   back = channel(1)

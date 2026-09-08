@@ -37,6 +37,19 @@ wait "$BROKER" 2>/dev/null
 start
 say "it is still gone after a restart" "$(client xdel gone orders-x)" "404"
 
+# The routing journal used to grow a record per binding made and per binding
+# taken away, with nothing ever shortening it. A table that changes as often as
+# this one does is a file that only ever got bigger.
+before=$(wc -c < "$D/d/_routes.log" 2>/dev/null || echo 0)
+client churn 3000 >/dev/null
+after=$(wc -c < "$D/d/_routes.log" 2>/dev/null || echo 0)
+say "churning bindings does not grow the journal without bound" "$([ "$after" -lt 200000 ] && echo small || echo "$after")" "small"
+
+kill -TERM "$BROKER" 2>/dev/null
+wait "$BROKER" 2>/dev/null
+start
+say "and what is left after a restart is the table as it stood" "$(client unrouted churn-x k)" "came back"
+
 kill -TERM "$BROKER" 2>/dev/null
 sleep 0.3
 printf '\n%d of %d passed\n' "$PASS" "$((PASS + FAIL))"

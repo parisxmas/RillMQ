@@ -150,7 +150,7 @@ fn apply_route(reg, r) = match r
 
 fn b_drop_exchange(reg, name) =
   back = channel(1)
-  send(reg, RDropExchange(name, true, back))
+  send(reg, RDropExchange(name, true, false, back))
   recv(back)
 
 fn b_exchange_of(reg, name, kind) =

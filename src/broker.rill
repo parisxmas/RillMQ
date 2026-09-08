@@ -40,7 +40,7 @@ type RReq
   # Deleting one of each. The reply is how much was in it, which is what AMQP
   # answers a `Queue.Delete` with, and -1 for a name that was not there.
   RDropQueue(name: Str, if_unused: Bool, if_empty: Bool, reply: Chan(Int))
-  RDropExchange(name: Str, quiet: Bool, reply: Chan(Int))
+  RDropExchange(name: Str, quiet: Bool, if_unused: Bool, reply: Chan(Int))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
   # The same numbers as `RRows`, as numbers rather than as the lines this
@@ -134,10 +134,33 @@ fn r_run(dir, inbox, done) =
 fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, inbox, done) =
   step = select
     r = recv(inbox) -> Some(r_handle(qs, xs, cs, mine, ts, ld, g, r, done))
+    recv(g.jr.want) -> Some(r_hand_over(xs, g))
     recv(done) -> None
   match step
     None -> 0
     Some(_) -> r_loop(qs, xs, cs, mine, ts, ld, g, inbox, done)
+
+# The routing journal has decided that most of what it holds has been undone,
+# and asks for the table as it stands. A queue answers the same question about
+# its messages; this is the same mechanism with the same shape, and until the
+# registry listened for it the journal asked and asked and nobody replied — so
+# a table that changed often grew a file that nothing ever shortened.
+#
+# Only the exchanges know their own bindings, so this asks each of them.
+fn r_hand_over(xs: Map(Str, Chan(XReq)), g: Reg) =
+  send(g.jr.puts, JRewriteReq(r_all_records(xs, map_keys(xs), Nil), rt_file()))
+  0
+
+fn r_all_records(xs: Map(Str, Chan(XReq)), ks, acc) = match ks
+  Nil -> acc
+  Cons(k, rest) -> match xs[k]
+    None -> r_all_records(xs, rest, acc)
+    Some(ch) -> r_all_records(xs, rest, append(acc, r_records_of(ch)))
+
+fn r_records_of(ch) =
+  back = channel(1)
+  send(ch, XRecords(back))
+  recv(back)
 
 fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, r, done) = match r
   RFind(name, reply) ->
@@ -152,8 +175,8 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RDropQueue(name, if_unused, if_empty, reply) ->
     send(reply, r_drop_queue(qs, mine, g.dir, name, if_unused, if_empty))
     0
-  RDropExchange(name, quiet, reply) ->
-    send(reply, r_drop_exchange(xs, name, quiet))
+  RDropExchange(name, quiet, if_unused, reply) ->
+    send(reply, r_drop_exchange(xs, name, quiet, if_unused))
     0
   RKindOf(name, reply) ->
     send(reply, r_kind_of(xs, name))
@@ -309,12 +332,17 @@ fn r_unlink(dir, name) =
 # The same for an exchange, except that what it answers with is how many
 # bindings went with it. `quiet` is replay, which must not write the record it
 # is reading.
-fn r_drop_exchange(xs: Map(Str, Chan(XReq)), name, quiet) = match xs[name]
+fn r_drop_exchange(xs: Map(Str, Chan(XReq)), name, quiet, if_unused) = match xs[name]
   None -> -1
   Some(ch) ->
     back = channel(1)
-    send(ch, XStop(quiet, back))
-    n = recv(back)
+    send(ch, XStop(quiet, if_unused, back))
+    r_dropped_x(xs, name, recv(back))
+
+# One that refused is still there, so nothing is forgotten.
+fn r_dropped_x(xs: Map(Str, Chan(XReq)), name, n) =
+  if n < 0 then n
+  else
     map_del(xs, name)
     n
 
