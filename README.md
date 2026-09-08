@@ -395,6 +395,29 @@ against 29,200 across six runs, inside the spread — because what these links
 wait for is a disk at the far end rather than a system call at this one. The
 change was made, measured, and taken out again.
 
+### How long it takes to come back
+
+Starting up reads every record still in the journal, which sounds like the
+kind of thing that becomes a wall. Measured, it is not one — a queue with
+messages in it, killed, started again, timed from `exec` to the first answer:
+
+| messages waiting | journal | ready after |
+|---:|---:|---:|
+| none | — | 0.03s |
+| 500,000 | 40 MB | 0.14s |
+| 2,000,000 | 160 MB | 0.68s |
+| 4,000,000 | 320 MB | 1.48s |
+
+It is a straight line at about two and a half million records a second, so ten
+million would be four seconds and a hundred million would be forty. A
+snapshot would fix the second of those and nothing has needed it yet. Nothing
+here was changed; this is only what it does, written down, because "reads
+every record to start" reads as a warning and 0.68 seconds is not one.
+
+The compaction is what keeps it honest: what is read is what is still in the
+queue, not everything that ever passed through it. A queue that has taken a
+billion messages and been kept empty starts in the time the empty row shows.
+
 ### Noticing without being asked
 
 Until there were heartbeats nothing noticed a node was gone until somebody
@@ -1100,8 +1123,9 @@ All hundred and thirty of them pass, with or without a journal.
 
 - **Replay is one pass and no more.** Starting up reads every journal from the
   front. A rewrite keeps that bounded by the size of the queue rather than by
-  its history, but there is no snapshot and no index, so a broker holding ten
-  million messages reads ten million records to start.
+  its history, so what is read is what is still there — but there is no
+  snapshot and no index, and a queue big enough will eventually make that
+  matter. It is further off than it sounds; the numbers are two sections up.
 - **A rewrite holds the whole live queue as records at once.** The queue builds
   them and hands them over as a list, which for a large queue is a second copy
   of it in memory for as long as the write takes.
