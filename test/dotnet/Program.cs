@@ -92,6 +92,31 @@ class Program
             return 0;
         }
 
+        // `cancelnotify` on its own, so the same question can be put to
+        // RabbitMQ and to RillMQ and the answers compared.
+        if (args.Length > 1 && args[1] == "cancelnotify")
+        {
+            var nf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var nc = nf.CreateConnection();
+            using var nm = nc.CreateModel();
+            string cnq = "cancel-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            nm.QueueDeclare(cnq, true, false, false, null);
+            var told = new BlockingCollection<string>();
+            var ncons = new EventingBasicConsumer(nm);
+            // `Unregistered` is the answer to a cancel this client asked for.
+            // A cancel the *broker* sends arrives as `ConsumerCancelled`.
+            ncons.ConsumerCancelled += (_, e) => told.Add("cancelled");
+            nm.BasicConsume(cnq, true, ncons);
+            Thread.Sleep(500);
+            // From another connection, because a broker has no reason to tell
+            // the connection that asked for the deletion anything it does not
+            // already know — and RabbitMQ does not.
+            using (var other = nf.CreateConnection())
+            using (var om = other.CreateModel()) om.QueueDelete(cnq);
+            Console.WriteLine(told.TryTake(out var w2, 4000) ? w2 : "(nothing)");
+            return 0;
+        }
+
         // `tls` connects over AMQPS and says whether it got in. The
         // certificate is one RillMQ made for itself, so the name is checked
         // and the chain is not: this says TLS works, not that a self-signed
@@ -488,6 +513,38 @@ class Program
             ch.QueueDeclare(hAll, true, false, false, null).MessageCount, 1u);
         Check("and x-match any wants one of them to",
             ch.QueueDeclare(hAny, true, false, false, null).MessageCount, 3u);
+
+        // `if-unused` and `if-empty` were read off the wire and ignored, so a
+        // client that asked for a queue to go only if it was empty got it gone
+        // either way — the wrong answer to a question it was right to ask.
+        string dq2 = q + "-conditional";
+        ch.QueueDeclare(dq2, true, false, false, null);
+        ch.BasicPublish("", dq2, null, Encoding.UTF8.GetBytes("in the way"));
+        Thread.Sleep(400);
+        Check("a queue with something in it refuses if-empty",
+            refused(m => m.QueueDelete(dq2, false, true)).Split(' ')[0], "406");
+        Check("and is still there afterwards",
+            ch.QueueDeclare(dq2, true, false, false, null).MessageCount, 1u);
+        Check("but goes when nothing is asked of it", ch.QueueDelete(dq2, false, false), 1u);
+
+        // And a consumer reading a queue that is deleted is told, rather than
+        // left waiting on something that will never speak again.
+        string goneq = q + "-cancelled";
+        ch.QueueDeclare(goneq, true, false, false, null);
+        using (var cm = conn.CreateModel())
+        {
+            var told = new BlockingCollection<string>();
+            var cc = new EventingBasicConsumer(cm);
+            cc.ConsumerCancelled += (_, e) => told.Add("cancelled");
+            cm.BasicConsume(goneq, true, cc);
+            Thread.Sleep(500);
+            cm.QueueDelete(goneq);
+            var why = "";
+            cm.ModelShutdown += (_, e) => why = e.ReplyCode + " " + e.ReplyText;
+            var saw = told.TryTake(out var t2, 4000) ? t2 : "(nothing)";
+            Check("a consumer is told its queue has gone",
+                saw + (saw == "cancelled" ? "" : " open=" + cm.IsOpen + " " + why), "cancelled");
+        }
 
         // A channel is where a refusal lands. Each of these used to be
         // silence: the client waited for a reply that was never coming, or

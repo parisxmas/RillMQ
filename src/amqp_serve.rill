@@ -194,6 +194,7 @@ fn am_step(am: Am, ses, gone, m) = match m
 fn am_from_queue(am: Am, what) = match what
   ODeliver(queue, id, body, props, sub) -> am_send_delivery(am, queue, id, body, props, sub)
   ONoRoute(exchange, key, body, props, chan) -> am_hand_back(am, chan, exchange, key, body, props)
+  OCancelled(queue, sub) -> am_tell_cancelled(am, sub)
   OPublished(queue, id) -> am_confirm(am)
   OFrame(text) -> am
 
@@ -424,6 +425,14 @@ fn am_basic_consume_ok(chan, tag) =
   a_shortstr(b, tag)
   am_method(chan, a_class_basic(), 21, strbuf_str(b))
 
+# `Basic.Cancel` from the server rather than to it: the queue this consumer
+# was reading has gone.
+fn am_basic_cancel(chan, tag) =
+  b = strbuf()
+  a_shortstr(b, tag)
+  a_u8(b, 0)
+  am_method(chan, a_class_basic(), 30, strbuf_str(b))
+
 fn am_basic_cancel_ok(chan, tag) =
   b = strbuf()
   a_shortstr(b, tag)
@@ -631,7 +640,7 @@ fn am_args() = 4
 fn am_after_reserved() = 6
 
 fn am_queue_method(am: Am, chan, method, payload) =
-  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 40 then am_delete_queue(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
+  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 40 then am_delete_queue(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
 
 # `Queue.Purge` throws away what is waiting and answers with how much that
 # was. It is `DRAIN` on RillMQ's own protocol, and the same request underneath.
@@ -647,20 +656,35 @@ fn am_purging(am: Am, chan, qh) =
 # `Queue.Delete` ends the queue: its strand returns, its journal stops, and
 # the file goes. The `if-unused` and `if-empty` flags are read and not
 # honoured — see the last section of the README.
-fn am_delete_queue(am: Am, chan, queue) =
+# The bits after the name: the first says delete it only if nobody is reading
+# it, the second only if nothing is in it. They were read and ignored, so a
+# client that asked for a queue to go only if it was empty got it gone either
+# way — the wrong answer to a question it was right to ask.
+fn am_if_unused() = 1
+
+fn am_if_empty() = 2
+
+fn am_delete_queue(am: Am, chan, queue, bits) =
   back = channel(1)
-  send(am.reg, RDropQueue(queue, back))
+  send(am.reg, RDropQueue(queue, bit_and(bits, am_if_unused()) != 0, bit_and(bits, am_if_empty()) != 0, back))
   am_deleted_queue(am, chan, queue, recv(back))
 
 fn am_deleted_queue(am: Am, chan, queue, n) =
-  if n < 0 then am_no_queue(am, chan, queue, 40) else am_answer(am_forgot_queue(am, queue), am_queue_delete_ok(chan, n))
+  if n == -1 then am_no_queue(am, chan, queue, 40) else if n < 0 then am_queue_in_use(am, chan, queue) else am_answer(am_forgot_queue(am, queue), am_queue_delete_ok(chan, n))
 
-# Whatever this connection was reading from it is reading from nothing now.
+fn am_queue_in_use(am: Am, chan, queue) =
+  am_refuse(am, chan, am_precondition(), "queue `" + queue + "` is in use or not empty", a_class_queue(), 40)
+
+# Whatever this connection was reading from it is reading from nothing now,
+# and it is told so here rather than waiting for the queue to say it. The
+# queue does say it — that is what reaches consumers on other connections —
+# but by the time that arrives this session has already forgotten the tag, and
+# a cancellation naming a tag nobody remembers names nothing.
 fn am_forgot_queue(am: Am, queue) = am_forget_all_on(am, map_keys(am.consumers), queue)
 
 fn am_forget_all_on(am: Am, tags, queue) = match tags
   Nil -> am
-  Cons(t, rest) -> am_forget_all_on(if str_cmp(map_or(am.consumers, t, ""), queue) == 0 then am_dropped(am, t) else am, rest, queue)
+  Cons(t, rest) -> am_forget_all_on(if str_cmp(map_or(am.consumers, t, ""), queue) == 0 then am_cancelled_here(am, t, map_or(am.where, t, 1)) else am, rest, queue)
 
 # `Queue.Unbind` is the same three names as `Queue.Bind`, undone. The exchange
 # already understood it — a replayed journal has always been able to ask —
@@ -948,6 +972,17 @@ fn am_told(am: Am, tag) =
 # A message the queue handed over. The tag counting deliveries on this
 # connection is minted here, and what it stands for is remembered until the
 # client says it is done with it.
+# The consumer is told and then forgotten, in that order: after this the tag
+# means nothing, so the frame that names it has to go first.
+fn am_tell_cancelled(am: Am, sub) = am_cancel_tag(am, map_or(am.serving, sub, ""))
+
+fn am_cancel_tag(am: Am, tag) =
+  if str_len(tag) == 0 then am else am_cancelled_here(am, tag, map_or(am.where, tag, 1))
+
+fn am_cancelled_here(am: Am, tag, chan) =
+  am_say(am, am_basic_cancel(chan, tag))
+  am_dropped(am, tag)
+
 fn am_send_delivery(am: Am, queue, id, body, props, sub) =
   am.whose[am.tag] = queue
   am.which[am.tag] = id
@@ -991,6 +1026,7 @@ fn am_one(am: Am, chan, queue, what) = match what
   OFrame(text) -> am_answer(am, am_basic_get_empty(chan))
   OPublished(q, id) -> am_answer(am, am_basic_get_empty(chan))
   ONoRoute(exchange, key, body, props, on) -> am_answer(am, am_basic_get_empty(chan))
+  OCancelled(queue, sub) -> am_answer(am, am_basic_get_empty(chan))
   ODeliver(q, id, body, props, sub) ->
     back = channel(1)
     sent = am_hand(am, am_queue(am, queue), QAck(id, back))

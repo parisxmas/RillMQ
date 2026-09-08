@@ -39,7 +39,7 @@ type RReq
   RFindIf(name: Str, reply: Chan(Option(Chan(QReq))))
   # Deleting one of each. The reply is how much was in it, which is what AMQP
   # answers a `Queue.Delete` with, and -1 for a name that was not there.
-  RDropQueue(name: Str, reply: Chan(Int))
+  RDropQueue(name: Str, if_unused: Bool, if_empty: Bool, reply: Chan(Int))
   RDropExchange(name: Str, quiet: Bool, reply: Chan(Int))
   RTotals(reply: Chan(Totals))
   RRows(reply: Chan(List(Str)))
@@ -149,8 +149,8 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RFindIf(name, reply) ->
     send(reply, r_known(qs, mine, g.dir, g.self, name, done))
     0
-  RDropQueue(name, reply) ->
-    send(reply, r_drop_queue(qs, mine, g.dir, name))
+  RDropQueue(name, if_unused, if_empty, reply) ->
+    send(reply, r_drop_queue(qs, mine, g.dir, name, if_unused, if_empty))
     0
   RDropExchange(name, quiet, reply) ->
     send(reply, r_drop_exchange(xs, name, quiet))
@@ -280,12 +280,18 @@ fn r_ask_kind(ch) =
   send(ch, XKind(back))
   recv(back)
 
-fn r_drop_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name) = match qs[name]
+fn r_drop_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, if_unused, if_empty) = match qs[name]
   None -> -1
   Some(ch) ->
     back = channel(1)
-    send(ch, QStop(back))
-    held = recv(back)
+    send(ch, QStop(if_unused, if_empty, back))
+    r_dropped(qs, mine, dir, name, recv(back))
+
+# A queue that refused the conditions is still there, so nothing is forgotten
+# and nothing is unlinked.
+fn r_dropped(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, held) =
+  if held < 0 then held
+  else
     map_del(qs, name)
     map_del(mine, name)
     r_unlink(dir, name)
@@ -543,6 +549,9 @@ fn b_bytes(what) = match what
   ODeliver(queue, id, body, props, sub) -> w_msg(id, queue, body)
   # This protocol has no `mandatory` and so never asks for one of these.
   ONoRoute(exchange, key, body, props, chan) -> ""
+  # This protocol has no way of saying it, and a subscriber on it finds out
+  # the next time it asks.
+  OCancelled(queue, sub) -> ""
   OPublished(queue, id) -> w_ok_id(id)
 
 fn b_next(out, done) =

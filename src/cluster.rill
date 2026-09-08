@@ -262,7 +262,7 @@ fn cl_say_no(r) = match r
     send(reply, 0)
     0
   QPoke -> 0
-  QStop(reply) ->
+  QStop(if_unused, if_empty, reply) ->
     send(reply, 0)
     0
 
@@ -540,7 +540,7 @@ fn cl_ask(p: P, r) = match r
   QPoke -> p
   # A stand-in cannot delete somebody else's queue, and saying so is better
   # than pretending: the count is -1, which is what a name nobody has answers.
-  QStop(reply) ->
+  QStop(if_unused, if_empty, reply) ->
     send(reply, -1)
     p
 

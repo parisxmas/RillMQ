@@ -692,6 +692,7 @@ answering those would be answering questions asked of a channel that is gone.
 | a consumer tag already in use | 406 | `consumer tag ... is already in use` |
 | publishing to or binding an exchange nobody declared | 404 | `no exchange ... in vhost /` |
 | consuming, getting from or binding a queue nobody declared | 404 | `no queue ... in vhost /` |
+| deleting a queue that fails its own `if-unused` or `if-empty` | 406 | `queue ... is in use or not empty` |
 
 Each of those used to be silence, and silence is the worst of the three
 answers a broker can give. A client calling `Queue.Purge` waited for a reply
@@ -1098,7 +1099,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 48 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 52 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 3 checks that a deleted exchange stays deleted
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 9 checks of passwords and TLS
@@ -1117,7 +1118,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and thirty of them pass, with or without a journal.
+All hundred and thirty-four of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1173,15 +1174,9 @@ All hundred and thirty of them pass, with or without a journal.
   client that wrote `{"count", 3}` on both sides gets and is right; a nested
   table or an array in either is skipped rather than compared, so a binding
   that mentions one matches nothing.
-- **`Queue.Delete` and `Exchange.Delete` read their conditions and do not
-  honour them.** `if-unused`, `if-empty` and `if-unused` again are parsed off
-  the wire and ignored, so a delete always deletes. A client that asked for a
-  queue to go only if it was empty gets it gone either way, which is the
-  wrong answer to a question it was right to ask.
-- **Deleting a queue does not tell its consumers.** AMQP says they get a
-  `Basic.Cancel`; here the connection that asked has its own consumers
-  forgotten, and a consumer on another connection is left holding a
-  subscription to a queue that has stopped.
+- **`Exchange.Delete` reads `if-unused` and does not honour it.** The queue's
+  two conditions are honoured; the exchange's one is not, so deleting an
+  exchange something is still bound to takes the bindings with it.
 - **`durable` is not a choice.** Every exchange and every binding is written
   down, whatever the flag said, exactly as every queue is.
 - **One virtual host, and one permission.** `Connection.Open` takes whatever

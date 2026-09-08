@@ -77,7 +77,7 @@ type QReq
   # strand returns, which is the only way one of these ever stops short of the
   # broker stopping. Its journal is told to stop too: nothing else is watching
   # for the end of one queue.
-  QStop(reply: Chan(Int))
+  QStop(if_unused: Bool, if_empty: Bool, reply: Chan(Int))
 
 # How long a message may be out before the queue decides the consumer is not
 # coming back with an answer. Five seconds unless the second argument on the
@@ -198,8 +198,35 @@ fn q_turn(q: Q, inbox, done, g: Guard) =
     None -> 0
     Some(next) -> q_turn(next, inbox, done, q_look(g))
 
+# `if-unused` and `if-empty` are a client saying it wants the queue gone only
+# if nobody is reading it, or only if nothing is in it. A queue that does not
+# meet them stays and says so with -2, which is not a count and cannot be
+# mistaken for one — as -1 is not, for a name nobody has.
+fn q_refused() = -2
+
+fn q_asked_to_stop(q: Q, if_unused, if_empty, reply) =
+  if if_unused && len(q.subs) > 0 || if_empty && q.tail - q.head + #q.inflight > 0 then q_stays(q, reply) else q_goes(q, reply)
+
+fn q_stays(q: Q, reply) =
+  send(reply, q_refused())
+  Some(q)
+
+# Everyone reading it is told before it goes. A consumer waiting on a queue
+# that has stopped is a consumer waiting for ever.
+fn q_goes(q: Q, reply) =
+  send(reply, q.tail - q.head + #q.inflight)
+  q_tell_gone(q, q.subs)
+  send(q.jr.puts, JStop)
+  None
+
+fn q_tell_gone(q: Q, subs) = match subs
+  Nil -> 0
+  Cons(s, rest) ->
+    q_try_send(q_sub_out(s), OCancelled(q.name, q_sub_id(s)))
+    q_tell_gone(q, rest)
+
 fn q_is_stop(r) = match r
-  QStop(reply) -> true
+  QStop(if_unused, if_empty, reply) -> true
   QPub(b, p, o) -> false
   QSub(s, reply) -> false
   QUnsub(i, reply) -> false
@@ -212,10 +239,7 @@ fn q_is_stop(r) = match r
 # Answered, then over. The journal is told last so that nothing it is holding
 # is lost before the count goes out.
 fn q_stopping(q: Q, r) = match r
-  QStop(reply) ->
-    send(reply, q.tail - q.head + #q.inflight)
-    send(q.jr.puts, JStop)
-    None
+  QStop(if_unused, if_empty, reply) -> q_asked_to_stop(q, if_unused, if_empty, reply)
   QPub(b, p, o) -> Some(q)
   QSub(s, reply) -> Some(q)
   QUnsub(i, reply) -> Some(q)
@@ -293,7 +317,7 @@ fn q_handle(q: Q, r, full) = match r
   QStat(reply) -> q_handle_rest(q, r)
   QDrain(reply) -> q_handle_rest(q, r)
   QPoke -> q_handle_rest(q, r)
-  QStop(reply) -> q_handle_rest(q, r)
+  QStop(if_unused, if_empty, reply) -> q_handle_rest(q, r)
 
 # The refusal goes down the journal's channel with everything else, so that it
 # arrives in the place the client asked for it. Nothing is written.
@@ -346,7 +370,7 @@ fn q_handle_rest(q: Q, r) = match r
     q
   QDrain(reply) -> q_drain(q, reply)
   QPoke -> q
-  QStop(reply) -> q
+  QStop(if_unused, if_empty, reply) -> q
 
 # Everything ready, dropped, and the journal told about each one in the way it
 # is told about an acknowledgement — so a broker that comes back does not find

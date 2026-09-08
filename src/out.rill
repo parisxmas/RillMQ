@@ -33,3 +33,7 @@ type Out
   # which channel asked. A message carrying where it is going is the only kind
   # that arrives.
   ONoRoute(exchange: Str, key: Str, body: Str, props: Str, chan: Int)
+  # The queue this subscriber was reading has gone. AMQP calls it
+  # `Basic.Cancel` from the server, and a consumer that is not told is a
+  # consumer waiting on something that will never speak again.
+  OCancelled(queue: Str, sub: Int)
