@@ -74,7 +74,8 @@ prefetch — `Queue.Declare` (which is also how a client asks how many are
 waiting), `Exchange.Declare` and `Queue.Bind`, `Basic.Qos`, `Basic.Publish`,
 `Basic.Consume` with `no-ack`, `Basic.Deliver`, `Basic.Ack`, `Basic.Nack` and
 `Basic.Reject`, `Basic.Get`, `Basic.Cancel`, `Confirm.Select`, and closing a
-channel or a connection. A message's properties — `reply-to`,
+channel or a connection — from either side, since the broker closes a channel
+itself when it has to refuse something. A message's properties — `reply-to`,
 `correlation-id`, `content-type`, headers — are kept as they came and handed
 back untouched, which is what the request-and-reply pattern is made of.
 
@@ -503,6 +504,32 @@ Emptying a queue writes an acknowledgement record per message, so a queue
 emptied from a page is still empty after a restart. What is in flight is left
 alone: it is somebody's to answer for.
 
+## When the answer is no
+
+A channel is where a refusal lands, which is what a channel is for: a
+connection carrying eight of them loses one and keeps seven. The broker sends
+`Channel.Close` with a code and a reason, cancels that channel's consumers,
+and then ignores everything on it until the client says `Channel.Close-Ok` —
+the client has frames in flight that were written before it heard, and
+answering those would be answering questions asked of a channel that is gone.
+
+| what happened | code | what the client sees |
+|---|---:|---|
+| a method this broker has not written | 540 | an exception naming the class and method |
+| acknowledging a tag it was never given | 406 | `unknown delivery tag` |
+| a consumer tag already in use | 406 | `consumer tag ... is already in use` |
+
+Each of those used to be silence, and silence is the worst of the three
+answers a broker can give. A client calling `Queue.Purge` waited for a reply
+that was never coming, which is harder to work out than being refused. A
+client acknowledging the same message twice — the ordinary shape of a
+double-delivery bug — was told nothing by the one party that knew. A second
+consumer registered under a name already in use quietly replaced the first,
+which stayed subscribed in the queue with nothing left pointing at it.
+
+Channel zero is the connection's own and cannot be closed this way, so what is
+not written there is passed over instead.
+
 ## Who is allowed to stay
 
 A client that opens a socket and never speaks holds a strand, a descriptor and
@@ -815,7 +842,7 @@ rill build test/bench.rill  -o rillmq-bench
 ./rillmq-bench 7700 200000 64
 
 sh test/persistence.sh       # 18 checks, most of which stop the broker
-sh test/amqp.sh              # 22 checks through RabbitMQ's own .NET client
+sh test/amqp.sh              # 27 checks through RabbitMQ's own .NET client
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -831,7 +858,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All ninety-four pass, with or without a journal.
+All ninety-nine pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -866,12 +893,13 @@ All ninety-four pass, with or without a journal.
   made and per binding taken away, and nothing ever shortens it. A queue's
   journal is compacted; this one is not, on the grounds that a table which
   changes as often as messages arrive is not a routing table.
-- **A channel is not a unit of failure.** A consumer belongs to the channel it
-  was made on, keeps that channel's `Basic.Qos`, and is cancelled when the
-  channel closes. What a channel still cannot do is fail on its own: there is
-  no `Channel.Close` sent *by* the broker, so a request it should refuse —
-  publishing to an exchange that is not there, acknowledging a tag twice —
-  is passed over silently where AMQP would close the channel with a reason.
+- **A refusal is a `404` short of complete.** A channel now fails on its own —
+  see below — but the one refusal a broker most often owes a client is not
+  among them: publishing to or binding an exchange that was never declared is
+  answered by making it, because RillMQ makes exchanges and queues the first
+  time they are named. That is deliberate for its own protocol and is the
+  wrong answer over AMQP, where a client that mistypes an exchange name should
+  be told so rather than given a new one.
 - **`Basic.Qos` counts per consumer, not per channel.** Two consumers made on
   one channel each get the window the channel asked for, rather than sharing
   it, and `global=true` is read and treated as `false`. For the usual shape —

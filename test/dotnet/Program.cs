@@ -349,6 +349,37 @@ class Program
             Check("a prefetch of one means one at a time", most, 1);
         }
 
+        // A channel is where a refusal lands. Each of these used to be
+        // silence: the client waited for a reply that was never coming, or
+        // went on believing something the broker had quietly not done.
+        string refused(Action<IModel> ask)
+        {
+            using var bad = conn.CreateModel();
+            var why = new BlockingCollection<string>();
+            bad.ModelShutdown += (_, e) => why.Add(e.ReplyCode + " " + e.ReplyText);
+            try { ask(bad); } catch (Exception) { }
+            return why.TryTake(out var w, 5000) ? w : "(nothing was said)";
+        }
+
+        Check("a method the broker has not written closes the channel",
+            refused(m => m.QueuePurge(q)).Split(' ')[0], "540");
+        Check("acknowledging a tag it never gave out closes it too",
+            refused(m => m.BasicAck(9999, false)), "406 unknown delivery tag");
+        Check("and so does a consumer tag already in use",
+            refused(m =>
+            {
+                m.QueueDeclare(q + "-dup", true, false, false, null);
+                m.BasicConsume(q + "-dup", true, "twice", new EventingBasicConsumer(m));
+                m.BasicConsume(q + "-dup", true, "twice", new EventingBasicConsumer(m));
+                Thread.Sleep(800);
+            }).Split(' ')[0], "406");
+
+        // And the connection is not what closes: everything above happened on
+        // a channel of its own, and this one is still up.
+        Check("the connection survives all of that", conn.IsOpen, true);
+        Check("and so does the channel that did nothing wrong",
+            ch.QueueDeclare(q, true, false, false, null).QueueName, q);
+
         // Message properties, which is what the request-and-reply pattern is
         // made of: a message says where to answer and what to call the answer,
         // and the broker hands both back untouched.
