@@ -154,6 +154,37 @@ class Program
             return 0;
         }
 
+        // `transient make|check` is the two halves of one question either side
+        // of a restart: does a queue a client asked not to keep, stay?
+        if (args.Length > 2 && args[1] == "transient")
+        {
+            var tf2 = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var tc2 = tf2.CreateConnection();
+            using var tm2 = tc2.CreateModel();
+            if (args[2] == "make")
+            {
+                tm2.QueueDeclare("lasting-q", durable: true, false, false, null);
+                tm2.QueueDeclare("passing-q", durable: false, false, false, null);
+                tm2.BasicPublish("", "lasting-q", null, Encoding.UTF8.GetBytes("keep"));
+                tm2.BasicPublish("", "passing-q", null, Encoding.UTF8.GetBytes("lose"));
+                Thread.Sleep(500);
+                Console.WriteLine("made");
+            }
+            else
+            {
+                var gone = new BlockingCollection<string>();
+                tm2.ModelShutdown += (_, e) => gone.Add(e.ReplyCode.ToString());
+                uint kept = 0;
+                try { kept = tm2.QueueDeclare("lasting-q", true, false, false, null).MessageCount; } catch (Exception) { }
+                using var tm3 = tc2.CreateModel();
+                var gone2 = new BlockingCollection<string>();
+                tm3.ModelShutdown += (_, e) => gone2.Add(e.ReplyCode.ToString());
+                try { tm3.BasicGet("passing-q", true); } catch (Exception) { }
+                Console.WriteLine("kept=" + kept + " passing=" + (gone2.TryTake(out var g3, 3000) ? g3 : "still there"));
+            }
+            return 0;
+        }
+
         // `tls` connects over AMQPS and says whether it got in. The
         // certificate is one RillMQ made for itself, so the name is checked
         // and the chain is not: this says TLS works, not that a self-signed

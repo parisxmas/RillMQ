@@ -605,7 +605,7 @@ fn am_exchange_method(am: Am, chan, method, payload) =
   else if method != 10 then am_no_method(am, chan, a_class_exchange(), method)
   else
     at = a_after_shortstr(payload, am_after_reserved())
-    am_exchange(am, a_get_shortstr(payload, am_after_reserved()), a_get_shortstr(payload, at))
+    am_exchange(am, a_get_shortstr(payload, am_after_reserved()), a_get_shortstr(payload, at), bit_and(a_get_u8(payload, a_after_shortstr(payload, at)), am_durable()) != 0)
     am_answer(am, am_exchange_declare_ok(chan))
 
 # `Exchange.Delete` takes its bindings with it and writes a record saying so,
@@ -622,9 +622,15 @@ fn am_deleted_exchange(am: Am, chan, name, n) =
 fn am_exchange_in_use(am: Am, chan, name) =
   am_refuse(am, chan, am_precondition(), "exchange `" + name + "` still has something bound to it", a_class_exchange(), 20)
 
-fn am_exchange(am: Am, name, kind) =
+# The second bit of the flags on a declaration: whether the thing is meant to
+# outlive the broker. It was read and ignored, so a client that asked for
+# something temporary got something permanent — the safe direction to be wrong
+# in and still the wrong answer.
+fn am_durable() = 2
+
+fn am_exchange(am: Am, name, kind, durable) =
   back = channel(1)
-  send(am.reg, RExchange(name, kind, false, back))
+  send(am.reg, RExchange(name, kind, false, durable, back))
   recv(back)
 
 fn am_answer(am: Am, bytes) =
@@ -643,7 +649,7 @@ fn am_args() = 4
 fn am_after_reserved() = 6
 
 fn am_queue_method(am: Am, chan, method, payload) =
-  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 40 then am_delete_queue(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
+  if method == 10 then am_declare(am, chan, a_get_shortstr(payload, am_after_reserved()), bit_and(a_get_u8(payload, a_after_shortstr(payload, am_after_reserved())), am_durable()) != 0) else if method == 20 then am_bind(am, chan, payload) else if method == 30 then am_purge(am, chan, a_get_shortstr(payload, am_after_reserved())) else if method == 40 then am_delete_queue(am, chan, a_get_shortstr(payload, am_after_reserved()), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method == 50 then am_unbind(am, chan, payload) else am_no_method(am, chan, a_class_queue(), method)
 
 # `Queue.Purge` throws away what is waiting and answers with how much that
 # was. It is `DRAIN` on RillMQ's own protocol, and the same request underneath.
@@ -783,12 +789,20 @@ fn am_exchange_if(am: Am, name) =
 
 fn am_named_exchange(am: Am, name) =
   back = channel(1)
-  send(am.reg, RExchange(name, x_direct(), false, back))
+  send(am.reg, RExchange(name, x_direct(), false, true, back))
   recv(back)
 
-fn am_declare(am: Am, chan, name) =
+fn am_declare(am: Am, chan, name, durable) =
   back = channel(1)
-  am_declared(am_wait_stat(am_hand(am, am_queue(am, name), QStat(back)), back), chan, name)
+  am_declared(am_wait_stat(am_hand(am, am_queue_kind(am, name, durable), QStat(back)), back), chan, name)
+
+# A declaration is the one place a client says how long it wants the queue for.
+# Everywhere else a queue is named — this broker's own protocol, a replayed
+# journal, a cluster — means one that is meant to last.
+fn am_queue_kind(am: Am, name, durable) =
+  back = channel(1)
+  send(am.reg, RFindKind(name, durable, back))
+  recv(back)
 
 fn am_declared(w: AStat, chan, name) =
   am_answer(w.am, am_queue_declare_ok(chan, name, q_count_ready(w.got) + q_count_inflight(w.got), q_count_subs(w.got)))

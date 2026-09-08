@@ -18,11 +18,16 @@ import "tls"
 
 type RReq
   RFind(name: Str, reply: Chan(Chan(QReq)))
+  # The same, for a client that said whether it wants the queue to outlive the
+  # broker. `RFind` means durable, because everything else that names a queue
+  # — this broker's own protocol, a replayed journal, a cluster — means a
+  # queue that is meant to last.
+  RFindKind(name: Str, durable: Bool, reply: Chan(Chan(QReq)))
   # An exchange, made the first time it is named, like a queue. The kind is
   # settled by whoever names it first; naming it again with another kind is
   # answered with the one it already is rather than refused, which is friendlier
   # than the specification and no less safe.
-  RExchange(name: Str, kind: Str, quiet: Bool, reply: Chan(Chan(XReq)))
+  RExchange(name: Str, kind: Str, quiet: Bool, durable: Bool, reply: Chan(Chan(XReq)))
   # An exchange if there is one and nothing if there is not. `RExchange` makes
   # what it cannot find, which is right for a protocol with no declaration step
   # in it and wrong for AMQP, where a client that mistypes an exchange's name
@@ -166,8 +171,11 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
   RFind(name, reply) ->
     send(reply, r_queue(qs, mine, g.dir, g.self, name, done))
     0
-  RExchange(name, kind, quiet, reply) ->
-    send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, done))
+  RFindKind(name, durable, reply) ->
+    send(reply, r_queue(qs, mine, if durable then g.dir else "", g.self, name, done))
+    0
+  RExchange(name, kind, quiet, durable, reply) ->
+    send(reply, r_exchange(xs, Cons(g.jr, Nil), name, kind, quiet, durable, done))
     0
   RFindIf(name, reply) ->
     send(reply, r_known(qs, mine, g.dir, g.self, name, done))
@@ -219,17 +227,17 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     send(reply, r_journal_size(g.dir, name))
     0
 
-fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, done) = match xs[name]
+fn r_exchange(xs: Map(Str, Chan(XReq)), jr, name, kind, quiet, durable, done) = match xs[name]
   Some(ch) -> ch
-  None -> r_make_exchange(xs, r_only(jr), name, kind, quiet, done)
+  None -> r_make_exchange(xs, r_only(jr), name, kind, quiet, durable, done)
 
 # `quiet` is what startup uses. Reading the table back in and writing every
 # line of it out again would make the file longer every time the broker was
 # restarted, for a table that had not changed.
-fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, done) =
+fn r_make_exchange(xs: Map(Str, Chan(XReq)), jr: Jr, name, kind, quiet, durable, done) =
   ch = channel()
-  spawn x_run(name, kind, jr, ch, done)
-  if quiet then 0 else r_note_x(jr, name, kind)
+  spawn x_run(name, kind, durable, jr, ch, done)
+  if quiet || !durable then 0 else r_note_x(jr, name, kind)
   xs[name] = ch
   ch
 
@@ -797,7 +805,7 @@ fn q_count_of(ch) =
 
 fn b_exchange(c: Conn, name, kind) =
   back = channel(1)
-  send(c.reg, RExchange(name, kind, false, back))
+  send(c.reg, RExchange(name, kind, false, true, back))
   recv(back)
 
 fn b_find(reg, name) =

@@ -13,7 +13,7 @@ type Bind
   Bind(queue: Str, key: Str, ch: Chan(QReq))
 
 type X
-  X(name: Str, kind: Str, binds: List(Bind), jr: Jr)
+  X(name: Str, kind: Str, binds: List(Bind), jr: Jr, lasting: Bool)
 
 type XReq
   XPub(key: Str, body: Str, props: Str, out: Chan(Out), back: Int)
@@ -35,7 +35,8 @@ fn x_topic() = "topic"
 
 fn x_headers() = "headers"
 
-fn x_run(name, kind, jr: Jr, inbox, done) = x_loop(X(name, kind, Nil, jr), inbox, done)
+fn x_run(name, kind, lasting, jr: Jr, inbox, done) =
+  x_loop(X(name, kind, Nil, jr, lasting), inbox, done)
 
 fn x_loop(x: X, inbox, done) =
   step = select
@@ -99,20 +100,24 @@ fn x_handle(x: X, r) = match r
   XUnbind(queue, key, reply) ->
     send(reply, 1)
     x_note(x, rt_unbind_record(x.name, queue, key))
-    X(x.name, x.kind, x_without(x.binds, queue, key), x.jr)
+    X(x.name, x.kind, x_without(x.binds, queue, key), x.jr, x.lasting)
 
 fn x_add(x: X, queue, key, ch, quiet) =
   if quiet then 0 else x_note(x, rt_bind_record(x.name, queue, key))
-  X(x.name, x.kind, Cons(Bind(queue, key, ch), x.binds), x.jr)
+  X(x.name, x.kind, Cons(Bind(queue, key, ch), x.binds), x.jr, x.lasting)
 
 # A binding is written down and nothing waits for it to land. It is one small
 # record on a file that is synced with the next batch, which is to say almost
 # at once; and a binding lost in that window is a binding the client is about
 # to declare again anyway, because declaring is what a client does on the way
 # in.
+# An exchange a client asked not to keep writes nothing down, and neither do
+# its bindings: there is nothing for them to come back to.
 fn x_note(x: X, rec) =
-  send(x.jr.puts, JNote(rec))
-  0
+  if !x.lasting then 0
+  else
+    send(x.jr.puts, JNote(rec))
+    0
 
 fn x_bound(binds, queue, key) = match binds
   Nil -> false

@@ -1183,10 +1183,11 @@ All hundred and thirty-six of them pass, with or without a journal.
   client that wrote `{"count", 3}` on both sides gets and is right; a nested
   table or an array in either is skipped rather than compared, so a binding
   that mentions one matches nothing.
-- **`durable` is not a choice.** Every queue, exchange and binding is written
-  down, whatever the flag said. A client that asked for a temporary queue gets
-  a permanent one, which is the safe direction to be wrong in and still the
-  wrong answer.
+- **`exclusive` and `auto-delete` are not choices.** `durable` is: a queue or
+  exchange declared without it is held in memory only, and neither it nor its
+  bindings come back from a restart. The other two flags are read and ignored,
+  so nothing is private to the connection that declared it and nothing goes
+  away when its last consumer does.
 - **One virtual host, and one permission.** `Connection.Open` takes whatever
   virtual host it is given. A name and a word are checked; what that person
   may then do is not, beyond a tag the management pages read.

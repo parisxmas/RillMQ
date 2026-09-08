@@ -1,8 +1,7 @@
 #!/bin/sh
-# Does an exchange somebody deleted stay deleted across a restart?
-#
-# The routing journal replays what was declared and what was bound, in order,
-# so it has to replay what was deleted or the broker helpfully brings it back.
+# What survives a restart and what does not, which is one question with several
+# faces: a deleted exchange must stay deleted, a churned routing table must not
+# grow without bound, and a queue a client asked not to keep must not be kept.
 set -u
 . "$(dirname "$0")/lib.sh"
 A="${1:-9890}"
@@ -49,6 +48,17 @@ kill -TERM "$BROKER" 2>/dev/null
 wait "$BROKER" 2>/dev/null
 start
 say "and what is left after a restart is the table as it stood" "$(client unrouted churn-x k)" "came back"
+
+# `durable` was read off the wire and ignored, so a client that asked for a
+# temporary queue got a permanent one — the safe direction to be wrong in and
+# still the wrong answer.
+client transient make >/dev/null
+say "only the durable one is on the disk" "$(ls "$D/d" | grep -cE '^(lasting|passing)-q\.log$')" "1"
+
+kill -TERM "$BROKER" 2>/dev/null
+wait "$BROKER" 2>/dev/null
+start
+say "and only it comes back" "$(client transient check)" "kept=1 passing=404"
 
 kill -TERM "$BROKER" 2>/dev/null
 sleep 0.3
