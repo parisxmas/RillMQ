@@ -373,11 +373,40 @@ fn cl_note_term(p: P, term) =
 # The registry puts a real queue where this stand-in was, and every connection
 # picks it up on its next command. This request is refused, and whoever made it
 # asks again.
+# The queue is this node's now, and the registry hands out the real one
+# instead of this stand-in. Two things have to move across and neither used
+# to.
+#
+# The request that caused the takeover was answered with a refusal, so the one
+# message that provoked a failover was the one message the failover lost. It
+# is forwarded to the queue that now exists instead.
+#
+# And the consumers who subscribed through here were left holding a
+# subscription to a stand-in nobody fills any more. They are subscribed to the
+# real queue, which is the same thing the proxy does when a link comes back.
 fn cl_take_over(p: P, r) =
   back = channel(1)
   send(p.reg, RPromote(p.name, back))
   recv(back)
-  cl_no(p, r)
+  cl_handed_over(p, r, cl_local(p))
+
+fn cl_handed_over(p: P, r, q) =
+  cl_move_subs(q, p.subs)
+  send(q, r)
+  P(p.name, p.fd, Nil, p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg)
+
+fn cl_local(p: P) =
+  back = channel(1)
+  send(p.reg, RFind(p.name, back))
+  recv(back)
+
+fn cl_move_subs(q, subs) = match subs
+  Nil -> 0
+  Cons(s, rest) ->
+    back = channel(1)
+    send(q, QSub(s, back))
+    recv(back)
+    cl_move_subs(q, rest)
 
 fn cl_try_again(p: P, r, ses) = match connect_to(p.host, p.port)
   Err(e) -> cl_look_around(P(p.name, -1, p.subs, p.waits, p.head, p.tail, p.host, p.port, now_millis(), p.reg), r, ses)

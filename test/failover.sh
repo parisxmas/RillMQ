@@ -48,14 +48,17 @@ kill -9 "$N3" 2>/dev/null
 wait "$N3" 2>/dev/null
 sleep 2
 
-# The first request after the node has gone is the one that holds the election;
-# it is refused, and whoever asked asks again.
-ask "$A" 'PUB alpha 5\r\nthree' >/dev/null
+# The first request after the node has gone is the one that holds the election,
+# and it is also the first request the new leader answers. It used to be
+# refused — the message that provoked a failover was the message the failover
+# lost — which is why this line used to throw its answer away and why the
+# count below used to be one lower.
+say "the request that holds the election is answered by the winner" "$(ask "$A" 'PUB alpha 5\r\nthree' | cut -d' ' -f1)" "+OK"
 sleep 1
 say "a queue comes back without anyone deciding it should" "$(ask "$A" 'PUB alpha 4\r\nfour' | cut -d' ' -f1)" "+OK"
 say "and the node that took it says so" "$(ask "$A" 'WHO alpha\r\n')" "+WHO 0"
 say "as does the one that voted for it" "$(ask "$B" 'WHO alpha\r\n')" "+WHO 0"
-say "with what was published before still in it" "$(ask "$A" 'QSTAT alpha\r\n' | cut -d' ' -f2)" "3"
+say "with what was published before still in it" "$(ask "$A" 'QSTAT alpha\r\n' | cut -d' ' -f2)" "4"
 
 # A client on the other node finds the new leader rather than the old one.
 say "and the other node finds it too" "$(ask "$B" 'PUB alpha 4\r\nfive' | cut -d' ' -f1)" "+OK"

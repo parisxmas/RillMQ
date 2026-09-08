@@ -329,6 +329,27 @@ two, so a two-node cluster cannot lose a node and still confirm, and cannot
 elect anybody either. That is a fact about two-node clusters rather than a
 shortcoming here, and it is why clusters have an odd number of nodes.
 
+### What a client sees while it happens
+
+The other cluster checks kill a node and then ask a question. That is not what
+a failover looks like from a program that never asked to know about one, and
+looking at it that way found two things.
+
+The publish that provoked the takeover was refused. The proxy stood for the
+leadership, won it, promoted the queue — and then answered the request that
+had set all of that in motion with `-ERR the node holding that queue cannot be
+reached`. So the one message that caused a failover was the one message the
+failover lost. It is handed to the queue that now exists instead.
+
+And the consumers who had subscribed through the stand-in were left subscribed
+to it. The registry hands out the real queue from the moment it is promoted,
+so nothing was filling the thing they were reading. They are moved across,
+which is what the proxy already did when a link came back.
+
+`test/handover.sh` is the two of them together: a publisher and a consumer on
+one node while the node that owns the queue is killed underneath them. Three
+messages published, three received, no error seen by either.
+
 ### Taking a copy over by hand
 
 ```
@@ -962,7 +983,8 @@ sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
 sh test/majority.sh          # 5 checks across three
-sh test/failover.sh          # 7 checks, one node killed with nobody watching
+sh test/handover.sh          # 2 checks with a publisher and a consumer working
+sh test/failover.sh          # 8 checks, one node killed with nobody watching
 ```
 
 The AMQP checks need the .NET SDK; `test/dotnet` is a plain console program
@@ -973,7 +995,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and twenty-one of them pass, with or without a journal.
+All hundred and twenty-four of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -987,7 +1009,9 @@ All hundred and twenty-one of them pass, with or without a journal.
 - **An election is one round and no heartbeats.** Nothing notices a node is
   gone until somebody wants a queue it held. A cluster nobody is using does
   not notice anything, which is the right amount of noticing for a cluster
-  nobody is using and the wrong amount for one about to be.
+  nobody is using and the wrong amount for one about to be. What the asking
+  costs is now nothing, though: the request that provokes the takeover is the
+  first one the new leader answers.
 - **A term is per queue, and there is no log to catch up on.** A candidate
   that is behind is refused and stays behind; nothing copies it the records it
   is missing. In a cluster that has been up long enough for a majority to have
