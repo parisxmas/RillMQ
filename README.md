@@ -1,3 +1,5 @@
+<img src="docs/rillmq.png" alt="RillMQ" width="420">
+
 # RillMQ
 
 A message broker written in [Rill](../funclang). Messages are kept in memory
