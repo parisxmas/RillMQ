@@ -495,6 +495,17 @@ not found
 and the same three things over AMQP are `Exchange.Declare`, `Queue.Bind` and a
 `Basic.Publish` that names an exchange.
 
+**An exchange can be bound to an exchange.** `Exchange.Bind` points one at
+another, and a message that matches at the source is handed to the destination
+to be routed again — a `topic` in front of three `fanout`s, say, built out of
+exchanges rather than out of the client. A ring of them would be a message
+that never stops, so a message carries a count of the hops it has left and is
+dropped where it runs out; sixteen is far past any topology built on purpose.
+
+Whether a message was routed at all is decided at the first exchange it
+reached, so a `mandatory` publish that matched a binding there is not returned
+even if the exchange behind it matched nothing.
+
 **`headers` is the one that reads inside a message.** It routes by what a
 message says about itself rather than by a word in a key, so somebody has to
 look at the properties this broker otherwise carries as bytes and hands back
@@ -1258,9 +1269,10 @@ All hundred and thirty-six of them pass, with or without a journal.
   client that wrote `{"count", 3}` on both sides gets and is right; a nested
   table or an array in either is skipped rather than compared, so a binding
   that mentions one matches nothing.
-- **`internal` is read and ignored.** An exchange declared internal, which is
-  a client saying that only other exchanges may publish to it, takes a
-  publish from anybody. The other four declaration flags mean what they say:
+- **`internal` is read and ignored.** An exchange declared internal — a client
+  saying that only other exchanges may publish to it, which now means
+  something, since an exchange can be bound to an exchange — takes a publish
+  from anybody. The other four declaration flags mean what they say:
   `passive` asks rather than makes and is answered with a 404 when the thing
   is not there, `durable` decides whether it is written down, a queue's
   `exclusive` gives it to one connection and refuses it to others with a 405,

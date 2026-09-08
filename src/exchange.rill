@@ -9,15 +9,28 @@
 import "queue"
 import "routes"
 
+# Onward a binding points. A queue is the usual answer; an exchange is the
+# other one, and a message that matches is handed on to be routed again. That
+# is how a topology is built out of exchanges rather than out of the client —
+# a `topic` in front of three `fanout`s, say — and it is the whole of what
+# `Exchange.Bind` asks for.
+type Onward
+  ToQueue(ch: Chan(QReq))
+  ToExchange(ch: Chan(XReq))
+
 type Bind
-  Bind(queue: Str, key: Str, ch: Chan(QReq))
+  Bind(queue: Str, key: Str, to: Onward)
 
 type X
   X(name: Str, kind: Str, binds: List(Bind), jr: Jr, lasting: Bool)
 
 type XReq
-  XPub(key: Str, body: Str, props: Str, out: Chan(Out), back: Int)
-  XBind(queue: Str, key: Str, ch: Chan(QReq), quiet: Bool, reply: Chan(Int))
+  # `hops` is what keeps a ring of exchanges from being a message that never
+  # stops. It counts down and a message that runs out is dropped where it is,
+  # rather than the bind being refused when the ring is made: a ring can be
+  # made one binding at a time from either end, so the check has to be here.
+  XPub(key: Str, body: Str, props: Str, out: Chan(Out), back: Int, hops: Int)
+  XBind(queue: Str, key: Str, to: Onward, quiet: Bool, reply: Chan(Int))
   XUnbind(queue: Str, key: Str, reply: Chan(Int))
   # The end of this exchange. Its bindings go with it, and the routing journal
   # is told so that a restart does not bring back what somebody deleted.
@@ -26,6 +39,11 @@ type XReq
   # This exchange as records: what it is, and each of its bindings. It is what
   # a rewritten routing journal is made of, and only this strand knows it.
   XRecords(reply: Chan(List(Str)))
+
+# How many exchanges a message may pass through before it is dropped. A ring
+# is the reason there is a number at all; sixteen is far past any topology
+# anybody builds on purpose.
+fn x_hops() = 16
 
 fn x_direct() = "direct"
 
@@ -71,25 +89,25 @@ fn x_is_stop(r) = match r
   XStop(quiet, if_unused, reply) -> true
   XKind(reply) -> false
   XRecords(reply) -> false
-  XPub(key, body, props, out, back) -> false
+  XPub(key, body, props, out, back, hops) -> false
   XBind(queue, key, ch, quiet, reply) -> false
   XUnbind(queue, key, reply) -> false
 
 fn x_over(x: X, r) = match r
   XStop(quiet, if_unused, reply) -> x_asked_to_stop(x, quiet, if_unused, reply)
-  XPub(key, body, props, out, back) -> Some(x)
+  XPub(key, body, props, out, back, hops) -> Some(x)
   XKind(reply) -> Some(x)
   XRecords(reply) -> Some(x)
   XBind(queue, key, ch, quiet, reply) -> Some(x)
   XUnbind(queue, key, reply) -> Some(x)
 
 fn x_handle(x: X, r) = match r
-  XPub(key, body, props, out, back) ->
-    x_send(x, x_route(x, x.binds, key, Nil), key, body, props, out, back)
+  XPub(key, body, props, out, back, hops) ->
+    x_send(x, if hops <= 0 then Nil else x_route(x, x.binds, key, Nil), Post(key, body, props, out, back, hops))
     x
-  XBind(queue, key, ch, quiet, reply) ->
+  XBind(queue, key, to, quiet, reply) ->
     send(reply, 1)
-    if x_bound(x.binds, queue, key) then x else x_add(x, queue, key, ch, quiet)
+    if x_bound(x.binds, queue, key) then x else x_add(x, queue, key, to, quiet)
   XStop(quiet, if_unused, reply) -> x
   XKind(reply) ->
     send(reply, x.kind)
@@ -99,12 +117,26 @@ fn x_handle(x: X, r) = match r
     x
   XUnbind(queue, key, reply) ->
     send(reply, 1)
-    x_note(x, rt_unbind_record(x.name, queue, key))
+    x_note(x, x_unrecord(x, x.binds, queue, key))
     X(x.name, x.kind, x_without(x.binds, queue, key), x.jr, x.lasting)
 
-fn x_add(x: X, queue, key, ch, quiet) =
-  if quiet then 0 else x_note(x, rt_bind_record(x.name, queue, key))
-  X(x.name, x.kind, Cons(Bind(queue, key, ch), x.binds), x.jr, x.lasting)
+fn x_add(x: X, queue, key, to, quiet) =
+  if quiet then 0 else x_note(x, x_record_of(x.name, queue, key, to))
+  X(x.name, x.kind, Cons(Bind(queue, key, to), x.binds), x.jr, x.lasting)
+
+fn x_record_of(ex, name, key, to) = match to
+  ToQueue(ch) -> rt_bind_record(ex, name, key)
+  ToExchange(ch) -> rt_xbind_record(ex, name, key)
+
+# Which kind of undoing to write down is a question only the binding can
+# answer, so it is asked before the binding goes.
+fn x_unrecord(x: X, binds, name, key) = match binds
+  Nil -> rt_unbind_record(x.name, name, key)
+  Cons(b, rest) -> if x_same(b, name, key) then x_unrecord_of(x.name, name, key, x_bind_to(b)) else x_unrecord(x, rest, name, key)
+
+fn x_unrecord_of(ex, name, key, to) = match to
+  ToQueue(ch) -> rt_unbind_record(ex, name, key)
+  ToExchange(ch) -> rt_xunbind_record(ex, name, key)
 
 # A binding is written down and nothing waits for it to land. It is one small
 # record on a file that is synced with the next batch, which is to say almost
@@ -133,17 +165,17 @@ fn x_without(binds, queue, key) = match binds
 
 fn x_route(x: X, binds, key, acc) = match binds
   Nil -> acc
-  Cons(b, rest) -> x_route(x, rest, key, if x_takes(x.kind, x_bind_key(b), key) then Cons(x_bind_ch(b), acc) else acc)
+  Cons(b, rest) -> x_route(x, rest, key, if x_takes(x.kind, x_bind_key(b), key) then Cons(x_bind_to(b), acc) else acc)
 
 fn x_bind_records(x: X, binds) = match binds
   Nil -> Nil
-  Cons(b, rest) -> Cons(rt_bind_record(x.name, x_bind_queue(b), x_bind_key(b)), x_bind_records(x, rest))
+  Cons(b, rest) -> Cons(x_record_of(x.name, x_bind_queue(b), x_bind_key(b), x_bind_to(b)), x_bind_records(x, rest))
 
 fn x_bind_queue(b: Bind) = b.queue
 
 fn x_bind_key(b: Bind) = b.key
 
-fn x_bind_ch(b: Bind) = b.ch
+fn x_bind_to(b: Bind) = b.to
 
 fn x_takes(kind, pattern, key) =
   str_cmp(kind, x_fanout()) == 0 || (if str_cmp(kind, x_topic()) == 0 then x_topic_takes(pattern, key) else if str_cmp(kind, x_headers()) == 0 then x_headers_takes(pattern, key) else str_cmp(pattern, key) == 0)
@@ -223,17 +255,36 @@ fn x_hash_more(prest, ks) = match ks
 # Nothing matched. The publisher is told it is safe either way — an
 # unroutable message is confirmed, because the broker has decided about it and
 # that is what a confirm means — and gets it back as well if it asked to.
-fn x_send(x: X, chans, key, body, props, out, back) = match chans
-  Nil -> x_nowhere(x, key, body, props, out, back)
-  Cons(ch, rest) -> match rest
-    Nil ->
-      send(ch, QPub(body, props, out))
-      0
+# A message and everything about it that is the same for every place it is
+# going. Six arguments was where this stopped being a jump.
+type Post
+  Post(key: Str, body: Str, props: Str, out: Chan(Out), back: Int, hops: Int)
+
+fn x_send(x: X, tos, p: Post) = match tos
+  Nil -> x_nowhere(x, p.key, p.body, p.props, p.out, p.back)
+  Cons(t, rest) -> match rest
+    Nil -> x_hand_to(t, p, p.out)
     _ ->
-      collect = channel(len(chans))
-      x_fan(chans, body, props, collect)
-      spawn x_wait(collect, len(chans), out, x.name)
+      collect = channel(len(tos))
+      x_fan(tos, p, collect)
+      spawn x_wait(collect, len(tos), p.out, x.name)
       0
+
+# One place, and what goes there depends on what it is. An exchange is handed
+# the message to route again, one hop shorter, and with nothing to hand back:
+# whether a message was routed at all is decided at the first exchange it
+# reached, so an inner one that matches nothing returns nothing.
+#
+# Either way exactly one answer comes back on the channel given, which is what
+# lets the count above be the number of places rather than the number of
+# queues underneath them.
+fn x_hand_to(t, p: Post, out) = match t
+  ToQueue(ch) ->
+    send(ch, QPub(p.body, p.props, out))
+    0
+  ToExchange(ch) ->
+    send(ch, XPub(p.key, p.body, p.props, out, 0, p.hops - 1))
+    0
 
 fn x_nowhere(x: X, key, body, props, out, back) =
   x_hand_back(x, key, body, props, out, back)
@@ -246,11 +297,11 @@ fn x_hand_back(x: X, key, body, props, out, back) =
     send(out, ONoRoute(x.name, key, body, props, back))
     0
 
-fn x_fan(chans, body, props, collect) = match chans
+fn x_fan(tos, p: Post, collect) = match tos
   Nil -> 0
-  Cons(ch, rest) ->
-    send(ch, QPub(body, props, collect))
-    x_fan(rest, body, props, collect)
+  Cons(t, rest) ->
+    x_hand_to(t, p, collect)
+    x_fan(rest, p, collect)
 
 fn x_wait(collect, n, out, name) =
   x_drain(collect, n)

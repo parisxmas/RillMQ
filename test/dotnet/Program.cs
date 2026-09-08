@@ -897,6 +897,33 @@ class Program
         Check("and a header a client put there",
             back == null ? "(nothing)" : Encoding.UTF8.GetString((byte[])back.BasicProperties.Headers["tenant"]), "acme");
 
+        // An exchange bound to an exchange: a message published to the source
+        // is routed again by the destination, which is how a topology is
+        // built out of exchanges rather than out of the client.
+        using var xch2 = conn.CreateModel();
+        xch2.ExchangeDeclare("up-x", ExchangeType.Topic, true);
+        xch2.ExchangeDeclare("down-x", ExchangeType.Fanout, true);
+        xch2.ExchangeBind("down-x", "up-x", "orders.#");
+        var xq2 = "chained-" + Environment.TickCount;
+        xch2.QueueDeclare(xq2, true, false, false, null);
+        xch2.QueueBind(xq2, "down-x", "");
+        xch2.BasicPublish("up-x", "orders.new", null, Encoding.UTF8.GetBytes("through"));
+        xch2.BasicPublish("up-x", "other.new", null, Encoding.UTF8.GetBytes("not this"));
+        Thread.Sleep(600);
+        var xgot = xch2.BasicGet(xq2, true);
+        Check("a message routed by one exchange into another arrives",
+            xgot == null ? "(nothing)" : Encoding.UTF8.GetString(xgot.Body.ToArray()), "through");
+        Check("and one the first exchange did not match does not",
+            xch2.BasicGet(xq2, true) == null ? "(nothing)" : "something", "(nothing)");
+        xch2.ExchangeUnbind("down-x", "up-x", "orders.#");
+        xch2.BasicPublish("up-x", "orders.new", null, Encoding.UTF8.GetBytes("after"));
+        Thread.Sleep(600);
+        Check("and after unbinding, nothing comes through",
+            xch2.BasicGet(xq2, true) == null ? "(nothing)" : "something", "(nothing)");
+        xch2.QueueDelete(xq2);
+        xch2.ExchangeDelete("down-x");
+        xch2.ExchangeDelete("up-x");
+
         // `multiple` on `Basic.Ack`: one frame settles everything this
         // channel is holding up to the tag it names. Ignoring the bit left
         // four of five in flight for ever.

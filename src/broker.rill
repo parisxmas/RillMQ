@@ -799,12 +799,12 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     b_read(c, buf, next, subs, 0, who)
   CBind(ex, qname, key) ->
     back = channel(1)
-    send(b_exchange(c, ex, x_direct()), XBind(qname, key, b_find(c.reg, qname), false, back))
+    send(b_exchange(c, ex, x_direct()), XBind(qname, key, ToQueue(b_find(c.reg, qname)), false, back))
     recv(back)
     send(c.out, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CXPub(ex, key, body) ->
-    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.out, 0))
+    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.out, 0, x_hops()))
     b_read(c, buf, next, subs, 0, who)
   CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, bytes)
   CPromote(qname) ->

@@ -727,7 +727,7 @@ fn am_shapes_x(method, payload) =
   method != 10 || bit_and(a_get_u8(payload, a_after_shortstr(payload, a_after_shortstr(payload, am_after_reserved()))), am_passive()) == 0
 
 fn am_exchange_doing(am: Am, chan, method, payload) =
-  if method == 20 then am_delete_exchange(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method != 10 then am_no_method(am, chan, a_class_exchange(), method) else am_exchange_declare(am, chan, payload, a_after_shortstr(payload, am_after_reserved()))
+  if method == 30 then am_x_bind(am, chan, payload, true) else if method == 40 then am_x_bind(am, chan, payload, false) else if method == 20 then am_delete_exchange(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_u8(payload, a_after_shortstr(payload, am_after_reserved()))) else if method != 10 then am_no_method(am, chan, a_class_exchange(), method) else am_exchange_declare(am, chan, payload, a_after_shortstr(payload, am_after_reserved()))
 
 fn am_exchange_declare(am: Am, chan, payload, at) =
   am_exchange_named(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), a_get_shortstr(payload, at), a_get_u8(payload, a_after_shortstr(payload, at)))
@@ -766,6 +766,33 @@ fn am_durable() = 2
 # `auto-delete`, where a queue has `exclusive`. An exchange declared that way
 # goes when the last thing bound to it is unbound.
 fn am_x_fleeting() = 4
+
+# `Exchange.Bind` and `Exchange.Unbind` are destination, source, routing key —
+# the destination first, which is the other way round from `Queue.Bind` and
+# worth reading twice. A message that matches at the source is handed to the
+# destination to be routed again.
+fn am_x_bind(am: Am, chan, payload, on) =
+  if !am_may(am, "c") then am_not_yours(am, chan, "bind an exchange", a_class_exchange(), if on then 30 else 40)
+  else
+    at1 = a_after_shortstr(payload, am_after_reserved())
+    at2 = a_after_shortstr(payload, at1)
+    am_x_binding(am, chan, am_in(am, a_get_shortstr(payload, am_after_reserved())), am_in(am, a_get_shortstr(payload, at1)), a_get_shortstr(payload, at2), on)
+
+fn am_x_binding(am: Am, chan, dest, source, key, on) =
+  am_x_bound(am, chan, dest, key, on, am_exchange_if(am, source), source, am_exchange_if(am, dest))
+
+fn am_x_bound(am: Am, chan, dest, key, on, from, source, to) = match from
+  None -> am_no_exchange(am, chan, source, if on then 30 else 40)
+  Some(sx) -> am_x_onto(am, chan, dest, key, on, sx, to)
+
+fn am_x_onto(am: Am, chan, dest, key, on, sx, to) = match to
+  None -> am_no_exchange(am, chan, dest, if on then 30 else 40)
+  Some(dx) -> am_x_joining(am, chan, dest, key, on, sx, dx)
+
+fn am_x_joining(am: Am, chan, dest, key, on, sx, dx) =
+  back = channel(1)
+  sent = am_hand(am, sx, if on then XBind(dest, key, ToExchange(dx), false, back) else XUnbind(dest, key, back))
+  am_answer(am_wait(sent, back).am, am_method(chan, a_class_exchange(), if on then 31 else 51, ""))
 
 fn am_exchange(am: Am, name, kind, durable, fleeting) =
   back = channel(1)
@@ -905,7 +932,7 @@ fn am_bind_from(am: Am, chan, queue, key, x, found) = match found
 
 fn am_binding(am: Am, chan, queue, key, x, qh) =
   back = channel(1)
-  sent = am_hand(am, x, XBind(queue, key, qh, false, back))
+  sent = am_hand(am, x, XBind(queue, key, ToQueue(qh), false, back))
   am_answer(am_wait(sent, back).am, am_queue_bind_ok(chan))
 
 # 404, and the one refusal a client most often earns: a name it typed wrong.
@@ -1082,7 +1109,7 @@ fn am_deposit_at(am: Am, body, found) = match found
   # and the acknowledgement numbers have to keep step, and this channel is
   # about to be closed anyway.
   None -> am_done_with_publish(am_no_exchange(am, am.pub_chan, am.pub_x, 40))
-  Some(x) -> am_deposited(am_hand(am, x, XPub(am_route_by(am, am.pub_x, am.pub_to, am.pub_props), body, am.pub_props, am.out, if am.pub_back then am.pub_chan else 0)))
+  Some(x) -> am_deposited(am_hand(am, x, XPub(am_route_by(am, am.pub_x, am.pub_to, am.pub_props), body, am.pub_props, am.out, if am.pub_back then am.pub_chan else 0, x_hops())))
 
 # What this message is routed on. For every kind but one it is the routing key
 # the client sent; for `headers` it is the message's own headers, read into the

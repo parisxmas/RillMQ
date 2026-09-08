@@ -23,12 +23,21 @@ fn rt_kind_bind() = 66
 
 fn rt_kind_unbind() = 85
 
+# A binding whose far end is another exchange rather than a queue. It is a
+# kind of its own because replay has to look the far end up in the right
+# table: an exchange named `orders` and a queue named `orders` are two things.
+fn rt_kind_xbind() = 67
+
+fn rt_kind_xunbind() = 86
+
 fn rt_kind_gone() = 71
 
 type Route
   RX(name: Str, kind: Str)
   RB(exchange: Str, queue: Str, key: Str)
   RU(exchange: Str, queue: Str, key: Str)
+  RXB(source: Str, dest: Str, key: Str)
+  RXU(source: Str, dest: Str, key: Str)
   RGone(name: Str)
   RNone
 
@@ -61,6 +70,10 @@ fn rt_bind_record(ex, queue, key) = rt_three(rt_kind_bind(), ex, queue, key)
 
 fn rt_unbind_record(ex, queue, key) = rt_three(rt_kind_unbind(), ex, queue, key)
 
+fn rt_xbind_record(ex, to, key) = rt_three(rt_kind_xbind(), ex, to, key)
+
+fn rt_xunbind_record(ex, to, key) = rt_three(rt_kind_xunbind(), ex, to, key)
+
 fn rt_three(kind, a, b2, c) =
   b = strbuf()
   rt_field(b, a)
@@ -91,7 +104,15 @@ fn rt_scan(buf, at, acc) = match j_take(buf, at)
   RGot(kind, id, body, next) -> rt_scan(buf, next, Cons(rt_of(kind, body), acc))
 
 fn rt_of(kind, body) =
-  if kind == rt_kind_x() then RX(rt_field_at(body, 0), rt_field_at(body, rt_after(body, 0))) else if kind == rt_kind_bind() then rt_triple(body, true) else if kind == rt_kind_unbind() then rt_triple(body, false) else if kind == rt_kind_gone() then RGone(rt_field_at(body, 0)) else RNone
+  if kind == rt_kind_x() then RX(rt_field_at(body, 0), rt_field_at(body, rt_after(body, 0))) else if kind == rt_kind_bind() then rt_triple(body, true) else if kind == rt_kind_unbind() then rt_triple(body, false) else if kind == rt_kind_xbind() then rt_x_triple(body, true) else if kind == rt_kind_xunbind() then rt_x_triple(body, false) else if kind == rt_kind_gone() then RGone(rt_field_at(body, 0)) else RNone
+
+fn rt_x_triple(body, bind) =
+  at2 = rt_after(body, 0)
+  at3 = rt_after(body, at2)
+  ex = rt_field_at(body, 0)
+  to = rt_field_at(body, at2)
+  key = rt_field_at(body, at3)
+  if bind then RXB(ex, to, key) else RXU(ex, to, key)
 
 fn rt_triple(body, bind) =
   at2 = rt_after(body, 0)

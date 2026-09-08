@@ -139,12 +139,25 @@ fn apply_route(reg, r) = match r
     0
   RB(ex, queue, key) ->
     back = channel(1)
-    send(b_exchange_of(reg, ex, x_direct()), XBind(queue, key, b_find(reg, queue), true, back))
+    send(b_exchange_of(reg, ex, x_direct()), XBind(queue, key, ToQueue(b_find(reg, queue)), true, back))
     recv(back)
     1
   RU(ex, queue, key) ->
     back = channel(1)
     send(b_exchange_of(reg, ex, x_direct()), XUnbind(queue, key, back))
+    recv(back)
+    0
+  # The far end is another exchange, so it is looked up in the other table.
+  # Its own declaration is earlier in this file, which is what makes the kind
+  # named here a fallback nobody reaches.
+  RXB(source, dest, key) ->
+    back = channel(1)
+    send(b_exchange_of(reg, source, x_direct()), XBind(dest, key, ToExchange(b_exchange_of(reg, dest, x_direct())), true, back))
+    recv(back)
+    1
+  RXU(source, dest, key) ->
+    back = channel(1)
+    send(b_exchange_of(reg, source, x_direct()), XUnbind(dest, key, back))
     recv(back)
     0
 
