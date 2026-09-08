@@ -6,6 +6,7 @@
 #
 #     sh test/persistence.sh [port]
 set -u
+. "$(dirname "$0")/lib.sh"
 PORT="${1:-7999}"
 DIR="$(mktemp -d)/rillmq"
 PASS=0
@@ -24,7 +25,7 @@ say() {
 start() {
   ./rillmq "$PORT" "dir=$DIR" "ack=${1:-5000}" >/dev/null 2>&1 &
   BROKER=$!
-  sleep 1
+  up "$PORT" "$BROKER" || exit 1
 }
 
 stop() { kill -TERM "$BROKER" 2>/dev/null; wait "$BROKER" 2>/dev/null; }
@@ -112,6 +113,7 @@ stop
 
 ./rillmq "$PORT" idle=2 conns=4 >/dev/null 2>&1 &
 BROKER=$!
+up "$PORT" "$BROKER" || exit 1
 sleep 1
 QUIET=$( (sleep 5) | nc 127.0.0.1 "$PORT" | tr -d '\r\n' )
 say "a connection that says nothing is let go" "$QUIET" "-ERR said nothing for 2 seconds"

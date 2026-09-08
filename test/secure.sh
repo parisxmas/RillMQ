@@ -3,6 +3,7 @@
 #
 #     sh test/secure.sh [first-port]
 set -u
+. "$(dirname "$0")/lib.sh"
 A="${1:-9880}"
 TLSP=$((A + 1))
 AMQP=$((A + 2))
@@ -29,7 +30,10 @@ openssl req -x509 -newkey rsa:2048 -keyout "$D/key.pem" -out "$D/cert.pem" \
 ./rillmq "$A" "dir=$D/d" "users=$D/users" "tls=$TLSP" "amqp=$AMQP" "amqps=$AMQPS" \
   "cert=$D/cert.pem" "key=$D/key.pem" >/dev/null 2>&1 &
 N=$!
-sleep 1.5
+up "$A" "$N" || exit 1
+up "$TLSP" "$N" || exit 1
+up "$AMQP" "$N" || exit 1
+up "$AMQPS" "$N" || exit 1
 
 plain() { printf "$1" | nc -w 3 127.0.0.1 "$A" | tr -d '\r' | tr '\n' '|'; }
 wrapped() { printf "$1" | openssl s_client -quiet -connect "127.0.0.1:$TLSP" 2>/dev/null | tr -d '\r' | tr '\n' '|'; }

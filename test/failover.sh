@@ -3,6 +3,7 @@
 #
 #     sh test/failover.sh [first-port]
 set -u
+. "$(dirname "$0")/lib.sh"
 A="${1:-9901}"
 B=$((A + 1))
 C=$((A + 2))
@@ -31,6 +32,7 @@ except Exception: print('(timeout)')
 
 ./rillmq "$A" "dir=$DIR/1" node=0 "peers=$P" > "$DIR/1.log" 2>&1 &
 N1=$!
+up "$A" "$N1" || exit 1
 ./rillmq "$B" "dir=$DIR/2" node=1 "peers=$P" > "$DIR/2.log" 2>&1 &
 N2=$!
 ./rillmq "$C" "dir=$DIR/3" node=2 "peers=$P" > "$DIR/3.log" 2>&1 &

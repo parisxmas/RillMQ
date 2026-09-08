@@ -3,6 +3,7 @@
 #
 #     sh test/cluster.sh [port-a] [port-b]
 set -u
+. "$(dirname "$0")/lib.sh"
 A="${1:-9101}"
 B="${2:-9102}"
 PEERS="127.0.0.1:$A,127.0.0.1:$B"
@@ -19,8 +20,10 @@ say() {
 }
 
 ./rillmq "$A" "dir=$DIR/a" node=0 "peers=$PEERS" >/dev/null 2>&1 &
+up "$A" $! || exit 1
 NA=$!
 ./rillmq "$B" "dir=$DIR/b" node=1 "peers=$PEERS" >/dev/null 2>&1 &
+up "$B" $! || exit 1
 NB=$!
 sleep 1
 

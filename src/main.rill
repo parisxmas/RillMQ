@@ -36,13 +36,18 @@ fn said_wrong() =
   println("usage: rillmq passwd <file> <name> <word> [tag]")
   1
 
+# A port that cannot be had stops the broker, and says so with a status as
+# well as a line. It used to print and exit zero, which is the worst of both:
+# a script that starts a broker in the background and looks away has no way to
+# know, and the client that connects a moment later is answered by whatever
+# was already on that port. That cost an afternoon — the answers came from a
+# stale broker with another `dir` and another `peers`, and looked like a
+# message queue losing messages.
 fn start() =
   port = if arg_count() > 1 then str_to_int(arg(1)) else default_port()
   dir = where_to_keep_it()
   match listen_on(port)
-    Err(e) ->
-      println(e)
-      0
+    Err(e) -> stop_with(e)
     Ok(server) -> run_broker(server, dir)
 
 # `dir=` names somewhere to keep messages. Without one the broker keeps
@@ -176,9 +181,7 @@ fn turn_away(conn) =
 # own. `amqp=5672` is the port everything that speaks it expects.
 fn amqp_on(reg, done, port, d: Door) =
   if port <= 0 then 0 else match listen_on(port)
-    Err(e) ->
-      println("rillmq: " + e)
-      0
+    Err(e) -> stop_with("rillmq: " + e)
     Ok(server) ->
       println("rillmq speaking amqp 0-9-1 on port " + int_to_str(sock_port(server)) + (if is_null(d.tls.ctx) then "" else ", wrapped in tls"))
       spawn amqp_accept(server, reg, done, Gate(0, 1, channel(b_max_conns())), d)
@@ -223,9 +226,7 @@ fn stop_with(why) =
 
 fn native_tls_on(reg, done, port, d: Door) =
   if port <= 0 then 0 else match listen_on(port)
-    Err(e) ->
-      println("rillmq: " + e)
-      0
+    Err(e) -> stop_with("rillmq: " + e)
     Ok(server) ->
       println("rillmq on port " + int_to_str(sock_port(server)) + ", wrapped in tls (openssl " + tls_version() + ")")
       spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())), d)

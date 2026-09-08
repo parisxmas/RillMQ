@@ -18,13 +18,16 @@ import "sha1"
 
 fn mg_port() = opt_int("manage", 0)
 
+fn mg_stop_with(why) =
+  println(why)
+  exit(1)
+  0
+
 # -- the listener ----------------------------------------------------------------
 
 fn mg_on(reg, done, port, users) =
   if port <= 0 then 0 else match listen_on(port)
-    Err(e) ->
-      println("rillmq: " + e)
-      0
+    Err(e) -> mg_stop_with("rillmq: " + e)
     Ok(server) ->
       println("rillmq management on http://127.0.0.1:" + int_to_str(sock_port(server)) + (if au_wanted(users) then "" else " — open, because no users= was given"))
       spawn mg_accept(server, reg, users)

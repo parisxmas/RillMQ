@@ -3,6 +3,7 @@
 #
 #     sh test/majority.sh [first-port]
 set -u
+. "$(dirname "$0")/lib.sh"
 A="${1:-9801}"
 B=$((A + 1))
 C=$((A + 2))
@@ -33,16 +34,18 @@ except Exception: print('(timeout)')
 
 ./rillmq "$A" "dir=$DIR/1" node=0 "peers=$P" >/dev/null 2>&1 &
 N1=$!
-sleep 1.2
+up "$A" "$N1" || exit 1
 say "a leader alone will not confirm" "$(pub)" "-ERR not enough of the cluster has it"
 
 ./rillmq "$B" "dir=$DIR/2" node=1 "peers=$P" >/dev/null 2>&1 &
 N2=$!
+up "$B" "$N2" || exit 1
 sleep 2
 say "with two of three it will" "$(pub | cut -d' ' -f1)" "+OK"
 
 ./rillmq "$C" "dir=$DIR/3" node=2 "peers=$P" >/dev/null 2>&1 &
 N3=$!
+up "$C" "$N3" || exit 1
 sleep 2
 say "and with all three" "$(pub | cut -d' ' -f1)" "+OK"
 

@@ -851,6 +851,58 @@ Publishing two hundred thousand, acknowledging all of them and publishing two
 hundred thousand more leaves the broker exactly where the first two hundred
 thousand had it.
 
+## The afternoon the broker seemed to lose messages
+
+It is worth writing down, because the answer was not where anyone would look
+and the shape of the mistake is general.
+
+The cluster checks began failing: a publish went unanswered, `QSTAT` said the
+message was in the queue, and `PING` on the same connection came straight
+back. It looked like a lost wake-up in the runtime — a reply sitting in a
+channel with nobody to carry it — and that is a real class of bug in a
+language with green threads, so that is what was hunted. Five deliberate
+attempts to reproduce it found nothing: the checks under sixteen spinning
+processes, an arrival timed to land while the strand was parked on a timer,
+the same while it was parked on a channel, a connect storm against a dead
+port alongside a live socket, and sixty runs on a quiet machine.
+
+Two things had gone wrong together, and neither was in the broker's logic.
+
+A stale broker from an earlier experiment was still holding the port. It had
+another `dir`, another `peers`, another idea of which node it was, and it
+answered every connection the checks made. The `pkill -f rillmq` between runs
+had never matched it, because it had been built to `/tmp/t1` while a trace was
+being added.
+
+And a broker that cannot have its port **printed a line and exited zero**. A
+script that starts one in the background and looks away has no way to know
+that, so the checks connected to whatever was already there and asked their
+questions of a stranger. Every symptom follows: the stranger had no cluster to
+replicate to, so it never confirmed; it did have a queue by that name, so
+`QSTAT` answered; and `PING` needs nobody's agreement.
+
+Both halves are fixed. The broker exits non-zero when a port it was asked for
+cannot be had — every port, including `amqp=`, `tls=` and `manage=`. And
+`test/lib.sh` asks the harder question after starting one:
+
+```sh
+./rillmq 9801 "dir=$D" >/dev/null 2>&1 &
+up 9801 $! || exit 1
+```
+
+`up` does not settle for the port answering. It asks which process is
+listening and requires it to be the one just started, so a stale broker is a
+named failure rather than a quiet wrong answer:
+
+```
+port 9801 is held by pid(s) 90893, not by the broker just started (90968)
+```
+
+Nothing about the original theory survived, and that is the point of writing
+it down: the evidence was consistent with a lost wake-up and it was not one.
+What made it expensive was that both halves were silent — a process nobody
+could see, and a failure that reported success.
+
 ## Running the tests
 
 ```sh
@@ -941,13 +993,6 @@ All hundred and seven of them pass, with or without a journal.
 - **No flow control back to publishers, only a wall.** A publisher that
   outruns its consumers is refused rather than slowed, so it finds out by
   being told no rather than by being made to wait.
-- **The cluster checks want a quiet machine.** `majority.sh` and
-  `failover.sh` publish and wait on deadlines of a second or two. On a machine
-  also running RabbitMQ, a .NET build and three other brokers they time out,
-  and on a quiet one they pass sixty runs out of sixty. Whether that is only
-  load or whether there is a lost wake-up behind it is not settled: a reply
-  was once observed sitting in a connection's channel until the next command
-  arrived and shook it loose, and that has not been reproduced since.
 - **Nothing is measured over time.** `QUEUES` says what is true now; there is
   no rate, no age of the oldest message, and no way to see how big a queue's
   journal has grown.

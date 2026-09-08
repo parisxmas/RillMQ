@@ -3,6 +3,7 @@
 #
 #     sh test/manage.sh [first-port]
 set -u
+. "$(dirname "$0")/lib.sh"
 A="${1:-9900}"
 W=$((A + 1))
 D="$(mktemp -d)"
@@ -20,7 +21,8 @@ say() {
 ./rillmq passwd "$D/users" alice hunter2 >/dev/null
 ./rillmq "$A" "dir=$D/d" "users=$D/users" "manage=$W" >/dev/null 2>&1 &
 N=$!
-sleep 1.5
+up "$A" "$N" || exit 1
+up "$W" "$N" || exit 1
 
 U="http://127.0.0.1:$W"
 get() { curl -s -u alice:hunter2 "$U$1"; }

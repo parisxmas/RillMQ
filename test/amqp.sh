@@ -4,13 +4,15 @@
 #
 #     sh test/amqp.sh [amqp-port] [native-port]
 set -u
+. "$(dirname "$0")/lib.sh"
 AMQP="${1:-5672}"
 NATIVE="${2:-7998}"
 DIR="$(mktemp -d)/rillmq"
 
 ./rillmq "$NATIVE" "dir=$DIR" "amqp=$AMQP" >/dev/null 2>&1 &
 BROKER=$!
-sleep 1
+up "$NATIVE" "$BROKER" || exit 1
+up "$AMQP" "$BROKER" || exit 1
 
 # Builds if it has to. The first run fetches RabbitMQ.Client from nuget.
 ( cd test/dotnet && dotnet run -- "$AMQP" )
