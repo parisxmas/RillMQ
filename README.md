@@ -15,7 +15,8 @@ rill build src/main.rill -o rillmq
 Everything else is optional and named. Ports: `amqp=<port>` AMQP 0-9-1,
 `tls=<port>` and `amqps=<port>` the same two wrapped in TLS, `manage=<port>`
 the management pages. Files: `cert=` and `key=` a certificate and its key in
-PEM, `users=` who may connect. Cluster: `peers=<host:port,...>`, `node=<i>`,
+PEM, `ca=` certificates a client's own must be signed by, `users=` who may
+connect. Cluster: `peers=<host:port,...>`, `node=<i>`,
 `peer=<name:word>` for what one node signs in to another as, and `beat=<ms>`
 for how often a node checks that the ones whose copies it keeps are still
 there. Limits:
@@ -616,6 +617,18 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 `RabbitMQ.Client` connects to `amqps=` with `Ssl.Enabled = true` and nothing
 else changed, which is the whole point.
 
+Add `ca=` and the broker asks the client for a certificate of its own, and
+takes only one signed by something in that file:
+
+```sh
+./rillmq 6789 amqps=5671 cert=server.pem key=server.key ca=ca.pem
+```
+
+A client that brings none, or brings one signed by somebody else, is refused
+in the handshake — before a frame is read, and so before a name and a word are
+asked for at all. Without `ca=`, nothing is asked of a client but its
+password.
+
 The handshake is OpenSSL's, reached through Rill's `extern`, so this is a page
 of declarations in `src/tls.rill` rather than a TLS implementation. Nothing
 above that file knows which kind of connection it has: a connection carries an
@@ -1201,9 +1214,11 @@ All hundred and thirty-six of them pass, with or without a journal.
 - **One virtual host, and one permission.** `Connection.Open` takes whatever
   virtual host it is given. A name and a word are checked; what that person
   may then do is not, beyond a tag the management pages read.
-- **TLS is server-side only, and there is no client certificate.** A client
-  proves nothing about itself but its password, and one node proves nothing to
-  another but `peer=`.
+- **A client certificate is a door, not a name.** `ca=` decides who may reach
+  the broker; who they then are is still the name and word they send, and a
+  certificate's subject is not read or mapped to one. Between nodes there is
+  no TLS at all: a cluster link is a plain socket and one node proves nothing
+  to another but `peer=`.
 - **`immediate` is read and ignored.** The other bit on `Basic.Publish` asks
   for the message to be returned if no consumer is ready for it *this
   instant*, which is a promise about timing rather than about routing. RabbitMQ

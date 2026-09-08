@@ -51,6 +51,46 @@ say "and keeps the wrong pair out" "$(dotnet_check "$AMQP" auth alice nope)" "ou
 say "amqps carries a message" "$(RILLMQ_USER=alice RILLMQ_PASS=hunter2 dotnet_check "$AMQPS" tls)" "over tls"
 
 kill "$N" 2>/dev/null
+wait "$N" 2>/dev/null
+
+# -- a broker that wants to be shown a certificate too ------------------------------
+#
+# One authority signs the broker's certificate and one client's; a second
+# authority signs a stranger's. `ca=` names the first, so the stranger's
+# certificate is a certificate and still not one this broker knows.
+CAP=$((A + 4))
+openssl req -x509 -newkey rsa:2048 -keyout "$D/ca.key" -out "$D/ca.pem" \
+  -days 30 -nodes -subj "/CN=rillmq-test-ca" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -keyout "$D/other-ca.key" -out "$D/other-ca.pem" \
+  -days 30 -nodes -subj "/CN=somebody-else" >/dev/null 2>&1
+sign() {
+  openssl req -newkey rsa:2048 -keyout "$D/$1.key" -out "$D/$1.csr" \
+    -nodes -subj "/CN=$1" >/dev/null 2>&1
+  openssl x509 -req -in "$D/$1.csr" -CA "$D/$2.pem" -CAkey "$D/$2.key" \
+    -CAcreateserial -days 30 -out "$D/$1.pem" >/dev/null 2>&1
+}
+sign server ca
+sign client ca
+sign stranger other-ca
+
+./rillmq "$A" "dir=$D/e" "users=$D/users" "tls=$CAP" \
+  "cert=$D/server.pem" "key=$D/server.key" "ca=$D/ca.pem" >/dev/null 2>&1 &
+M=$!
+up "$A" "$M" || exit 1
+up "$CAP" "$M" || exit 1
+
+shown() {
+  printf 'AUTH alice hunter2\r\nPING\r\nQUIT\r\n' | openssl s_client -quiet \
+    -connect "127.0.0.1:$CAP" -CAfile "$D/ca.pem" $1 2>/dev/null | tr -d '\r' | tr '\n' '|'
+}
+
+say "a client with a certificate this broker knows gets in" \
+  "$(shown "-cert $D/client.pem -key $D/client.key")" "+OK|+PONG|+OK|"
+say "a client with none does not" "$(shown "")" ""
+say "and one signed by somebody else does not either" \
+  "$(shown "-cert $D/stranger.pem -key $D/stranger.key")" ""
+
+kill "$M" 2>/dev/null
 sleep 0.3
 printf '\n%d of %d passed\n' "$PASS" "$((PASS + FAIL))"
 [ "$FAIL" -eq 0 ]

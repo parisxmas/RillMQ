@@ -69,7 +69,7 @@ fn run_broker(server, dir) =
   spawn accept_loop(server, reg, done, Gate(0, 1, channel(b_max_conns())), b_door())
   spawn cl_watch(reg, done)
   amqp_on(reg, done, opt_int("amqp", 0), b_door())
-  wrapped(reg, done, tls_ready(opt("cert", ""), opt("key", "")))
+  wrapped(reg, done, tls_ready(opt("cert", ""), opt("key", ""), opt("ca", "")))
   mg_on(reg, done, mg_port(), b_users())
   say_who_may(b_users())
   println("rillmq on port " + int_to_str(sock_port(server)) + (if str_len(dir) == 0 then ", keeping nothing" else ", keeping messages in " + dir + " (" + int_to_str(restored) + " queue(s) and " + int_to_str(routed) + " binding(s) restored)"))

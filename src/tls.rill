@@ -35,6 +35,10 @@ extern "ssl" fn SSL_CTX_use_PrivateKey_file(ctx: Ptr, path: Ptr, kind: I32) -> I
 
 extern "ssl" fn SSL_CTX_check_private_key(ctx: Ptr) -> I32
 
+extern "ssl" fn SSL_CTX_load_verify_locations(ctx: Ptr, file: Ptr, dir: Ptr) -> I32
+
+extern "ssl" fn SSL_CTX_set_verify(ctx: Ptr, mode: I32, cb: Ptr) -> Unit
+
 # `SSL_CTX_set_min_proto_version` is a macro in the header rather than a
 # symbol in the library, so what it stands for is written out: control 123 on
 # the context, with the version as the argument.
@@ -73,6 +77,11 @@ fn tls_1_2() = 771
 
 fn tls_set_min_version() = 123
 
+# `SSL_VERIFY_PEER` and `SSL_VERIFY_FAIL_IF_NO_PEER_CERT` together. The first
+# alone asks a client for a certificate and lets it through without one, which
+# is a door with a lock and no latch.
+fn tls_verify_peer() = 3
+
 # -- the server's one context ----------------------------------------------------
 
 # Made once, at startup, and shared by every connection. It holds the
@@ -81,18 +90,18 @@ fn tls_set_min_version() = 123
 type Tls
   Tls(ctx: Ptr, why: Str)
 
-fn tls_ready(cert, key) =
-  if str_len(cert) == 0 || str_len(key) == 0 then Tls(null_ptr(), "a cert= and a key= are both wanted") else tls_with_files(SSL_CTX_new(TLS_server_method()), cert, key)
+fn tls_ready(cert, key, ca) =
+  if str_len(cert) == 0 || str_len(key) == 0 then Tls(null_ptr(), "a cert= and a key= are both wanted") else tls_with_files(SSL_CTX_new(TLS_server_method()), cert, key, ca)
 
-fn tls_with_files(ctx, cert, key) =
+fn tls_with_files(ctx, cert, key, ca) =
   if is_null(ctx) then Tls(null_ptr(), "openssl would not make a context: " + tls_why())
   else
     SSL_CTX_ctrl(ctx, tls_set_min_version(), tls_1_2(), null_ptr())
-    tls_loaded(ctx, tls_load(ctx, cert, key))
+    tls_loaded(ctx, tls_load(ctx, cert, key, ca))
 
-fn tls_load(ctx, cert, key) =
+fn tls_load(ctx, cert, key, ca) =
   c = tls_use_cert(ctx, cert)
-  if c != 1 then "cannot read the certificate in " + cert + ": " + tls_why() else tls_load_key(ctx, key)
+  if c != 1 then "cannot read the certificate in " + cert + ": " + tls_why() else tls_load_key(ctx, key, ca)
 
 fn tls_use_cert(ctx, cert) =
   p = to_cstr(cert)
@@ -100,11 +109,31 @@ fn tls_use_cert(ctx, cert) =
   free_ptr(p)
   r
 
-fn tls_load_key(ctx, key) =
+fn tls_load_key(ctx, key, ca) =
   p = to_cstr(key)
   r = SSL_CTX_use_PrivateKey_file(ctx, p, tls_pem())
   free_ptr(p)
-  if r != 1 then "cannot read the key in " + key + ": " + tls_why() else if SSL_CTX_check_private_key(ctx) != 1 then "the key in " + key + " is not the key for that certificate" else ""
+  if r != 1 then "cannot read the key in " + key + ": " + tls_why() else if SSL_CTX_check_private_key(ctx) != 1 then "the key in " + key + " is not the key for that certificate" else tls_want_client(ctx, ca)
+
+# `ca=` is the file of certificates this broker will take a client's own
+# certificate from. Given one, a client that brings none, or brings one signed
+# by somebody else, does not get through the handshake — which is a refusal
+# before a single frame is read, and therefore before a name and a word are
+# asked for at all. Without `ca=` nothing is asked of a client but its
+# password, which is what this did until now.
+fn tls_want_client(ctx, ca) =
+  if str_len(ca) == 0 then ""
+  else
+    p = to_cstr(ca)
+    r = SSL_CTX_load_verify_locations(ctx, p, null_ptr())
+    free_ptr(p)
+    tls_asking(ctx, ca, r)
+
+fn tls_asking(ctx, ca, r) =
+  if r != 1 then "cannot read the certificates in " + ca + ": " + tls_why()
+  else
+    SSL_CTX_set_verify(ctx, tls_verify_peer(), null_ptr())
+    ""
 
 fn tls_loaded(ctx, why) = if str_len(why) == 0 then Tls(ctx, "") else Tls(null_ptr(), why)
 
