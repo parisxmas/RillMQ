@@ -84,6 +84,19 @@ itself when it has to refuse something. A message's properties — `reply-to`,
 `correlation-id`, `content-type`, headers — are kept as they came and handed
 back untouched, which is what the request-and-reply pattern is made of.
 
+**Being asked to stop.** A broker over its `mem=` limit says so with
+`Connection.Blocked`, and says `Connection.Unblocked` when there is room
+again. Each is sent once at the moment it becomes true — a publisher told to
+pause every two hundred and fifty-sixth message is not being told anything.
+
+It goes only to clients that advertised `connection.blocked` among their
+capabilities, which is what RabbitMQ does, because a client that has not said
+it understands the method will be confused by receiving it. What RillMQ does
+not do is parse the field table to find out: the capability's name is a key in
+it, and a key in a field table is its own bytes, so finding the name in the
+blob is finding the capability. That is a shortcut and it is written down as
+one.
+
 **Publisher confirms are the interesting one.** A `Basic.Publish` has no reply,
 so an AMQP client cannot otherwise learn when its message reached the disk —
 which is exactly what RillMQ's own protocol tells a publisher as a matter of
@@ -394,6 +407,14 @@ is the only list of other nodes' queues it has — and it is exactly the set it
 could take over. So it pings each node whose copies it keeps, and stands for
 the ones that do not answer. The election is the same one a request would have
 held; it is simply held by nobody's request.
+
+One thing it did change is which node wins. A request holds an election and so
+does a heartbeat, and either can get there first, so the survivor that takes a
+queue over is no longer decided. `failover.sh` had been asserting which one,
+and now asserts what actually has to be true: that the survivors agree, and
+that the answer is one of them rather than nobody. Three nodes each asked the
+same question and answering differently is the thing worth failing a test
+over; which of two correct answers turns up is not.
 
 The risk this raises is the one the cluster already had. A node cut off from
 the rest still believes it leads its queues, and now the others will take them
@@ -1032,6 +1053,7 @@ rill build test/bench.rill  -o rillmq-bench
 sh test/persistence.sh       # 18 checks, most of which stop the broker
 sh test/amqp.sh              # 46 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 3 checks that a deleted exchange stays deleted
+sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 9 checks of passwords and TLS
 sh test/manage.sh            # 15 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -1048,7 +1070,7 @@ format that only ever reads itself has not been tested. The persistence checks a
 the broker itself to end, including once by `kill -9` and once with half a
 record appended by hand.
 
-All hundred and twenty-seven of them pass, with or without a journal.
+All hundred and twenty-eight of them pass, with or without a journal.
 
 ## What it deliberately is not, yet
 
@@ -1120,12 +1142,17 @@ All hundred and twenty-seven of them pass, with or without a journal.
   for the message to be returned if no consumer is ready for it *this
   instant*, which is a promise about timing rather than about routing. RabbitMQ
   removed it years ago and this never had it.
-- **At the memory limit a publisher is refused, not slowed.** Below it there
-  is real backpressure and always was: the strand reading a connection hands
-  each publish to the queue and does not read the next until it can, so a
-  slow queue fills the socket and the publisher waits. What is missing is
-  `Connection.Blocked` at the wall, so a publisher that has hit `mem=` finds
-  out by being told no rather than by being asked to pause.
+- **A blocked connection is asked to stop, not made to.** RabbitMQ stops
+  reading the socket, so a publisher that ignores `Connection.Blocked` is
+  eventually stopped by TCP. This says so and goes on reading, and a publisher
+  that carries on is refused a message at a time as before. The difference
+  matters for a client that does not listen; for one that does, it is the same
+  thing.
+- **How full is how big this process has got.** `rss_bytes()` counts
+  everything — the journal's buffers, a connection's, the binary itself — not
+  the messages. It is checked every two hundred and fifty-sixth publish on a
+  connection and about as often in each queue, so the wall is approached
+  rather than hit exactly.
 - **The history is two minutes and it is in memory.** One strand samples the
   registry once a second and keeps a hundred and twenty of those, so a rate is
   over the last ten seconds and a line is over the last minute. Nothing longer

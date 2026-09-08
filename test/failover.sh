@@ -56,8 +56,17 @@ sleep 2
 say "the request that holds the election is answered by the winner" "$(ask "$A" 'PUB alpha 5\r\nthree' | cut -d' ' -f1)" "+OK"
 sleep 1
 say "a queue comes back without anyone deciding it should" "$(ask "$A" 'PUB alpha 4\r\nfour' | cut -d' ' -f1)" "+OK"
-say "and the node that took it says so" "$(ask "$A" 'WHO alpha\r\n')" "+WHO 0"
-say "as does the one that voted for it" "$(ask "$B" 'WHO alpha\r\n')" "+WHO 0"
+# Which of the survivors takes it is not decided any more: the request holds
+# an election and so does the heartbeat, and either can get there first. What
+# has to be true is that they agree, and that the answer is somebody — two
+# nodes each believing they lead one queue is the thing worth failing over.
+TOOK=$(ask "$A" 'WHO alpha\r\n')
+say "the two survivors agree on who has it" "$TOOK|$(ask "$B" 'WHO alpha\r\n')" "$TOOK|$TOOK"
+case "$TOOK" in
+  "+WHO 0" | "+WHO 1") ONE_OF_THEM=yes ;;
+  *) ONE_OF_THEM="$TOOK" ;;
+esac
+say "and it is one of them rather than nobody" "$ONE_OF_THEM" "yes"
 say "with what was published before still in it" "$(ask "$A" 'QSTAT alpha\r\n' | cut -d' ' -f2)" "4"
 
 # A client on the other node finds the new leader rather than the old one.

@@ -68,6 +68,30 @@ class Program
             return 0;
         }
 
+        // `blocked <queue>` fills the broker until it is over whatever `mem=`
+        // it was started with, and says what the client was told on the way.
+        // A broker with no room left used to answer individual publishes with
+        // an error; AMQP has a way of saying "stop, I am full" to the whole
+        // connection instead, and RabbitMQ.Client raises it as an event.
+        if (args.Length > 2 && args[1] == "blocked")
+        {
+            var bf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = "/" };
+            using var bc = bf.CreateConnection();
+            var heard = new BlockingCollection<string>();
+            bc.ConnectionBlocked += (_, e) => heard.Add("blocked: " + e.Reason);
+            bc.ConnectionUnblocked += (_, _) => heard.Add("unblocked");
+            using var bm = bc.CreateModel();
+            bm.QueueDeclare(args[2], true, false, false, null);
+            var fat = new byte[64 * 1024];
+            for (int i = 0; i < 40000 && heard.Count == 0; i++)
+            {
+                bm.BasicPublish("", args[2], null, fat);
+                if (i % 200 == 0) Thread.Sleep(1);
+            }
+            Console.WriteLine(heard.TryTake(out var w, 4000) ? w : "(nothing was said)");
+            return 0;
+        }
+
         // `tls` connects over AMQPS and says whether it got in. The
         // certificate is one RillMQ made for itself, so the name is checked
         // and the chain is not: this says TLS works, not that a self-signed
