@@ -621,15 +621,23 @@ exactly the names, files and behaviour it had before there were any. A queue
 in any other host is stored under the host, a slash, and the name, which is
 what the management pages show and what a cluster hashes and replicates.
 
-Who may open which is the last field of a line in `users=`:
+Who may open which, and what they may do there, are the last two fields of a
+line in `users=`:
 
 ```
 alice:9f3c…:4096:1a7b…:administrator:/,prod
-carol:2b81…:4096:0e4f…:monitoring:/
+carol:2b81…:4096:0e4f…:monitoring:/:r
+dave:7a02…:4096:c115…:agent:/,prod:c
 ```
 
-An empty field means every host, which is what every line written before
-there was more than one says.
+Three letters: `c` to declare and delete, `w` to publish, `r` to consume. A
+host may carry its own after a colon — `prod:r` is read-only there — and the
+bare field is the rights for every host on the line that does not say
+otherwise. Empty means every host and every right, which is what every line
+written before there was more than one of either says.
+
+A connection that tries what it may not is refused on the channel with a 403,
+and the rest of the connection goes on.
 
 ## TLS
 
@@ -1232,11 +1240,14 @@ All hundred and thirty-six of them pass, with or without a journal.
   A `Basic.Qos` arriving after the consumers it governs takes effect on what
   is handed out from then on; what is already outstanding keeps the window it
   went out under.
-- **A `Basic.Get` on a queue another node holds is refused.** The link's
-  language has a word for subscribing and none for polling once, and a poll
-  used to be written as a subscription for an instant, which went over. It is
-  now one request the queue answers directly, and that request stops at the
-  node holding the queue.
+- **A `Basic.Get` across the cluster always settles.** The link's language has
+  a word for subscribing and none for asking once, so a poll that reaches
+  another node's queue is still written as a subscription for an instant — and
+  what it takes is settled over there before that subscription goes, because
+  unsubscribing gives back everything it was holding. The delivery tag such a
+  poll hands back is therefore one that nothing is waiting on, whatever the
+  client asked for. On the node holding the queue it is one request and the
+  tag means what it says.
 - **A consumer that answers for nothing has no window.** Prefetch does not
   apply under `no-ack`, which is what the specification says and what RabbitMQ
   does, so such a consumer is given whatever the connection will take as fast
@@ -1255,10 +1266,11 @@ All hundred and thirty-six of them pass, with or without a journal.
   `exclusive` gives it to one connection and refuses it to others with a 405,
   and `auto-delete` ends a queue with its last consumer and an exchange with
   its last binding.
-- **A permission is a door, not a grammar.** `users=` says which virtual hosts
-  a person may open. RabbitMQ says, for each host, which names they may
-  configure, write to and read from, as three regular expressions. Here,
-  once in, everybody may do everything.
+- **A right is a host, not a name.** `users=` says which virtual hosts a
+  person may open and which of the three things they may do there. RabbitMQ
+  says the same three as regular expressions over names, so that a person can
+  be allowed to write to `logs.*` and nothing else. Here the answer is the
+  same for every name in a host.
 - **The management pages do not know about virtual hosts.** They show every
   queue this broker holds, and one in a host other than the first is shown by
   the name it is stored under: the host, a slash, and the name.

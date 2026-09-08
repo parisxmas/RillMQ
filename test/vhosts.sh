@@ -23,7 +23,11 @@ say() {
 # Carol may open the one host she is given and no other. The field is on the
 # end of her line, so every line written before there was more than one host
 # goes on meaning everywhere.
-awk -F: 'BEGIN { OFS = ":" } $1 == "carol" { print $0 ":/"; next } { print }' "$D/users" > "$D/users.new"
+# Carol may open the one host she is given and no other, and there she may
+# only read. Both fields are on the end of her line, so every line written
+# before there was more than one host or more than one right goes on meaning
+# everywhere and everything.
+awk -F: 'BEGIN { OFS = ":" } $1 == "carol" { print $0 ":/:r"; next } { print }' "$D/users" > "$D/users.new"
 mv "$D/users.new" "$D/users"
 
 ./rillmq "$A" "dir=$D/d" "users=$D/users" "amqp=$AMQP" "vhosts=/,prod" >/dev/null 2>&1 &
@@ -42,6 +46,13 @@ say "one queue name in two hosts is two queues" \
   "$(RILLMQ_USER=alice RILLMQ_PASS=hunter2 client vhost split prod)" "there=(nothing) home=home"
 say "and the name a client gets back is the one it gave" \
   "$(RILLMQ_USER=alice RILLMQ_PASS=hunter2 client vhost name prod)" "vh-named"
+# Alice declares it; Carol may read it and nothing else.
+RILLMQ_USER=alice RILLMQ_PASS=hunter2 client vhost may / >/dev/null
+say "somebody with every right has every right" \
+  "$(RILLMQ_USER=alice RILLMQ_PASS=hunter2 client vhost may /)" "declare=yes publish=yes consume=yes"
+say "and somebody who may only read, only reads" \
+  "$(RILLMQ_USER=carol RILLMQ_PASS=c4rol client vhost may /)" "declare=403 publish=403 consume=yes"
+
 say "the queue in the other host has a file of its own" "$(ls "$D/d" | grep -c '^prod')" "2"
 say "and the one at home is named as it always was" "$(ls "$D/d" | grep -c '^vh-shared.log$')" "1"
 

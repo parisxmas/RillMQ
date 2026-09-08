@@ -9,11 +9,14 @@
 #
 # The file is one person a line, and the word is not in it:
 #
-#     alice:9f3c…:4096:1a7b…:administrator:/,prod
-#      name  salt  work  hash   what they may do  where they may do it
+#     alice:9f3c…:4096:1a7b…:administrator:/,prod:r
+#      name  salt  work  hash   what they may do  where       and what
 #
-# The last field is optional and empty means everywhere, which is what every
-# line written before there was more than one virtual host says.
+# The last two fields are optional and empty means everywhere and everything,
+# which is what every line written before there was more than one virtual host
+# says. A host may carry its own rights after a colon — `prod:r` is read-only
+# there — and the bare `r` above is the rights for every host on the line that
+# does not say otherwise.
 #
 # The salt is why two people who chose the same word do not share a line, and
 # why a table computed in advance is a table for this broker's one user. The
@@ -115,7 +118,35 @@ fn au_among(where, vhost) =
 
 fn au_listed(names, vhost) = match names
   Nil -> false
-  Cons(n, rest) -> str_cmp(n, vhost) == 0 || au_listed(rest, vhost)
+  Cons(n, rest) -> str_cmp(au_host_of(n), vhost) == 0 || au_listed(rest, vhost)
+
+# `prod:r` is a host and the rights in it; `prod` on its own is a host and
+# whatever the line's own rights field says.
+fn au_host_of(one) =
+  i = str_find(one, ":")
+  if i < 0 then one else one[0:i]
+
+fn au_rights_in(one) =
+  i = str_find(one, ":")
+  if i < 0 then "" else one[i + 1:]
+
+# What a person may do in a host: `c` declare and delete, `w` publish, `r`
+# consume. Nothing written down anywhere means all three, so a file from
+# before there were rights goes on meaning what it meant.
+fn au_rights(path, name, vhost) =
+  if !au_wanted(path) then au_all() else au_rights_for(au_where(path, name), au_field(unwrap_or(au_load(path)[name], ""), 5), vhost)
+
+fn au_all() = "crw"
+
+fn au_rights_for(where, whole, vhost) =
+  own = au_own_rights(split(where, ","), vhost)
+  if str_len(own) > 0 then own else if str_len(whole) > 0 then whole else au_all()
+
+fn au_own_rights(names, vhost) = match names
+  Nil -> ""
+  Cons(n, rest) -> if str_cmp(au_host_of(n), vhost) == 0 then au_rights_in(n) else au_own_rights(rest, vhost)
+
+fn au_has(rights, letter) = str_find(rights, letter) >= 0
 
 fn au_names(path) = map_keys(au_load(path))
 

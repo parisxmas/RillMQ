@@ -250,6 +250,29 @@ class Program
                 catch (Exception) { Console.WriteLine("out"); }
                 return 0;
             }
+            if (args[2] == "may")
+            {
+                var yf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = args[3] };
+                using var yc = yf.CreateConnection();
+                var said = new List<string>();
+                foreach (var what in new[] { "declare", "publish", "consume" })
+                {
+                    using var ym = yc.CreateModel();
+                    var stop = new BlockingCollection<string>();
+                    ym.ModelShutdown += (_, e) => stop.Add(e.ReplyCode.ToString());
+                    try
+                    {
+                        if (what == "declare") ym.QueueDeclare("rights-q", true, false, false, null);
+                        else if (what == "publish") ym.BasicPublish("", "rights-q", null, Encoding.UTF8.GetBytes("x"));
+                        else ym.BasicConsume("rights-q", true, "", new EventingBasicConsumer(ym));
+                    }
+                    catch (Exception) { }
+                    Thread.Sleep(300);
+                    said.Add(what + "=" + (stop.TryTake(out var sc, 1500) ? sc : "yes"));
+                }
+                Console.WriteLine(string.Join(" ", said));
+                return 0;
+            }
             if (args[2] == "name")
             {
                 var nf = new ConnectionFactory { HostName = "127.0.0.1", Port = port, UserName = user, Password = word, VirtualHost = args[3] };
