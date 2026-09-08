@@ -221,7 +221,7 @@ fn mg_people_page(users, who, said) =
   mg_people(b, au_names(users), who, mg_note(), said, au_wanted(users))
   html_response(200, strbuf_str(b))
 
-fn mg_note() = "RillMQ · " + mg_where()
+fn mg_note() = "RillMQ " + b_version() + " · " + mg_where()
 
 fn mg_where() =
   if str_len(opt("dir", "")) == 0 then "keeping nothing" else "keeping messages in " + opt("dir", "")
