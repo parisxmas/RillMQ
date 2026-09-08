@@ -1153,9 +1153,11 @@ All hundred and thirty-six of them pass, with or without a journal.
   its history, so what is read is what is still there — but there is no
   snapshot and no index, and a queue big enough will eventually make that
   matter. It is further off than it sounds; the numbers are two sections up.
-- **A rewrite holds the whole live queue as records at once.** The queue builds
-  them and hands them over as a list, which for a large queue is a second copy
-  of it in memory for as long as the write takes.
+- **A rewrite holds a list of the whole live queue.** Not a copy of it: what
+  is handed over is the messages the queue is already holding, one pointer
+  each, and the record that goes to the file is built on the way there. So it
+  costs a list rather than the queue's data twice over — but it is still a
+  list of everything live, made in one go.
 - **An election is one round.** One ask, one majority, one turn — there is no
   second phase and no log to reconcile, which is what makes a candidate that
   is behind a candidate that stays behind.

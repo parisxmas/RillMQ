@@ -199,6 +199,14 @@ type JReq
   # accounted for in the snapshot, and everything after it lands in the new
   # one.
   JRewriteReq(recs: List(Str), name: Str)
+  # The same thing for a queue, which hands over its messages rather than
+  # records made from them. A record is the body with a header around it, so
+  # a list of records is a second copy of the queue's data for as long as the
+  # write takes, and a queue big enough for a rewrite to matter is exactly the
+  # one that cannot spare it. A list of the messages themselves is a pointer
+  # each: the bodies are the ones the queue is already holding, and the record
+  # is built here, one at a time, on its way to the file.
+  JRewriteMsgs(msgs: List(Msg), name: Str)
   # The end of this journal, because the queue it belongs to has gone. Nothing
   # else ends one: every other journal in the program stops when the broker
   # does, on the `done` everybody watches.
@@ -303,6 +311,7 @@ fn j_is_stop(r) = match r
   JNote(rec) -> false
   JSay(reply, value) -> false
   JRewriteReq(recs, name) -> false
+  JRewriteMsgs(msgs, name) -> false
 
 fn j_commit(js: Js, jr: Jr, r) =
   b = strbuf()
@@ -433,6 +442,7 @@ fn j_add(b: StrBuf, r, g: JBatch) = match r
     JBatch(g.ws, g.pubs, g.acks + 1, g.todo)
   JSay(reply, value) -> JBatch(Cons(JWait(reply, value), g.ws), g.pubs, g.acks, g.todo)
   JRewriteReq(recs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
+  JRewriteMsgs(msgs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
   JStop -> g
 
 # In the order the records went in. `j_add` puts each on the front as it
@@ -544,16 +554,20 @@ fn j_rewrite(js: Js, c) = match c
   JNote(rec) -> js
   JStop -> js
   JSay(reply, value) -> js
-  JRewriteReq(recs, name) ->
-    tmp = js.path + ".new"
-    nfd = file_open(tmp, "w")
-    if nfd < 0 then js
-    else
-      file_write(nfd, j_name_record(name))
-      j_write_recs(nfd, recs, strbuf(), 0)
-      file_sync(nfd)
-      file_close(nfd)
-      j_swap(js, tmp, len(recs))
+  JRewriteReq(recs, name) -> j_rewriting(js, name, recs, Nil, len(recs))
+  JRewriteMsgs(msgs, name) -> j_rewriting(js, name, Nil, msgs, len(msgs))
+
+fn j_rewriting(js: Js, name, recs, msgs, n) =
+  tmp = js.path + ".new"
+  nfd = file_open(tmp, "w")
+  if nfd < 0 then js
+  else
+    file_write(nfd, j_name_record(name))
+    j_write_recs(nfd, recs, strbuf(), 0)
+    j_write_msgs(nfd, msgs, strbuf(), 0)
+    file_sync(nfd)
+    file_close(nfd)
+    j_swap(js, tmp, n)
 
 fn j_swap(js: Js, tmp, n) =
   if !file_rename(tmp, js.path) then js
@@ -587,5 +601,20 @@ fn j_flush_recs(fd, rest, b: StrBuf) =
   file_write(fd, strbuf_str(b))
   strbuf_clear(b)
   j_write_recs(fd, rest, b, 0)
+
+fn j_write_msgs(fd, msgs, b: StrBuf, n) = match msgs
+  Nil ->
+    file_write(fd, strbuf_str(b))
+    0
+  Cons(m, rest) ->
+    b += j_msg_of(m)
+    if n < j_chunk() then j_write_msgs(fd, rest, b, n + 1) else j_flush_msgs(fd, rest, b)
+
+fn j_msg_of(m: Msg) = j_msg_record(m.id, m.props, m.body)
+
+fn j_flush_msgs(fd, rest, b: StrBuf) =
+  file_write(fd, strbuf_str(b))
+  strbuf_clear(b)
+  j_write_msgs(fd, rest, b, 0)
 
 fn j_chunk() = 1000

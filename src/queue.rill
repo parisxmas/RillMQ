@@ -266,7 +266,7 @@ fn q_stopping(q: Q, r) = match r
 # has already written and in front of everything it has not. That ordering is
 # what makes the snapshot true when it is used rather than when it was taken.
 fn q_hand_over(q: Q) =
-  send(q.jr.puts, JRewriteReq(q_live_records(q), q.name))
+  send(q.jr.puts, JRewriteMsgs(q_live(q), q.name))
   q
 
 # In flight first, then ready in the order it will go out. A message in flight
@@ -274,19 +274,24 @@ fn q_hand_over(q: Q) =
 # which is what at-least-once has always meant; what is lost is only that it
 # keeps its place relative to the ready ones, and redelivery had already given
 # that up.
-fn q_live_records(q: Q) =
-  append(q_flight_recs(q.inflight, map_keys(q.inflight), Nil), q_ready_recs(q, q.tail - 1, Nil))
+# The messages themselves, not records made from them. What goes to the file
+# is built one at a time on the way there, so what is handed over is a pointer
+# each rather than the queue's data twice over.
+fn q_live(q: Q) =
+  append(q_flight_msgs(q.inflight, map_keys(q.inflight), Nil), q_ready_msgs(q, q.tail - 1, Nil))
 
-fn q_flight_recs(fl: Map(Int, Flight), ks, acc) = match ks
+fn q_flight_msgs(fl: Map(Int, Flight), ks, acc) = match ks
   Nil -> acc
   Cons(k, rest) -> match fl[k]
-    None -> q_flight_recs(fl, rest, acc)
-    Some(f) -> q_flight_recs(fl, rest, Cons(j_msg_record(f.msg.id, f.msg.props, f.msg.body), acc))
+    None -> q_flight_msgs(fl, rest, acc)
+    Some(f) -> q_flight_msgs(fl, rest, Cons(q_msg_of(f), acc))
 
-fn q_ready_recs(q: Q, i, acc) =
+fn q_msg_of(f: Flight) = f.msg
+
+fn q_ready_msgs(q: Q, i, acc) =
   if i < q.head then acc else match q.ready[i]
-    None -> q_ready_recs(q, i - 1, acc)
-    Some(m) -> q_ready_recs(q, i - 1, Cons(j_msg_record(m.id, m.props, m.body), acc))
+    None -> q_ready_msgs(q, i - 1, acc)
+    Some(m) -> q_ready_msgs(q, i - 1, Cons(m, acc))
 
 # The deadline the `select` above is given. With nothing in flight there is
 # nothing to wake up for, and with something in flight the wait is exactly as
