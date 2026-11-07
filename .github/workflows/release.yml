@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: the tag to build and publish
+        description: the tag to build and publish, or with `dry` any branch
         required: true
       dry:
         description: build and test everything, and publish nothing
@@ -100,6 +100,7 @@ jobs:
         run: cargo build --release
 
       - name: The tag and the source have to agree
+        if: ${{ !inputs.dry }}
         run: |
           want="${TAG#v}"
           have=$(sed -n 's/^fn b_version() = "\(.*\)"$/\1/p' src/broker.rill)

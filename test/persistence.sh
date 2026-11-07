@@ -107,8 +107,16 @@ while [ "$BULK" -ge 120000 ] && [ "$WAITED" -lt 60 ]; do
 done
 # Ready and in flight together: a hard kill gives the in-flight ones back as
 # ready, so counting only what is ready would be counting a different thing on
-# either side of the crash.
+# either side of the crash. The client goes without waiting for its last answers,
+# so this waits for the count to reach what it left, or it is measuring a number
+# that is still moving and blaming the crash for the difference.
 LEFT=$(stats | awk '{print $3 + $4}')
+WAITED=0
+while [ "$LEFT" -gt 100 ] && [ "$WAITED" -lt 60 ]; do
+  sleep 0.5
+  WAITED=$((WAITED + 1))
+  LEFT=$(stats | awk '{print $3 + $4}')
+done
 say "the journal was rewritten to about what is left" "$([ "$BULK" -lt 120000 ] && echo small || echo "$BULK")" "small"
 crash
 

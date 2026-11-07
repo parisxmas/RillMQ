@@ -105,6 +105,18 @@ class Conn:
         self.expect(60, 21)
 
 
+def tell(port, queue):
+    """What a stuck run looked like, on stderr, because it may only happen on a
+    machine nobody can log in to."""
+    os.system(f"(ss -tn 2>/dev/null || netstat -an -p tcp) | grep -E '[.:]{port}\\b' >&2")
+    try:
+        c = Conn(port)
+        c.s.settimeout(5)
+        print(f"the queue says {c.ready(queue)} left", file=sys.stderr)
+    except Exception as e:
+        print(f"the broker did not answer: {e!r}", file=sys.stderr)
+
+
 def fill(port, queue, n):
     c = Conn(port)
     c.s.sendall(declare(queue))
@@ -131,6 +143,7 @@ def drain(port, n, window):
                 done += 1
     except (socket.timeout, TimeoutError):
         print(f"stuck at {done}")
+        tell(port, queue)
         return
     c.s.sendall(method(1, 60, 30, short("c") + b"\0"))
     c.expect(60, 31)
