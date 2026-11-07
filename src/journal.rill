@@ -230,7 +230,7 @@ type Jr
 # One other node's copy of this journal, the socket to it, and when it was
 # last tried if there is no socket.
 type Copy
-  Copy(host: Str, port: Int, fd: Int, spill: Str, tried: Int)
+  Copy(host: Str, port: Int, fd: Int, spill: Str, tried: Int, yes: Bool)
 
 # Where a journal lives, who else is to have a copy of it, and how many of
 # them have to have a record before anybody is told it is safe.
@@ -287,8 +287,8 @@ fn j_dial_all(copies) = match copies
   Cons(c, rest) -> Cons(j_dial(c), j_dial_all(rest))
 
 fn j_dial(c: Copy) = match connect_to(c.host, c.port)
-  Err(e) -> Copy(c.host, c.port, -1, "", now_millis())
-  Ok(fd) -> Copy(c.host, c.port, fd, "", 0)
+  Err(e) -> Copy(c.host, c.port, -1, "", now_millis(), false)
+  Ok(fd) -> Copy(c.host, c.port, fd, "", 0, false)
 
 fn j_cannot(path, jr: Jr, done) =
   println("rillmq: cannot write " + path + ", this queue is memory only")
@@ -388,20 +388,27 @@ fn j_count_one(js: Js, c: Copy, rest, seen, got) =
   if c.fd < 0 then j_count(js, rest, Cons(c, seen), got)
   else
     a = j_line(c)
-    if a.fd < 0 then j_count(js, rest, Cons(a, seen), got) else j_count(js, rest, Cons(a, seen), got + 1)
+    j_count(js, rest, Cons(a, seen), if j_agreed(a) then got + 1 else got)
+
+# A line is an answer and not a yes. `-STALE` is a node saying it has heard of a
+# later turn, and it was being counted with the rest, so a leader that had been
+# replaced went on telling clients their messages were safe. What it had was
+# the one guarantee this file exists to give.
+fn j_agreed(a: Copy) =
+  a.fd >= 0 && a.yes
 
 # One line back from one copy, and whatever came with it kept for next time.
 fn j_line(c: Copy) =
   at = str_find(c.spill, "\r\n")
-  if at >= 0 then Copy(c.host, c.port, c.fd, c.spill[at + 2:], c.tried) else j_line_more(c)
+  if at >= 0 then Copy(c.host, c.port, c.fd, c.spill[at + 2:], c.tried, starts_with(c.spill, "+OK")) else j_line_more(c)
 
 fn j_line_more(c: Copy) =
   more = sock_read(c.fd)
-  if str_len(more) == 0 then j_copy_gone(c) else j_line(Copy(c.host, c.port, c.fd, c.spill + more, c.tried))
+  if str_len(more) == 0 then j_copy_gone(c) else j_line(Copy(c.host, c.port, c.fd, c.spill + more, c.tried, false))
 
 fn j_copy_gone(c: Copy) =
   sock_close(c.fd)
-  Copy(c.host, c.port, -1, "", now_millis())
+  Copy(c.host, c.port, -1, "", now_millis(), false)
 
 fn j_do_todo(js: Js, todo) = match todo
   Nil -> js
