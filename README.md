@@ -403,6 +403,11 @@ deep, three runs of each:
 | clustered, a queue this node holds | 28,700/sec |
 | clustered, a queue another node holds | 28,800/sec |
 
+Those are from an idle machine. A sync is most of what they measure, so they move
+with whatever else the disk is doing: on a busy one the same three came to 52,700,
+11,500 and 13,500, and 0.2.5 and 0.2.6 measured the same as each other there, so
+checking every batch against the leader's length costs nothing that shows.
+
 The two clustered figures being the same is the finding. This section used to
 say a proxy asked one thing at a time, so a queue's traffic across a link was
 a round trip deep rather than a pipeline — and that was simply wrong. `cl_ask`
