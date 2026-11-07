@@ -677,8 +677,8 @@ fn b_serving(fd, reg, done, cid, gone, ssl) =
   out = channel(b_backlog())
   say = channel(b_backlog())
   wire = channel(1)
-  spawn b_writer(fd, wire, done, false, ssl)
-  spawn b_pump(Pump(fd, say, out, wire, strbuf(), map_new()), "")
+  spawn b_writer(p_line(fd, ssl), wire, done, false)
+  spawn b_pump(Pump(fd, say, out, wire, strbuf(), map_new(), done), "")
   b_read(Conn(fd, reg, done, cid, out, say, gone, ssl), "", 0, Nil, 0, "")
 
 # Between the connection and its writer, gathering what is owed into one write
@@ -692,7 +692,7 @@ fn b_serving(fd, reg, done, cid, gone, ssl) =
 # `size` is what is held in slot 0, and in slot 1 how much of that is replies.
 # `head` is what has been offered to the writer and not yet taken.
 type Pump
-  Pump(fd: Int, say: Chan(Out), out: Chan(Out), wire: Chan(Out), owed: StrBuf, size: Map(Int, Int))
+  Pump(fd: Int, say: Chan(Out), out: Chan(Out), wire: Chan(Out), owed: StrBuf, size: Map(Int, Int), done: Chan(Int))
 
 type PStep
   PSay(what: Out)
@@ -781,9 +781,27 @@ fn b_cut_off(p: Pump) =
   sock_shutdown(p.fd)
   b_cleared(p)
 
+# What a connection leaves behind it. The journal answers a publish with a
+# `send` that waits, and it may be well behind the connection it is answering:
+# once a client has gone and more is owed to it than the channel holds, that
+# send never ends, and the journal stops for everyone. The queues stop behind
+# it at their next acknowledgement, and the broker goes quiet with nothing
+# wrong anywhere. So a channel someone may still answer on is emptied until it
+# has been quiet for long enough that nobody is going to.
+fn b_bin_ms() = 60000
+
+fn b_bin(ch, done) =
+  more = select
+    m = recv(ch) -> true
+    recv(done) -> false
+    timeout(b_bin_ms()) -> false
+  if more then b_bin(ch, done) else 0
+
 fn b_pump_end(p: Pump, head) =
   b_last_of(p, head)
   b_last_of(p, b_pump_take(p))
+  spawn b_bin(p.say, p.done)
+  spawn b_bin(p.out, p.done)
   send(p.wire, OFrame(""))
   0
 
@@ -798,19 +816,19 @@ fn b_last_of(p: Pump, text) =
 # that a broker being shut down can reach a connection that is saying nothing:
 # `sock_shutdown` ends the connection without closing the descriptor, which is
 # the only thing that wakes the reader parked on it.
-fn b_writer(fd, out, done, stopping, ssl) =
+fn b_writer(l: Line, out, done, stopping) =
   f = if stopping then Send(recv(out)) else b_next(out, done)
   match f
     Shutdown ->
-      sock_shutdown(fd)
-      b_writer(fd, out, done, true, ssl)
-    Send(what) -> b_put(fd, out, done, stopping, b_bytes(what), ssl)
+      sock_shutdown(l.fd)
+      b_writer(l, out, done, true)
+    Send(what) -> b_put(l, out, done, stopping, b_bytes(what))
 
-fn b_put(fd, out, done, stopping, text, ssl) =
-  if str_len(text) == 0 then p_close(ssl, fd)
+fn b_put(l: Line, out, done, stopping, text) =
+  if str_len(text) == 0 then p_line_close(l)
   else
-    p_write(ssl, fd, text)
-    b_writer(fd, out, done, stopping, ssl)
+    p_line_write(l, text)
+    b_writer(l, out, done, stopping)
 
 # This protocol's way of saying a message. The empty string is how the reader
 # says it has finished and the socket may go.

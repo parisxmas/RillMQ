@@ -79,6 +79,15 @@ say "a client that only asks is cut off in the end" "$($PY flood "$AMQP" 120)" "
 say "and costs what the limit says" "$(($(kb) < 400000))" "1"
 stop
 
+# A client that stops reading and stays connected, and a client that is only
+# slow, which is the one that must not be mistaken for it.
+start stall=2000
+say "a write that goes nowhere ends the connection" "$($PY gone "$AMQP" 50000)" "cut off"
+stop
+start stall=2000 ack=600000
+say "a client that is only slow keeps it" "$($PY dawdle "$AMQP" 200000 8)" "still connected"
+stop
+
 # The native protocol has no way to ask for a window, so the broker is told.
 start prefetch=0 ack=600000
 say "the native protocol is read to the end with no window" "$($PY native "$A" 50000)" "drained"

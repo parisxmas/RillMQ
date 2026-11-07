@@ -297,6 +297,66 @@ fn p_read(ssl, fd) = if is_null(ssl) then sock_read(fd) else tls_read(ssl, fd)
 
 fn p_write(ssl, fd, s) = if is_null(ssl) then sock_write(fd, s) else tls_write(ssl, fd, s)
 
+# A connection's writer, and the watchdog looking over its shoulder.
+#
+# A client that stops reading parks its writer, and a client that stops reading
+# and stays connected would park it for ever: nothing else on the connection can
+# tell, because the session and the reader are both still free. So a strand of
+# its own looks every `stall=<ms>`, and `sock_shutdown` is what ends a write
+# that has not moved since the last look, since it wakes everything parked on
+# the connection and the ordinary close takes it from there. A client is
+# therefore cut off after between one and two of those.
+#
+# The question is about progress. Writes are counted a piece at a time, because
+# a whole write can be a large message, and a client reading that slowly is slow
+# and not gone. They are counted in a map rather than told over a channel because
+# telling costs two switches per write, which was seven per cent of delivery, to
+# feed something that almost never does anything. In `seen`, slot 0 is pieces
+# begun, slot 1 pieces finished, and slot 2 is set once the socket is closing.
+type Line
+  Line(fd: Int, ssl: Ptr, seen: Map(Int, Int))
+
+fn p_line(fd, ssl) =
+  seen = map_new()
+  spawn p_watch(fd, seen, 0)
+  Line(fd, ssl, seen)
+
+fn p_stall_ms() = opt_int("stall", 30000)
+
+fn p_piece() = 65536
+
+fn p_line_write(l: Line, s) =
+  if str_len(s) <= p_piece() then p_line_piece(l, s) else p_line_pieces(l, s, 0)
+
+fn p_line_pieces(l: Line, s, from) =
+  if from >= str_len(s) then 0
+  else
+    upto = if from + p_piece() < str_len(s) then from + p_piece() else str_len(s)
+    p_line_piece(l, s[from:upto])
+    p_line_pieces(l, s, upto)
+
+fn p_line_piece(l: Line, s) =
+  seen = l.seen
+  seen[0] = map_or(seen, 0, 0) + 1
+  p_write(l.ssl, l.fd, s)
+  seen[1] = map_or(seen, 0, 0)
+  0
+
+# Marked before it is closed, so a look that comes after finds it marked and
+# leaves alone a descriptor that may by then be somebody else's.
+fn p_line_close(l: Line) =
+  seen = l.seen
+  seen[2] = 1
+  p_close(l.ssl, l.fd)
+
+fn p_watch(fd, seen, last) =
+  sleep_ms(p_stall_ms())
+  if map_or(seen, 2, 0) != 0 then 0 else p_watch_look(fd, seen, last, map_or(seen, 0, 0))
+
+fn p_watch_look(fd, seen, last, begun) =
+  if begun == last && begun > map_or(seen, 1, 0) then sock_shutdown(fd) else 0
+  p_watch(fd, seen, begun)
+
 fn p_close(ssl, fd) =
   if is_null(ssl) then 0 else tls_down(ssl)
   sock_close(fd)

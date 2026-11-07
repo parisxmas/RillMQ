@@ -6,6 +6,8 @@
     slow.py closes <port> <count>               open and politely close
     slow.py ignore <port> <messages>            consume, then never read again
     slow.py flood <port> <seconds>              ask, and never read an answer
+    slow.py gone <port> <messages>              ignore, then say whether it was cut off
+    slow.py dawdle <port> <messages> <seconds>  read, but slowly
     slow.py native <port> <messages>            drain, on RillMQ's own protocol
     slow.py pings <port> <seconds>              flood, on RillMQ's own protocol
 
@@ -166,6 +168,43 @@ def ignore(port, n):
     time.sleep(3600)
 
 
+def gone(port, n):
+    queue = "gone"
+    fill(port, queue, n)
+    c = Conn(port)
+    c.consume(queue, 0)
+    time.sleep(6)
+    # Everything the broker sent before it gave up is still here to be read.
+    c.s.settimeout(5)
+    try:
+        while c.s.recv(1 << 20):
+            pass
+    except ConnectionError:
+        pass
+    except (socket.timeout, TimeoutError):
+        print("still connected")
+        return
+    print("cut off")
+
+
+def dawdle(port, n, seconds):
+    queue = "dawdle"
+    fill(port, queue, n)
+    c = Conn(port)
+    c.consume(queue, 0)
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        try:
+            if not c.s.recv(16384):
+                print("cut off")
+                return
+        except ConnectionError:
+            print("cut off")
+            return
+        time.sleep(0.1)
+    print("still connected")
+
+
 def flood(port, seconds):
     c = Conn(port)
     name = "f" * 255
@@ -246,4 +285,4 @@ def pings(port, seconds):
 mode = sys.argv[1]
 args = [int(a) for a in sys.argv[2:]]
 {"drain": drain, "batches": batches, "closes": closes, "ignore": ignore, "flood": flood,
- "native": native, "pings": pings}[mode](*args)
+ "native": native, "pings": pings, "gone": gone, "dawdle": dawdle}[mode](*args)

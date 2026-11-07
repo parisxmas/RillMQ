@@ -25,7 +25,8 @@ there. Limits:
 `ack=<ms>` how long a message may be out unanswered, `prefetch=<n>` how much
 one consumer may hold, `mem=<MB>` how big the broker may get before it refuses
 publishes, `idle=<s>` how long a connection that has asked for nothing may say
-nothing, `conns=<n>` how many connections at once.
+nothing, `stall=<ms>` how long one write to a client may take before the client
+is disconnected, `conns=<n>` how many connections at once.
 
 ```sh
 ./rillmq passwd data/users alice hunter2

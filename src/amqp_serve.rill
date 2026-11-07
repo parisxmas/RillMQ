@@ -240,7 +240,7 @@ fn am_run(w: Who, buf) =
   wr = channel(am_writes())
   free = channel(1)
   send(free, 1)
-  spawn am_writer(w.fd, w.ssl, wr, free, false, false)
+  spawn am_writer(p_line(w.fd, w.ssl), wr, free, false, false)
   spawn am_reader(w, ses, wr, buf, 0)
   am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1, w.vh, map_new(), w.who, w.rights, map_new(), Pen(strbuf(), map_new(), wr, free)), ses, w.gone)
 
@@ -274,18 +274,18 @@ fn am_end(ses, wr) =
 # The socket closes when both have finished and not before. Closing a
 # descriptor with the reader parked on it does not wake the reader and may hand
 # the number to somebody else; `sock_shutdown` wakes it, and it says so here.
-fn am_writer(fd, ssl, wr, free, ended, read_out) = match recv(wr)
+fn am_writer(l: Line, wr, free, ended, read_out) = match recv(wr)
   AWBytes(text) ->
-    p_write(ssl, fd, text)
+    p_line_write(l, text)
     am_ready(free)
-    am_writer(fd, ssl, wr, free, ended, read_out)
+    am_writer(l, wr, free, ended, read_out)
   AWEnd ->
-    sock_shutdown(fd)
-    am_writer_done(fd, ssl, wr, free, true, read_out)
-  AWGone -> am_writer_done(fd, ssl, wr, free, ended, true)
+    sock_shutdown(l.fd)
+    am_writer_done(l, wr, free, true, read_out)
+  AWGone -> am_writer_done(l, wr, free, ended, true)
 
-fn am_writer_done(fd, ssl, wr, free, ended, read_out) =
-  if ended && read_out then p_close(ssl, fd) else am_writer(fd, ssl, wr, free, ended, read_out)
+fn am_writer_done(l: Line, wr, free, ended, read_out) =
+  if ended && read_out then p_line_close(l) else am_writer(l, wr, free, ended, read_out)
 
 # The session's last words can arrive with a token still unclaimed, so this
 # offers one rather than insisting.
@@ -511,6 +511,7 @@ fn am_close(am: Am, ses, gone, heard_end) =
   am_forget_all(am, map_keys(am.consumers))
   am_theirs(am)
   if am_owing(am) then am_hand_over(am) else 0
+  spawn b_bin(am.out, am.done)
   send(am.pen.wr, AWEnd)
   send(gone, 1)
   if heard_end then 0 else am_drain(ses)

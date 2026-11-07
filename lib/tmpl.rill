@@ -79,6 +79,7 @@ fn esc_tail(b: StrBuf, s, k, n) =
       b += escaped(c)
     else
       b += c
+  0
 
 fn first_special(s, i, n) =
   if i >= n then i else if is_special(str_get(s, i)) then i else first_special(s, i + 1, n)
