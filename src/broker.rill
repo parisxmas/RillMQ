@@ -636,7 +636,7 @@ fn b_peer() = opt("peer", "")
 # What version this is. It is said in one place on the wire — the server
 # properties of an AMQP connection — and read from here rather than written
 # there, so that the next version is one line rather than a search.
-fn b_version() = "0.2.0"
+fn b_version() = "0.2.1"
 
 # What a listener hands to every connection it takes: who may connect, and
 # whether the connection is wrapped in TLS. A plain port carries a context
