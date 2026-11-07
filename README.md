@@ -7,7 +7,7 @@ and written to a journal, so a broker that is killed comes back with what it
 had answered for. It speaks AMQP 0-9-1, so RabbitMQ's own client libraries
 work against it unchanged.
 
-This is version 0.2.5. It builds with Rill 0.16.2.
+This is version 0.2.6. It builds with Rill 0.16.2.
 
 ```sh
 rill build src/main.rill -o rillmq
@@ -1275,7 +1275,7 @@ sh test/deleted.sh           # 9 checks on what survives a restart and what does
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 14 checks of passwords, TLS and certificates
 sh test/slow.sh              # 26 checks of clients that do not keep up
-sh test/stale.sh             # 2 checks of a leader that was replaced while frozen
+sh test/stale.sh             # 5 checks of a leader that was replaced while frozen
 sh test/vhosts.sh            # 10 checks of virtual hosts and rights
 sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -1308,10 +1308,11 @@ All hundred and eighty-four of them pass, with or without a journal.
   costs a list rather than the queue's data twice over — but it is still a
   list of everything live, made in one go.
 - **An election is one round.** One ask, one majority, one turn. There is no
-  second phase, and a leader that is out-termed is never told: it goes on
-  holding the queue until somebody asks it something. What keeps two of them
-  from both winning is that only the lowest-numbered node that is still there
-  stands at all, which is a rule rather than a proof.
+  second phase. A leader that is out-termed is not told: it finds out from the
+  `-STALE` on its next write, and stands down at its next heartbeat, when it asks
+  who leads what it is holding and the node named says so itself. What keeps two
+  of them from both winning is that only the lowest-numbered node that is still
+  there stands at all, which is a rule rather than a proof.
 - **A node watches only what it is holding a copy of.** That is the only list
   of other nodes' queues it has, so a queue nobody has published to yet is a
   queue nobody is watching over. It has nothing in it, which is why this is

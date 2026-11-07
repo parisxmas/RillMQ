@@ -54,9 +54,19 @@ say "the others have moved on" "$(ask "$A" 'PUB alpha 4\r\nfour' | cut -d' ' -f1
 kill -CONT "$N3"
 sleep 0.4
 
-# Told no by everybody it asked, so it has not got a majority, and a message it
-# calls safe is one the cluster carrying on does not have.
-say "a leader that was replaced cannot confirm anything" "$(ask "$C" 'PUB alpha 4\r\nfive' | cut -c1-4)" "-ERR"
+# Whether this is refused or passed on depends on whether it has stood down yet.
+# What cannot depend on that: anything it calls safe, the leader has.
+FIVE=$(ask "$C" 'PUB alpha 4\r\nfive' | cut -c1-3)
+WANT=3
+[ "$FIVE" = "+OK" ] && WANT=4
+sleep 1.5
+say "what a replaced leader calls safe, the cluster has" "$(ask "$A" 'QSTAT alpha\r\n' | cut -d' ' -f2)" "$WANT"
+
+# It finds out by asking, and stands down rather than serving what it was holding.
+say "it stands in for the leader once it has asked" "$(ask "$C" 'QSTAT alpha\r\n' | cut -d' ' -f1-5)" "$(ask "$A" 'QSTAT alpha\r\n' | cut -d' ' -f1-5)"
+say "and takes messages for it" "$(ask "$C" 'PUB alpha 3\r\nsix' | cut -d' ' -f1)" "+OK"
+sleep 0.3
+say "which the leader has" "$(ask "$A" 'QSTAT alpha\r\n' | cut -d' ' -f2)" "$((WANT + 1))"
 
 kill -9 "$N1" "$N2" "$N3" 2>/dev/null
 wait 2>/dev/null

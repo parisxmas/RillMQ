@@ -167,7 +167,38 @@ fn cl_beating(reg, done, peers) =
 
 fn cl_round(reg, done, peers) =
   cl_check_each(reg, peers, cl_copies(reg))
+  cl_check_held(reg, peers, cl_held(reg))
   cl_beating(reg, done, peers)
+
+fn cl_held(reg) =
+  back = channel(1)
+  send(reg, RHeld(back))
+  recv(back)
+
+# A leader that was replaced is told nothing, because it was not there to be
+# told. So everything served from here is asked after, and whoever is named has
+# to say so itself: another node may only remember who led, and standing down on
+# that would give up a queue nobody else has.
+fn cl_check_held(reg, peers, names) = match names
+  Nil -> 0
+  Cons(n, rest) ->
+    cl_is_it_mine(reg, peers, n, cl_ask_who(peers, n, 0, cl_me()))
+    cl_check_held(reg, peers, rest)
+
+fn cl_is_it_mine(reg, peers, name, who) =
+  if who < 0 || who == cl_me() || !cl_says_it_leads(nth(peers, who), name, who) then 0 else cl_stand_down(reg, peers, name, who)
+
+fn cl_says_it_leads(where, name, who) = match where
+  None -> false
+  Some(q) -> str_cmp(cl_one_shot(cl_host(q), cl_port(q), "WHO " + name + crlf2()), "+WHO " + int_to_str(who)) == 0
+
+# A copy again, so the file it just gave up is fetched from whoever has the most.
+fn cl_stand_down(reg, peers, name, who) =
+  back = channel(1)
+  send(reg, RDemote(name, who, back))
+  recv(back)
+  cl_catch_up(reg, peers, name, cl_rounds())
+  0
 
 fn cl_copies(reg) =
   back = channel(1)

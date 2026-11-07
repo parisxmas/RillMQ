@@ -76,6 +76,9 @@ type RReq
   # nodes' queues this node has, and so the only set of things it could take
   # over if one of them stopped answering.
   RCopies(reply: Chan(List(Str)))
+  # What this node is serving itself, and being told that somebody else now is.
+  RHeld(reply: Chan(List(Str)))
+  RDemote(name: Str, leader: Int, reply: Chan(Int))
   # Serve a queue this node has only been keeping a copy of. What was a stand-in
   # for somebody else's queue becomes the queue.
   RPromote(name: Str, reply: Chan(Int))
@@ -159,12 +162,12 @@ type Conn
 # because the queue is what gets stopped, and a thing cannot be the one that
 # decides to stop itself and the one that is asked whether it should.
 type Reg
-  Reg(dir: Str, jr: Jr, self: Chan(RReq), auto: Map(Str, Int), owner: Map(Str, Int), xauto: Map(Str, Int))
+  Reg(dir: Str, jr: Jr, self: Chan(RReq), auto: Map(Str, Int), owner: Map(Str, Int), xauto: Map(Str, Int), moved: Map(Str, Int))
 
 fn r_run(dir, inbox, done) =
   jr = Jr(channel(256), channel(1))
   if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
-  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox, map_new(), map_new(), map_new()), inbox, done)
+  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox, map_new(), map_new(), map_new(), map_new()), inbox, done)
 
 fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, inbox, done) =
   step = select
@@ -244,6 +247,12 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     0
   RTable(reply) ->
     send(reply, r_table(qs, map_keys(qs), Nil, g.dir))
+    0
+  RHeld(reply) ->
+    send(reply, r_held(qs, mine, g, map_keys(qs), Nil))
+    0
+  RDemote(name, leader, reply) ->
+    send(reply, r_demote(qs, mine, ld, g, name, leader, done))
     0
   RCopies(reply) ->
     send(reply, map_keys(cs))
@@ -503,6 +512,39 @@ fn r_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, reg, name, done) 
 #
 # Nothing here decides that the other node is gone. Something else has to have
 # decided that, and it is not a decision this can make on its own.
+# Everything served from here rather than stood in for: promoted to it, or the
+# hash's to hold and not since given up.
+fn r_held(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), g: Reg, names, acc) = match names
+  Nil -> acc
+  Cons(n, rest) -> r_held(qs, mine, g, rest, if r_holds(mine, g, n) then Cons(n, acc) else acc)
+
+fn r_holds(mine: Map(Str, Int), g: Reg, name) =
+  !map_has(g.moved, name) && (map_has(mine, name) || cl_owner(name, len(cl_peers())) == cl_me())
+
+# Somebody else leads this now, and has said so itself. What is here stops: the
+# queue, its consumers, and the journal, whose confirmed records a majority has by
+# definition and whose others were never promised to anybody. From here this
+# node stands in for the leader like any other.
+fn r_demote(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), ld: Map(Str, Int), g: Reg, name, leader, done) = match qs[name]
+  None -> 0
+  Some(ch) ->
+    back = channel(1)
+    send(ch, QStop(false, false, back))
+    recv(back)
+    map_del(mine, name)
+    r_unlink(g.dir, name)
+    moved = g.moved
+    moved[name] = leader
+    ld[name] = leader
+    println("rillmq: " + name + " is led by node " + int_to_str(leader) + " now, standing down")
+    r_stand_for(qs, g, name, leader, done)
+
+fn r_stand_for(qs: Map(Str, Chan(QReq)), g: Reg, name, leader, done) =
+  ch = channel()
+  r_stand_in(name, g.self, ch, done, nth(cl_peers(), leader))
+  qs[name] = ch
+  1
+
 fn r_promote(qs: Map(Str, Chan(QReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), dir, name, done) =
   if map_has(mine, name) then 1
   else
@@ -636,7 +678,7 @@ fn b_peer() = opt("peer", "")
 # What version this is. It is said in one place on the wire — the server
 # properties of an AMQP connection — and read from here rather than written
 # there, so that the next version is one line rather than a search.
-fn b_version() = "0.2.5"
+fn b_version() = "0.2.6"
 
 # What a listener hands to every connection it takes: who may connect, and
 # whether the connection is wrapped in TLS. A plain port carries a context
