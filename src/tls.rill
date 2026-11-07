@@ -86,7 +86,9 @@ extern "crypto" fn ERR_get_error() -> U64
 # there was taken for the failure of the next one to ask, and a client leaving
 # could drop another that had done nothing wrong: its read ended and its writes
 # were lost. So this is called before every call that `SSL_get_error` will be
-# asked about, which is what OpenSSL's own documentation says to do.
+# asked about, which is what OpenSSL's own documentation says to do, and the
+# asking is done in the same function as the call. A strand can lose its turn at
+# a tail call, and another connection can then fill the queue in between.
 extern "crypto" fn ERR_clear_error() -> Unit
 
 extern "crypto" fn ERR_error_string_n(e: U64, buf: Ptr, len: USize) -> Unit
@@ -231,10 +233,12 @@ fn tls_shaking(ssl, fd, tries) =
 
 fn tls_shake_once(ssl, fd, tries) =
   ERR_clear_error()
-  tls_shook(ssl, fd, tries, SSL_accept(ssl))
+  r = SSL_accept(ssl)
+  e = if r == 1 then 0 else SSL_get_error(ssl, r)
+  tls_shook(ssl, fd, tries, r, e)
 
-fn tls_shook(ssl, fd, tries, r) =
-  if r == 1 then ssl else tls_shake_again(ssl, fd, tries, SSL_get_error(ssl, r))
+fn tls_shook(ssl, fd, tries, r, e) =
+  if r == 1 then ssl else tls_shake_again(ssl, fd, tries, e)
 
 fn tls_shake_again(ssl, fd, tries, e) =
   if e != tls_want_read() && e != tls_want_write() then tls_give_up(ssl) else tls_shake_after(ssl, fd, tries, e)
@@ -292,10 +296,12 @@ fn tls_write_from(ssl, fd, p, want, sent) =
 
 fn tls_write_more(ssl, fd, p, want, sent) =
   ERR_clear_error()
-  tls_wrote(ssl, fd, p, want, sent, SSL_write(ssl, ptr_offset(p, sent), want - sent))
+  k = SSL_write(ssl, ptr_offset(p, sent), want - sent)
+  e = if k > 0 then 0 else SSL_get_error(ssl, k)
+  tls_wrote(ssl, fd, p, want, sent, k, e)
 
-fn tls_wrote(ssl, fd, p, want, sent, k) =
-  if k > 0 then tls_write_from(ssl, fd, p, want, sent + k) else tls_write_again(ssl, fd, p, want, sent, SSL_get_error(ssl, k))
+fn tls_wrote(ssl, fd, p, want, sent, k, e) =
+  if k > 0 then tls_write_from(ssl, fd, p, want, sent + k) else tls_write_again(ssl, fd, p, want, sent, e)
 
 fn tls_write_again(ssl, fd, p, want, sent, e) =
   if e == tls_want_read() then tls_write_after_read(ssl, fd, p, want, sent) else if e == tls_want_write() then tls_write_after_pause(ssl, fd, p, want, sent) else -1
@@ -376,8 +382,12 @@ fn p_line_pieces(l: Line, s, from) =
 
 fn p_line_piece(l: Line, s) =
   p_moved(l)
-  p_write(l.ssl, l.fd, s)
+  wrote = p_write(l.ssl, l.fd, s)
   p_moved(l)
+  # Bytes that did not go cannot be left out of a stream and the rest sent on, so
+  # this ends the connection, and a client finds out rather than waiting for
+  # something that was dropped.
+  if wrote < 0 then sock_shutdown(l.fd) else 0
 
 fn p_moved(l: Line) =
   n = map_or(l.count, 0, 0) + 1
