@@ -1282,6 +1282,7 @@ sh test/secure.sh            # 14 checks of passwords, TLS and certificates
 sh test/slow.sh              # 26 checks of clients that do not keep up
 sh test/stale.sh             # 5 checks of a leader that was replaced while frozen
 sh test/gap.sh               # a copy that was away ends up the same as the leader's
+sh test/speed.sh             # that it has not become twenty-five times slower
 sh test/vhosts.sh            # 10 checks of virtual hosts and rights
 sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes

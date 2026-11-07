@@ -110,7 +110,9 @@ jobs:
       # what it is testing is a journal that is mostly acknowledgements and
       # that takes more of them than a shell script wants to write.
       - name: Build what the tests drive it with
-        run: rill-lang/target/release/rill build test/compact.rill -o rillmq-compact
+        run: |
+          rill-lang/target/release/rill build test/compact.rill -o rillmq-compact
+          rill-lang/target/release/rill build test/bench.rill -o rillmq-bench
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -119,7 +121,7 @@ jobs:
       - name: Every test there is
         run: |
           for t in amqp blocked catchup cluster deleted failover handover \
-                   majority manage persistence secure slow stale gap vhosts; do
+                   majority manage persistence secure slow stale gap speed vhosts; do
             printf '\n===== %s =====\n' "$t"
             sh "test/$t.sh" || exit 1
           done
