@@ -198,9 +198,7 @@ fn r_all_records(xs: Map(Str, Chan(XReq)), ks, acc) = match ks
     Some(ch) -> r_all_records(xs, rest, append(acc, r_records_of(ch)))
 
 fn r_records_of(ch) =
-  back = channel(1)
-  send(ch, XRecords(back))
-  recv(back)
+  call(ch, XRecords(_))
 
 fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, r, done) = match r
   RFind(name, reply) ->
@@ -393,9 +391,7 @@ fn r_kind_of(xs: Map(Str, Chan(XReq)), name) = match xs[name]
   Some(ch) -> r_ask_kind(ch)
 
 fn r_ask_kind(ch) =
-  back = channel(1)
-  send(ch, XKind(back))
-  recv(back)
+  call(ch, XKind(_))
 
 # Somebody else's, or nobody's yet. A queue is only ever claimed by the
 # connection that declared it exclusive, and the claim is dropped when that
@@ -460,9 +456,7 @@ fn r_gone_one(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), g: Reg, name, cid) 
 fn r_drop_queue(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), dir, name, if_unused, if_empty) = match qs[name]
   None -> -1
   Some(ch) ->
-    back = channel(1)
-    send(ch, QStop(if_unused, if_empty, back))
-    r_dropped(qs, mine, dir, name, recv(back))
+    r_dropped(qs, mine, dir, name, call(ch, QStop(if_unused, if_empty, _)))
 
 # A queue that refused the conditions is still there, so nothing is forgotten
 # and nothing is unlinked.
@@ -489,9 +483,7 @@ fn r_unlink(dir, name) =
 fn r_drop_exchange(xs: Map(Str, Chan(XReq)), name, quiet, if_unused) = match xs[name]
   None -> -1
   Some(ch) ->
-    back = channel(1)
-    send(ch, XStop(quiet, if_unused, back))
-    r_dropped_x(xs, name, recv(back))
+    r_dropped_x(xs, name, call(ch, XStop(quiet, if_unused, _)))
 
 # One that refused is still there, so nothing is forgotten.
 fn r_dropped_x(xs: Map(Str, Chan(XReq)), name, n) =
@@ -544,9 +536,7 @@ fn r_holds(mine: Map(Str, Int), g: Reg, name) =
 fn r_demote(qs: Map(Str, Chan(QReq)), mine: Map(Str, Int), ld: Map(Str, Int), g: Reg, name, leader, done) = match qs[name]
   None -> 0
   Some(ch) ->
-    back = channel(1)
-    send(ch, QStop(false, false, back))
-    recv(back)
+    call(ch, QStop(false, false, _))
     map_del(mine, name)
     r_unlink(g.dir, name)
     moved = g.moved
@@ -746,7 +736,7 @@ fn b_serving(fd, reg, done, cid, gone, ssl, d: Door) =
 # without it or this, delivery runs at two thirds of the rate. Replies arrive on
 # `say` and deliveries on `out`, because only one of them may be refused: a
 # reply is always taken, so the reader never waits on the client, and deliveries
-# stop being taken once the client is behind, for `q_try_send` to leave ready.
+# stop being taken once the client is behind, for `try_send` to leave ready.
 # The limits are `am_writer`'s, for the same reasons.
 #
 # `size` is what is held in slot 0, and in slot 1 how much of that is replies.
@@ -1017,9 +1007,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     send(c.say, OFrame(w_pong()))
     b_read(c, buf, next, subs, 0, who)
   CStats ->
-    back = channel()
-    send(c.reg, RTotals(back))
-    t = recv(back)
+    t = call(c.reg, RTotals(_))
     send(c.say, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
     b_read(c, buf, next, subs, 0, who)
   CXDecl(ex, kind, inner) ->
@@ -1027,9 +1015,7 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CBind(ex, qname, key) ->
-    back = channel(1)
-    send(b_exchange(c, ex, x_direct()), XBind(qname, key, ToQueue(b_find(c.reg, qname)), false, back))
-    recv(back)
+    call(b_exchange(c, ex, x_direct()), XBind(qname, key, ToQueue(b_find(c.reg, qname)), false, _))
     send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CXPub(ex, key, body) ->
@@ -1038,15 +1024,11 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
   CRepl(qname, term, at, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, at, bytes)
   CWhole(qname, term, bytes) -> b_take_whole(c, Where(buf, next, subs, who), qname, term, bytes)
   CPromote(qname) ->
-    back = channel(1)
-    send(c.reg, RPromote(qname, back))
-    recv(back)
+    call(c.reg, RPromote(qname, _))
     send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CVote(qname, term, size, node) ->
-    back = channel(1)
-    send(c.reg, RVote(qname, term, size, node, back))
-    send(c.say, OFrame(if recv(back) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
+    send(c.say, OFrame(if call(c.reg, RVote(qname, term, size, node, _)) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
     b_read(c, buf, next, subs, 0, who)
   CTail(qname, from) ->
     b_say_tail(c, qname, b_tail(c, qname, from))
@@ -1055,14 +1037,10 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     send(c.say, OFrame(w_size_line(b_size(c, qname))))
     b_read(c, buf, next, subs, 0, who)
   CWho(qname) ->
-    back = channel(1)
-    send(c.reg, RWho(qname, back))
-    send(c.say, OFrame(w_who_line(recv(back))))
+    send(c.say, OFrame(w_who_line(call(c.reg, RWho(qname, _)))))
     b_read(c, buf, next, subs, 0, who)
   CDrain(qname) ->
-    back = channel(1)
-    send(b_find(c.reg, qname), QDrain(back))
-    send(c.say, OFrame(w_drained(recv(back))))
+    send(c.say, OFrame(w_drained(call(b_find(c.reg, qname), QDrain(_)))))
     b_read(c, buf, next, subs, 0, who)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))
@@ -1087,23 +1065,17 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     # from the other, which is what makes this enough; asking first and
     # answering after would let a message overtake the `+OK` that promised it.
     send(c.say, OFrame(w_ok()))
-    back = channel()
-    send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false, q_prefetch(), c.cid), back))
-    recv(back)
+    call(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false, q_prefetch(), c.cid), _))
     b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0, who)
   CUnsub(qname) ->
     b_drop(c.reg, c.cid, qname)
     send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, without_name(subs, qname), 0, who)
   CAck(qname, id) ->
-    back = channel()
-    send(b_find(c.reg, qname), QAck(id, back))
-    send(c.say, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
+    send(c.say, OFrame(if call(b_find(c.reg, qname), QAck(id, _)) == 1 then w_ok() else w_err("no such message in flight")))
     b_read(c, buf, next, subs, 0, who)
   CNack(qname, id) ->
-    back = channel()
-    send(b_find(c.reg, qname), QNack(id, back))
-    send(c.say, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
+    send(c.say, OFrame(if call(b_find(c.reg, qname), QNack(id, _)) == 1 then w_ok() else w_err("no such message in flight")))
     b_read(c, buf, next, subs, 0, who)
 
 fn b_signed_in(c: Conn, buf, next, subs, name, yes) =
@@ -1153,15 +1125,11 @@ fn b_take_whole(c: Conn, w: Where, qname, term, bytes) =
   if term < b_term(c, qname) then b_refuse_copy(c, w) else b_keep_whole(c, w, qname, bytes)
 
 fn b_keep_whole(c: Conn, w: Where, qname, bytes) =
-  back = channel(1)
-  send(c.reg, RCopy(qname, back))
-  send(r_puts(recv(back)), JWhole(bytes, c.say, OFrame(w_ok())))
+  send(r_puts(call(c.reg, RCopy(qname, _))), JWhole(bytes, c.say, OFrame(w_ok())))
   b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_keep_copy(c: Conn, w: Where, qname, bytes) =
-  back = channel(1)
-  send(c.reg, RCopy(qname, back))
-  send(r_puts(recv(back)), JPut(bytes, c.say, OFrame(w_ok())))
+  send(r_puts(call(c.reg, RCopy(qname, _))), JPut(bytes, c.say, OFrame(w_ok())))
   b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_refuse_copy(c: Conn, w: Where) =
@@ -1169,42 +1137,30 @@ fn b_refuse_copy(c: Conn, w: Where) =
   b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_size(c: Conn, name) =
-  back = channel(1)
-  send(c.reg, RSize(name, back))
-  recv(back)
+  call(c.reg, RSize(name, _))
 
 fn b_tail(c: Conn, name, from) =
-  back = channel(1)
-  send(c.reg, RTail(name, from, back))
-  recv(back)
+  call(c.reg, RTail(name, from, _))
 
 fn b_say_tail(c: Conn, name, t) =
   send(c.say, OFrame(w_tail_line(str_len(t)) + t))
   0
 
 fn b_term(c: Conn, name) =
-  back = channel(1)
-  send(c.reg, RTerm(name, back))
-  recv(back)
+  call(c.reg, RTerm(name, _))
 
 fn r_puts(j: Jr) = j.puts
 
 fn q_count_of(ch) =
-  back = channel(1)
-  send(ch, QStat(back))
-  recv(back)
+  call(ch, QStat(_))
 
 fn b_exchange(c: Conn, name, kind) = b_exchange_as(c, name, kind, false)
 
 fn b_exchange_as(c: Conn, name, kind, inner) =
-  back = channel(1)
-  send(c.reg, RExchange(name, kind, false, true, false, inner, back))
-  recv(back)
+  call(c.reg, RExchange(name, kind, false, true, false, inner, _))
 
 fn b_find(reg, name) =
-  back = channel()
-  send(reg, RFind(name, back))
-  recv(back)
+  call(reg, RFind(name, _))
 
 # Leaving is not just closing the socket. Every queue this connection was
 # subscribed to has to be told first, so that whatever it was holding goes
@@ -1228,9 +1184,7 @@ fn b_drop_all(reg, cid, subs) = match subs
     b_drop_all(reg, cid, rest)
 
 fn b_drop(reg, cid, name) =
-  back = channel()
-  send(b_find(reg, name), QUnsub(cid, back))
-  recv(back)
+  call(b_find(reg, name), QUnsub(cid, _))
 
 fn contains_name(names, name) = match names
   Nil -> false

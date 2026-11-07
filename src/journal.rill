@@ -441,9 +441,7 @@ fn j_do_todo(js: Js, todo) = match todo
 fn j_maybe_ask(js: Js, jr: Jr) =
   if !j_worth_rewriting(js) then js
   else
-    asked = select
-      send(jr.want, 1) -> true
-      default -> false
+    try_send(jr.want, 1)
     js
 
 # Everything already waiting, without waiting for any more of it.

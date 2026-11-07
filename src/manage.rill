@@ -66,9 +66,7 @@ fn mg_kept(l, n) = match l
 # -- reading it back -----------------------------------------------------------------
 
 fn mg_history(watch) =
-  back = channel(1)
-  send(watch, SeenAll(back))
-  recv(back)
+  call(watch, SeenAll(_))
 
 # How much came in and went out per second for one queue, over the last little
 # while. Two samples and the seconds between them; nothing is smoothed, because
@@ -229,14 +227,10 @@ fn mg_where() =
 # -- what the pages ask for -------------------------------------------------------------
 
 fn mg_totals(reg) =
-  back = channel(1)
-  send(reg, RTotals(back))
-  recv(back)
+  call(reg, RTotals(_))
 
 fn mg_table(reg) =
-  back = channel(1)
-  send(reg, RTable(back))
-  recv(back)
+  call(reg, RTable(_))
 
 # -- what the forms do --------------------------------------------------------------------
 

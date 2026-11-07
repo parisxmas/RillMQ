@@ -171,9 +171,7 @@ fn cl_round(reg, done, peers) =
   cl_beating(reg, done, peers)
 
 fn cl_held(reg) =
-  back = channel(1)
-  send(reg, RHeld(back))
-  recv(back)
+  call(reg, RHeld(_))
 
 # A leader that was replaced is told nothing, because it was not there to be
 # told. So everything served from here is asked after, and whoever is named has
@@ -194,16 +192,12 @@ fn cl_says_it_leads(where, name, who) = match where
 
 # A copy again, so the file it just gave up is fetched from whoever has the most.
 fn cl_stand_down(reg, peers, name, who) =
-  back = channel(1)
-  send(reg, RDemote(name, who, back))
-  recv(back)
+  call(reg, RDemote(name, who, _))
   cl_catch_up(reg, peers, name, cl_rounds())
   0
 
 fn cl_copies(reg) =
-  back = channel(1)
-  send(reg, RCopies(back))
-  recv(back)
+  call(reg, RCopies(_))
 
 # One ping per queue is one ping too many when a node holds twenty copies of
 # the same node's queues, but a ping is a connection and a line and this
@@ -254,29 +248,21 @@ fn cl_step_up_now(reg, peers, name) =
 fn cl_stepped_up(reg, name, term) =
   println("rillmq: " + name + " has nobody, taking it over for turn " + int_to_str(term))
   cl_note_term_at(reg, name, term)
-  back = channel(1)
-  send(reg, RPromote(name, back))
-  recv(back)
+  call(reg, RPromote(name, _))
   0
 
 # Writing the turn down as a vote for itself, which is what a node standing
 # for a queue does anyway: the record is what makes anything it sends
 # afterwards say which turn it is for.
 fn cl_note_term_at(reg, name, term) =
-  back = channel(1)
-  send(reg, RVote(name, term, cl_size_at(reg, name), cl_me(), back))
-  recv(back)
+  call(reg, RVote(name, term, cl_size_at(reg, name), cl_me(), _))
   0
 
 fn cl_term_at(reg, name) =
-  back = channel(1)
-  send(reg, RTerm(name, back))
-  recv(back)
+  call(reg, RTerm(name, _))
 
 fn cl_size_at(reg, name) =
-  back = channel(1)
-  send(reg, RSize(name, back))
-  recv(back)
+  call(reg, RSize(name, _))
 
 # A queue whose node cannot be reached still has to answer, or every publisher
 # that names it waits for ever. It says no.
@@ -502,9 +488,7 @@ fn cl_pulled(reg, name, bytes) =
   if str_len(bytes) == 0 then 0 else cl_appended(reg, name, bytes)
 
 fn cl_appended(reg, name, bytes) =
-  back = channel(1)
-  send(reg, RCatchUp(name, bytes, back))
-  recv(back)
+  call(reg, RCatchUp(name, bytes, _))
 
 # A reply with a body behind it, which is the only one in the cluster's
 # language: a line saying how many bytes, and then that many.
@@ -541,9 +525,7 @@ fn cl_fill(fd, buf, n) =
     if str_len(more) == 0 then "" else cl_fill(fd, buf + more, n)
 
 fn cl_may_stand(reg, name, term) =
-  back = channel(1)
-  send(reg, RStanding(name, term, back))
-  recv(back)
+  call(reg, RStanding(name, term, _))
 
 fn cl_stand(name, term, size, peers, me) =
   cl_won(cl_count_votes(peers, name, term, size, 0, 1), len(peers))
@@ -591,14 +573,10 @@ fn cl_standing(p: P, r, peers, caught) =
   if !cl_may_stand(p.reg, p.name, term) || !cl_stand(p.name, term, cl_size_of(p), peers, cl_me()) then cl_no(p, r) else cl_elected(p, r, term)
 
 fn cl_term_of(p: P) =
-  back = channel(1)
-  send(p.reg, RTerm(p.name, back))
-  recv(back)
+  call(p.reg, RTerm(p.name, _))
 
 fn cl_size_of(p: P) =
-  back = channel(1)
-  send(p.reg, RSize(p.name, back))
-  recv(back)
+  call(p.reg, RSize(p.name, _))
 
 fn cl_elected(p: P, r, term) =
   println("rillmq: taking over " + p.name + " for turn " + int_to_str(term))
@@ -606,9 +584,7 @@ fn cl_elected(p: P, r, term) =
   cl_take_over(p, r)
 
 fn cl_note_term(p: P, term) =
-  back = channel(1)
-  send(p.reg, RVote(p.name, term, cl_size_of(p), cl_me(), back))
-  recv(back)
+  call(p.reg, RVote(p.name, term, cl_size_of(p), cl_me(), _))
   0
 
 # The registry puts a real queue where this stand-in was, and every connection
@@ -626,9 +602,7 @@ fn cl_note_term(p: P, term) =
 # subscription to a stand-in nobody fills any more. They are subscribed to the
 # real queue, which is the same thing the proxy does when a link comes back.
 fn cl_take_over(p: P, r) =
-  back = channel(1)
-  send(p.reg, RPromote(p.name, back))
-  recv(back)
+  call(p.reg, RPromote(p.name, _))
   cl_handed_over(p, r, cl_local(p))
 
 fn cl_handed_over(p: P, r, q) =
@@ -637,16 +611,12 @@ fn cl_handed_over(p: P, r, q) =
   P(p.name, p.fd, Nil, p.waits, p.head, p.tail, p.host, p.port, p.tried, p.reg)
 
 fn cl_local(p: P) =
-  back = channel(1)
-  send(p.reg, RFind(p.name, back))
-  recv(back)
+  call(p.reg, RFind(p.name, _))
 
 fn cl_move_subs(q, subs) = match subs
   Nil -> 0
   Cons(s, rest) ->
-    back = channel(1)
-    send(q, QSub(s, back))
-    recv(back)
+    call(q, QSub(s, _))
     cl_move_subs(q, rest)
 
 fn cl_try_again(p: P, r, ses) = match connect_to(p.host, p.port)

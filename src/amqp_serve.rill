@@ -278,7 +278,9 @@ fn am_end(ses, wr) =
 fn am_writer(l: Line, wr, free, ended, read_out) = match recv(wr)
   AWBytes(text) ->
     p_line_write(l, text)
-    am_ready(free)
+    # Offered rather than insisted on: the session's last words can arrive with
+    # a token still unclaimed.
+    try_send(free, 1)
     am_writer(l, wr, free, ended, read_out)
   AWEnd ->
     sock_shutdown(l.fd)
@@ -288,21 +290,13 @@ fn am_writer(l: Line, wr, free, ended, read_out) = match recv(wr)
 fn am_writer_done(l: Line, wr, free, ended, read_out) =
   if ended && read_out then p_line_close(l) else am_writer(l, wr, free, ended, read_out)
 
-# The session's last words can arrive with a token still unclaimed, so this
-# offers one rather than insisting.
-fn am_ready(free) =
-  ok = select
-    send(free, 1) -> true
-    default -> false
-  ok
-
 # One lot of bytes at a time is taken, and at the very end one more, an `AWEnd`
 # and an `AWGone`: never more than this, so nothing sending here ever waits.
 fn am_writes() = 4
 
 # How far behind a client may fall before the session stops taking deliveries.
 # It goes on reading the client, which is the point. The deliveries wait in
-# `out` until that is full, and then `q_try_send` leaves them ready for whoever
+# `out` until that is full, and then `try_send` leaves them ready for whoever
 # can take them, as it does for any consumer that is behind.
 fn am_behind_at() = 1048576
 
@@ -580,9 +574,7 @@ fn am_drop(am: Am, name, sub_id) =
     am_wait(am_hand(am, am_queue(am, name), QUnsub(sub_id, back)), back).am
 
 fn am_queue(am: Am, name) =
-  back = channel(1)
-  send(am.reg, RFind(name, back))
-  recv(back)
+  call(am.reg, RFind(name, _))
 
 # Said, not written: nothing here waits for the client, because everything the
 # session does happens on this strand. The writer gets it from `am_pay`.
@@ -930,9 +922,7 @@ fn am_exchange_if_there(am: Am, chan, name, found) = match found
 # because a restart replays the routing journal and would otherwise bring back
 # what somebody deleted.
 fn am_delete_exchange(am: Am, chan, name, bits) =
-  back = channel(1)
-  send(am.reg, RDropExchange(name, false, bit_and(bits, am_if_unused()) != 0, back))
-  am_deleted_exchange(am, chan, name, recv(back))
+  am_deleted_exchange(am, chan, name, call(am.reg, RDropExchange(name, false, bit_and(bits, am_if_unused()) != 0, _)))
 
 fn am_deleted_exchange(am: Am, chan, name, n) =
   if n == -1 then am_no_exchange(am, chan, name, 20) else if n < 0 then am_exchange_in_use(am, chan, name) else am_answer(am, am_exchange_delete_ok(chan))
@@ -986,9 +976,7 @@ fn am_x_joining(am: Am, chan, dest, key, on, sx, dx) =
   am_answer(am_wait(sent, back).am, am_method(chan, a_class_exchange(), if on then 31 else 51, ""))
 
 fn am_exchange(am: Am, name, kind, durable, fleeting, inner) =
-  back = channel(1)
-  send(am.reg, RExchange(name, kind, false, durable, fleeting, inner, back))
-  recv(back)
+  call(am.reg, RExchange(name, kind, false, durable, fleeting, inner, _))
 
 fn am_answer(am: Am, bytes) =
   am_say(am, bytes)
@@ -1040,9 +1028,7 @@ fn am_if_unused() = 1
 fn am_if_empty() = 2
 
 fn am_delete_queue(am: Am, chan, queue, bits) =
-  back = channel(1)
-  send(am.reg, RDropQueue(queue, bit_and(bits, am_if_unused()) != 0, bit_and(bits, am_if_empty()) != 0, back))
-  am_deleted_queue(am, chan, queue, recv(back))
+  am_deleted_queue(am, chan, queue, call(am.reg, RDropQueue(queue, bit_and(bits, am_if_unused()) != 0, bit_and(bits, am_if_empty()) != 0, _)))
 
 fn am_deleted_queue(am: Am, chan, queue, n) =
   if n == -1 then am_no_queue(am, chan, queue, 40) else if n < 0 then am_queue_in_use(am, chan, queue) else am_answer(am_forgot_queue(am, queue), am_queue_delete_ok(chan, n))
@@ -1083,9 +1069,7 @@ fn am_unbinding(am: Am, chan, queue, key, x, ex) =
 
 # The exchange's turn at the question the queue is asked when a consumer goes.
 fn am_idle_exchange(am: Am, ex) =
-  back = channel(1)
-  send(am.reg, RIdleExchange(ex, back))
-  recv(back)
+  call(am.reg, RIdleExchange(ex, _))
   am
 
 # `Queue.Bind` is queue, exchange, routing key, in that order after the
@@ -1139,9 +1123,7 @@ fn am_no_queue(am: Am, chan, name, method) =
   am_refuse(am, chan, am_not_found(), "no queue `" + am_out(am, name) + "` in vhost `" + am.vh + "`", a_class_queue(), method)
 
 fn am_queue_if(am: Am, name) =
-  back = channel(1)
-  send(am.reg, RFindIf(name, back))
-  recv(back)
+  call(am.reg, RFindIf(name, _))
 
 # Asked once per exchange per connection and remembered, because what kind an
 # exchange is cannot change: whoever names it first settles it.
@@ -1160,28 +1142,20 @@ fn am_ask_inner(am: Am, name, found) = match found
   Some(x) -> am_asked_inner(am, name, x)
 
 fn am_asked_inner(am: Am, name, x) =
-  back = channel(1)
-  send(x, XInner(back))
-  said = recv(back)
+  said = call(x, XInner(_))
   am.shut[name] = said
   said == 1
 
 fn am_asked_kind(am: Am, name) =
-  back = channel(1)
-  send(am.reg, RKindOf(name, back))
-  kind = recv(back)
+  kind = call(am.reg, RKindOf(name, _))
   am.kinds[name] = kind
   kind
 
 fn am_exchange_if(am: Am, name) =
-  back = channel(1)
-  send(am.reg, RExchangeIf(name, back))
-  recv(back)
+  call(am.reg, RExchangeIf(name, _))
 
 fn am_named_exchange(am: Am, name) =
-  back = channel(1)
-  send(am.reg, RExchange(name, x_direct(), false, true, false, false, back))
-  recv(back)
+  call(am.reg, RExchange(name, x_direct(), false, true, false, false, _))
 
 # The three bits after `durable`, and between them the whole of what a
 # temporary queue is. `exclusive` is a queue one connection has to itself;
@@ -1224,9 +1198,7 @@ fn am_declare_as(am: Am, chan, name, bits) =
 # Asked before the queue is looked up, because whether this connection may
 # have it at all is a different question from whether it is there.
 fn am_claim(am: Am, name, only, fleeting) =
-  back = channel(1)
-  send(am.reg, RClaim(name, am.cid, only, fleeting, back))
-  recv(back)
+  call(am.reg, RClaim(name, am.cid, only, fleeting, _))
 
 fn am_held_by_another(am: Am, chan, name, method) =
   am_refuse(am, chan, am_locked(), "queue `" + am_out(am, name) + "` belongs to another connection", a_class_queue(), method)
@@ -1234,25 +1206,19 @@ fn am_held_by_another(am: Am, chan, name, method) =
 # A consumer has gone, so a queue that was to last only as long as its
 # consumers may be finished. The registry decides; this only says when to ask.
 fn am_idle(am: Am, queue) =
-  back = channel(1)
-  send(am.reg, RIdle(queue, back))
-  recv(back)
+  call(am.reg, RIdle(queue, _))
   am
 
 # Everything this connection had to itself.
 fn am_theirs(am: Am) =
-  back = channel(1)
-  send(am.reg, RTheirs(am.cid, back))
-  recv(back)
+  call(am.reg, RTheirs(am.cid, _))
   0
 
 # A declaration is the one place a client says how long it wants the queue for.
 # Everywhere else a queue is named — this broker's own protocol, a replayed
 # journal, a cluster — means one that is meant to last.
 fn am_queue_kind(am: Am, name, durable) =
-  back = channel(1)
-  send(am.reg, RFindKind(name, durable, back))
-  recv(back)
+  call(am.reg, RFindKind(name, durable, _))
 
 fn am_declared(w: AStat, chan, name) =
   am_answer(w.am, am_queue_declare_ok(chan, am_out(w.am, name), q_count_ready(w.got) + q_count_inflight(w.got), q_count_subs(w.got)))

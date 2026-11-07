@@ -7,6 +7,7 @@
 # explicitly one strand's at a time on a `--parallel` build, so this is not
 # only the tidy way to write it, it is the only way that stays correct when
 # the program is given more than one worker.
+import "call"
 import "wire"
 import "journal"
 
@@ -236,7 +237,7 @@ fn q_goes(q: Q, reply) =
 fn q_tell_gone(q: Q, subs) = match subs
   Nil -> 0
   Cons(s, rest) ->
-    q_try_send(q_sub_out(s), OCancelled(q.name, q_sub_id(s)))
+    try_send(q_sub_out(s), OCancelled(q.name, q_sub_id(s)))
     q_tell_gone(q, rest)
 
 fn q_is_stop(r) = match r
@@ -586,7 +587,7 @@ fn q_offer(q: Q, m: Msg, tried) =
         # buffer being full means it is not keeping up with what it already
         # has. Either way the message stays ready and somebody else may take
         # it.
-        if q_no_room(q, s) then q_offer(moved, m, tried + 1) else if q_try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props, q_sub_id(s))) then q_took(moved, m, q_sub_group(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
+        if q_no_room(q, s) then q_offer(moved, m, tried + 1) else if try_send(q_sub_out(s), ODeliver(q.name, m.id, m.body, m.props, q_sub_id(s))) then q_took(moved, m, q_sub_group(s), q_sub_quick(s)) else q_offer(moved, m, tried + 1)
 
 # A consumer that answers for nothing has no window: there is nothing
 # outstanding to count, which is what AMQP says of prefetch under `no-ack` and
@@ -594,12 +595,6 @@ fn q_offer(q: Q, m: Msg, tried) =
 fn q_no_room(q: Q, s: Sub) =
   w = q_sub_window(s)
   !q_sub_quick(s) && w > 0 && q_held(q, q_sub_group(s)) >= w
-
-fn q_try_send(out, frame) =
-  ok = select
-    send(out, frame) -> true
-    default -> false
-  ok
 
 # The subscriber arrives here as two plain values rather than as itself. It is
 # the hottest path in the broker, and handing a counted record along it costs a

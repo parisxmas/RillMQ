@@ -1,0 +1,25 @@
+# Three things every strand here does to another.
+
+# A question and its answer. `make` is a request with a hole where the reply goes:
+#
+#     call(reg, RFind(name, _))
+#
+# The reply channel has room for one, so whoever answers never waits on whoever
+# asked, which may be gone.
+fn call(ch, make) =
+  back = channel(1)
+  send(ch, make(back))
+  recv(back)
+
+# An offer that gives up rather than waits.
+fn try_send(ch, v) =
+  ok = select
+    send(ch, v) -> true
+    default -> false
+  ok
+
+fn try_recv(ch) =
+  got = select
+    v = recv(ch) -> Some(v)
+    default -> None
+  got

@@ -393,20 +393,8 @@ fn p_moved(l: Line) =
   n = map_or(l.count, 0, 0) + 1
   count = l.count
   count[0] = n
-  p_take(l.state)
-  p_put(l.state, n)
-
-fn p_take(ch) =
-  v = select
-    n = recv(ch) -> n
-    default -> -1
-  v
-
-fn p_put(ch, n) =
-  ok = select
-    send(ch, n) -> 1
-    default -> 0
-  ok
+  try_recv(l.state)
+  try_send(l.state, n)
 
 # Said and heard before the socket closes, so the watchdog cannot shut a
 # descriptor that has been handed to somebody else.
@@ -452,11 +440,11 @@ fn p_look_all(known: Map(Int, Line), last: Map(Int, Int), fds) = match fds
 
 # Put back after reading, unless the writer got there first, which is newer.
 fn p_look(l: Line, last: Map(Int, Int)) =
-  n = p_take(l.state)
-  if n < 0 then 0
-  else
-    p_put(l.state, n)
-    p_compare(l, last, n)
+  match try_recv(l.state)
+    None -> 0
+    Some(n) ->
+      try_send(l.state, n)
+      p_compare(l, last, n)
 
 fn p_compare(l: Line, last: Map(Int, Int), n) =
   if n == map_or(last, l.fd, 0) && n - n / 2 * 2 == 1 then sock_shutdown(l.fd) else 0
