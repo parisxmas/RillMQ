@@ -990,8 +990,25 @@ so the strand *reading* the connection parks trying to put a reply in it; and
 the reply it was trying to put there was the answer to an acknowledgement. The
 consumer waits for the broker to read an acknowledgement the broker cannot
 read until the consumer reads what it has already been sent. Neither side is
-at fault and neither can move. A window of sixty-four messages per consumer is
-what stands between a broker and that deadlock.
+at fault and neither can move. A default window of sixty-four messages per
+consumer keeps a client that never asked for one out of that deadlock.
+
+A window keeps the deliveries small enough to fit in the socket's buffers; it
+does not remove the deadlock. A client may ask for no window, which is what
+`Basic.Qos` with a zero means, and a single-threaded one that did went straight
+back into it: twenty-three runs of twenty-five, against none on RabbitMQ with
+the same client. So over AMQP the session no longer writes. What it says goes
+into a buffer and a strand of its own puts that on the socket, and that strand
+is the only thing that ever parks on a client that has stopped reading. The
+session goes on reading acknowledgements whatever the client is doing. Once a
+client is a megabyte behind the session stops taking deliveries, and the queue
+leaves them ready as it does for any consumer that is behind. A client that asks
+for answers and leaves 64 MB of them unread is disconnected. `test/slow.sh` is
+that client, and the others.
+
+The native protocol still has the deadlock. Nothing a client says can reach it,
+because a native client cannot ask for a window, but a broker started with
+`prefetch=0` will: the window is what keeps it away there, so leave it on.
 
 ## Against RabbitMQ
 
