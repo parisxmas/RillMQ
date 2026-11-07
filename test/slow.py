@@ -3,6 +3,7 @@
 
     slow.py drain <port> <messages> <window>    read one, ack one, on one thread
     slow.py batches <port> <messages> <size>    read that many, then ack them all
+    slow.py beside <port> <messages>            drain while others come and go
     slow.py closes <port> <count>               open and politely close
     slow.py ignore <port> <messages>            consume, then never read again
     slow.py flood <port> <seconds>              ask, and never read an answer
@@ -18,7 +19,7 @@ client that reads and writes on one thread is the one that parks in a write
 while the broker parks in a write to it. Every mode prints one line. With
 WRAPPED set in the environment the AMQP modes speak TLS.
 """
-import os, socket, ssl, struct, sys, time
+import os, socket, ssl, struct, sys, threading, time
 
 STALL = 20
 BODY = b"x" * 64
@@ -179,6 +180,24 @@ def closes(port, count):
     print("closed")
 
 
+def beside(port, n):
+    """Drain while other clients come and go, on the same broker."""
+    def come_and_go():
+        while not over.is_set():
+            try:
+                Conn(port).close()
+            except OSError:
+                pass
+    over = threading.Event()
+    threading.Thread(target=come_and_go, daemon=True).start()
+    try:
+        drain(port, n, 0)
+    except ConnectionError:
+        print("dropped")
+    finally:
+        over.set()
+
+
 def ignore(port, n):
     queue = "ignored"
     fill(port, queue, n)
@@ -330,5 +349,5 @@ def pings(port, seconds):
 
 mode = sys.argv[1]
 args = [int(a) for a in sys.argv[2:]]
-{"drain": drain, "batches": batches, "closes": closes, "ignore": ignore, "flood": flood,
+{"drain": drain, "batches": batches, "closes": closes, "beside": beside, "ignore": ignore, "flood": flood,
  "native": native, "pings": pings, "gone": gone, "dawdle": dawdle, "behind": behind}[mode](*args)

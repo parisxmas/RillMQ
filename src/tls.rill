@@ -81,6 +81,14 @@ extern "ssl" fn SSL_free(ssl: Ptr) -> Unit
 
 extern "crypto" fn ERR_get_error() -> U64
 
+# OpenSSL keeps its errors in a queue per thread, and every connection here is on
+# the same thread. `SSL_get_error` reads that queue, so what one connection left
+# there was taken for the failure of the next one to ask, and a client leaving
+# could drop another that had done nothing wrong: its read ended and its writes
+# were lost. So this is called before every call that `SSL_get_error` will be
+# asked about, which is what OpenSSL's own documentation says to do.
+extern "crypto" fn ERR_clear_error() -> Unit
+
 extern "crypto" fn ERR_error_string_n(e: U64, buf: Ptr, len: USize) -> Unit
 
 # The two OpenSSL constants this needs by number, and one version.
@@ -219,7 +227,11 @@ fn tls_shake(ssl, fd, set) =
   if set != 1 then tls_give_up(ssl) else tls_shaking(ssl, fd, 0)
 
 fn tls_shaking(ssl, fd, tries) =
-  if tries > 64 then tls_give_up(ssl) else tls_shook(ssl, fd, tries, SSL_accept(ssl))
+  if tries > 64 then tls_give_up(ssl) else tls_shake_once(ssl, fd, tries)
+
+fn tls_shake_once(ssl, fd, tries) =
+  ERR_clear_error()
+  tls_shook(ssl, fd, tries, SSL_accept(ssl))
 
 fn tls_shook(ssl, fd, tries, r) =
   if r == 1 then ssl else tls_shake_again(ssl, fd, tries, SSL_get_error(ssl, r))
@@ -251,6 +263,7 @@ fn tls_give_up(ssl) =
 # which kind of connection it was reading.
 fn tls_read(ssl, fd) =
   b = buf_u8(tls_chunk())
+  ERR_clear_error()
   n = SSL_read(ssl, b, tls_chunk())
   if n > 0 then str_from_ptr(b, n) else tls_read_again(ssl, fd, SSL_get_error(ssl, n))
 
@@ -275,7 +288,11 @@ fn tls_write(ssl, fd, s) =
     n
 
 fn tls_write_from(ssl, fd, p, want, sent) =
-  if sent >= want then sent else tls_wrote(ssl, fd, p, want, sent, SSL_write(ssl, ptr_offset(p, sent), want - sent))
+  if sent >= want then sent else tls_write_more(ssl, fd, p, want, sent)
+
+fn tls_write_more(ssl, fd, p, want, sent) =
+  ERR_clear_error()
+  tls_wrote(ssl, fd, p, want, sent, SSL_write(ssl, ptr_offset(p, sent), want - sent))
 
 fn tls_wrote(ssl, fd, p, want, sent, k) =
   if k > 0 then tls_write_from(ssl, fd, p, want, sent + k) else tls_write_again(ssl, fd, p, want, sent, SSL_get_error(ssl, k))

@@ -1271,7 +1271,7 @@ sh test/amqp.sh              # 72 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 9 checks on what survives a restart and what does not
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 14 checks of passwords, TLS and certificates
-sh test/slow.sh              # 23 checks of clients that do not keep up
+sh test/slow.sh              # 24 checks of clients that do not keep up
 sh test/vhosts.sh            # 10 checks of virtual hosts and rights
 sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes

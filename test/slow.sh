@@ -115,6 +115,9 @@ stop
 wrapped ack=600000
 say "over tls, a window of zero is read to the end" "$(WRAPPED=1 $PY drain "$WRAP" 50000 0)" "drained"
 stop
+wrapped ack=600000
+say "over tls, others leaving do not drop a client" "$(WRAPPED=1 $PY beside "$WRAP" 50000)" "drained"
+stop
 wrapped stall=2000
 say "over tls, a write that goes nowhere ends the connection" "$(WRAPPED=1 $PY gone "$WRAP" 50000)" "cut off"
 stop
