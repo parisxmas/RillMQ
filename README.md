@@ -1311,9 +1311,7 @@ All hundred and eighty-four of them pass, with or without a journal.
 - **An election is one round.** One ask, one majority, one turn. There is no
   second phase. A leader that is out-termed is not told: it finds out from the
   `-STALE` on its next write, and stands down at its next heartbeat, when it asks
-  who leads what it is holding and the node named says so itself. What keeps two
-  of them from both winning is that only the lowest-numbered node that is still
-  there stands at all, which is a rule rather than a proof.
+  who leads what it is holding and the node named says so itself.
 - **A node watches only what it is holding a copy of.** That is the only list
   of other nodes' queues it has, so a queue nobody has published to yet is a
   queue nobody is watching over. It has nothing in it, which is why this is
@@ -1326,13 +1324,11 @@ All hundred and eighty-four of them pass, with or without a journal.
   there, so nothing has to know which it was. It is a length and not a log
   comparison, and a whole file is a whole file: a large queue pays for that once
   each time, and it has to fit in a gigabyte.
-- **Only the lowest-numbered node that is still there stands.** Two standing
-  at once for the same turn can each grant the other, because a vote is one
-  round and nothing here steps down on seeing a later turn. Until catching up
-  existed, what kept them apart was that their copies were usually different
-  lengths; now it is said rather than left to luck. The cost is that a node
-  which cannot see the lowest one, but can see a majority, waits for a
-  heartbeat rather than standing at once.
+- **Only the lowest-numbered node that is still there stands.** Two standing for
+  the same turn cannot both win, because a node takes its own vote before it asks
+  for anybody else's. The rule stays so that they rarely try, and the cost is
+  that a node which cannot see the lowest one, but can see a majority, waits for
+  a heartbeat rather than standing at once.
 - **A copy is a file, not a queue.** The node keeping it does not serve it,
   count it, or list it. Making it serve is a restart with a different
   `peers`.

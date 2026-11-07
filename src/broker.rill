@@ -89,6 +89,8 @@ type RReq
   RWho(name: Str, reply: Chan(Int))
   # The term a batch arriving from another node claims to be for.
   RTerm(name: Str, reply: Chan(Int))
+  # A turn this node is about to stand for, taken before it asks anyone.
+  RStanding(name: Str, term: Int, reply: Chan(Bool))
   # How much of a queue's journal this node has, which is what a candidate for
   # its leadership has to say when it asks for votes.
   RSize(name: Str, reply: Chan(Int))
@@ -162,12 +164,12 @@ type Conn
 # because the queue is what gets stopped, and a thing cannot be the one that
 # decides to stop itself and the one that is asked whether it should.
 type Reg
-  Reg(dir: Str, jr: Jr, self: Chan(RReq), auto: Map(Str, Int), owner: Map(Str, Int), xauto: Map(Str, Int), moved: Map(Str, Int))
+  Reg(dir: Str, jr: Jr, self: Chan(RReq), auto: Map(Str, Int), owner: Map(Str, Int), xauto: Map(Str, Int), moved: Map(Str, Int), stood: Map(Str, Int))
 
 fn r_run(dir, inbox, done) =
   jr = Jr(channel(256), channel(1))
   if str_len(dir) == 0 then spawn j_run_memory(jr, done) else spawn j_run(dir + "/" + rt_file(), jr, done)
-  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox, map_new(), map_new(), map_new(), map_new()), inbox, done)
+  r_loop(map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Reg(dir, jr, inbox, map_new(), map_new(), map_new(), map_new(), map_new()), inbox, done)
 
 fn r_loop(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr), mine: Map(Str, Int), ts: Map(Str, Int), ld: Map(Str, Int), g: Reg, inbox, done) =
   step = select
@@ -264,7 +266,7 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     send(reply, r_promote(qs, cs, mine, ts, g.dir, name, done))
     0
   RVote(name, term, size, from, reply) ->
-    send(reply, r_vote(ts, ld, g.dir, name, term, size, from))
+    send(reply, if from != cl_me() && term <= map_or(g.stood, name, 0) then 0 else r_vote(ts, ld, g.dir, name, term, size, from))
     0
   RWho(name, reply) ->
     # Only an elected leader, and -1 for not knowing of one. Answering with the
@@ -272,6 +274,9 @@ fn r_handle(qs: Map(Str, Chan(QReq)), xs: Map(Str, Chan(XReq)), cs: Map(Str, Jr)
     # found not to be answering, and everybody would go on pointing at it
     # instead of one of them standing for it.
     send(reply, if map_has(mine, name) then cl_me() else map_or(ld, name, -1))
+    0
+  RStanding(name, term, reply) ->
+    send(reply, r_standing(ts, g, name, term))
     0
   RTerm(name, reply) ->
     send(reply, r_known_term(ts, g.dir, name))
@@ -336,6 +341,17 @@ fn r_known_term(ts: Map(Str, Int), dir, name) =
 
 fn r_written_term(dir, name) =
   if str_len(dir) == 0 then 0 else j_replay(dir + "/" + j_file(name)).term
+
+# A node's vote in a turn is its own before it asks for anybody else's. Taken after
+# winning, two nodes standing for the same turn could each give the other theirs,
+# and both win. It is kept apart from `ts`, which copies are checked against: an
+# election lost must not leave this node refusing a leader that never heard of it.
+fn r_standing(ts: Map(Str, Int), g: Reg, name, term) =
+  if term <= r_known_term(ts, g.dir, name) then false
+  else
+    stood = g.stood
+    stood[name] = term
+    true
 
 fn r_vote(ts: Map(Str, Int), ld: Map(Str, Int), dir, name, term, size, from) =
   if term <= r_known_term(ts, dir, name) then 0

@@ -249,7 +249,7 @@ fn cl_lower_alive(peers, i) = match peers
 fn cl_step_up_now(reg, peers, name) =
   cl_catch_up(reg, peers, name, cl_rounds())
   term = cl_term_at(reg, name) + 1
-  if !cl_stand(name, term, cl_size_at(reg, name), peers, cl_me()) then 0 else cl_stepped_up(reg, name, term)
+  if !cl_may_stand(reg, name, term) || !cl_stand(name, term, cl_size_at(reg, name), peers, cl_me()) then 0 else cl_stepped_up(reg, name, term)
 
 fn cl_stepped_up(reg, name, term) =
   println("rillmq: " + name + " has nobody, taking it over for turn " + int_to_str(term))
@@ -540,6 +540,11 @@ fn cl_fill(fd, buf, n) =
     more = if sock_wait(fd, 5000) then sock_read(fd) else ""
     if str_len(more) == 0 then "" else cl_fill(fd, buf + more, n)
 
+fn cl_may_stand(reg, name, term) =
+  back = channel(1)
+  send(reg, RStanding(name, term, back))
+  recv(back)
+
 fn cl_stand(name, term, size, peers, me) =
   cl_won(cl_count_votes(peers, name, term, size, 0, 1), len(peers))
 
@@ -583,7 +588,7 @@ fn cl_maybe_stand(p: P, r, peers) =
 
 fn cl_standing(p: P, r, peers, caught) =
   term = cl_term_of(p) + 1
-  if !cl_stand(p.name, term, cl_size_of(p), peers, cl_me()) then cl_no(p, r) else cl_elected(p, r, term)
+  if !cl_may_stand(p.reg, p.name, term) || !cl_stand(p.name, term, cl_size_of(p), peers, cl_me()) then cl_no(p, r) else cl_elected(p, r, term)
 
 fn cl_term_of(p: P) =
   back = channel(1)
