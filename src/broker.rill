@@ -636,7 +636,7 @@ fn b_peer() = opt("peer", "")
 # What version this is. It is said in one place on the wire — the server
 # properties of an AMQP connection — and read from here rather than written
 # there, so that the next version is one line rather than a search.
-fn b_version() = "0.2.4"
+fn b_version() = "0.2.5"
 
 # What a listener hands to every connection it takes: who may connect, and
 # whether the connection is wrapped in TLS. A plain port carries a context
@@ -709,8 +709,11 @@ fn b_owed(p: Pump) = map_or(p.size, 0, 0)
 
 fn b_told(p: Pump) = map_or(p.size, 1, 0)
 
+fn b_too_far(p: Pump) =
+  b_told(p) >= b_lost_at() || (b_told(p) >= b_behind_at() && rss_bytes() > q_max_bytes())
+
 fn b_pump(p: Pump, head) =
-  if b_told(p) >= b_lost_at() then b_pump(b_cut_off(p), "") else if str_len(head) > 0 then b_offer(p, head) else if b_owed(p) > 0 then b_offer(p, b_pump_take(p)) else b_pump_idle(p)
+  if b_too_far(p) then b_pump(b_cut_off(p), "") else if str_len(head) > 0 then b_offer(p, head) else if b_owed(p) > 0 then b_offer(p, b_pump_take(p)) else b_pump_idle(p)
 
 fn b_pump_idle(p: Pump) =
   step = select

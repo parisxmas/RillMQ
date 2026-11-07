@@ -321,6 +321,13 @@ fn am_owed(am: Am) = map_or(am.pen.size, 0, 0)
 
 fn am_replies_owed(am: Am) = map_or(am.pen.size, 1, 0)
 
+# A limit each is not a limit between them, so a broker past `mem=` stops carrying
+# anyone's unread replies past the point deliveries stop. `mem=` is what the whole
+# process holds, so this needs nothing counted across connections, and it is only
+# asked of a client that is already behind.
+fn am_too_far(am: Am) =
+  am_replies_owed(am) >= am_lost_at() || (am_replies_owed(am) >= am_behind_at() && rss_bytes() > q_max_bytes())
+
 # Two inboxes, not one, and this is the whole reason the session does not
 # wedge. What a queue hands back — a delivery, a publish that reached the disk
 # — arrives on `out`; what the client sends arrives on `ses`. Merging them into
@@ -337,7 +344,7 @@ fn am_replies_owed(am: Am) = map_or(am.pen.size, 1, 0)
 # than one frame each.
 fn am_loop(am: Am, ses, gone) =
   am_pay(am)
-  if am_replies_owed(am) >= am_lost_at() then am_step(am, ses, gone, AStop) else if am_owed(am) >= am_behind_at() then am_behind(am, ses, gone) else am_look(am, ses, gone)
+  if am_too_far(am) then am_step(am, ses, gone, AStop) else if am_owed(am) >= am_behind_at() then am_behind(am, ses, gone) else am_look(am, ses, gone)
 
 fn am_look(am: Am, ses, gone) =
   step = select

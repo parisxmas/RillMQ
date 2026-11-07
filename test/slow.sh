@@ -83,6 +83,12 @@ say "a client that only asks is cut off in the end" "$($PY flood "$AMQP" 120)" "
 say "and costs what the limit says" "$(($(kb) < 400000))" "1"
 stop
 
+# Past `mem=`, nobody's unread replies are carried as far as the limit each.
+start mem=32
+say "a broker past its memory cuts a client off sooner" "$($PY flood "$AMQP" 120)" "cut off"
+say "and stays near it" "$(($(kb) < 150000))" "1"
+stop
+
 # A client that stops reading and stays connected, and a client that is only
 # slow, which is the one that must not be mistaken for it.
 start stall=2000

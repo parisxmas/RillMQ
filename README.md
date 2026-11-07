@@ -7,7 +7,7 @@ and written to a journal, so a broker that is killed comes back with what it
 had answered for. It speaks AMQP 0-9-1, so RabbitMQ's own client libraries
 work against it unchanged.
 
-This is version 0.2.4. It builds with Rill 0.16.1.
+This is version 0.2.5. It builds with Rill 0.16.2.
 
 ```sh
 rill build src/main.rill -o rillmq
@@ -1138,24 +1138,27 @@ rather than for the cache.
 
 | RillMQ's own protocol | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 119,000/sec | 366,000/sec |
-| deliver and acknowledge | 303,000/sec | 329,000/sec |
+| publish | 60,000/sec | 328,000/sec |
+| deliver and acknowledge | 150,000/sec | 323,000/sec |
 
-Both of those were about forty per cent lower until the connection's writer
-was given a write buffer. Every `+OK` and every `MSG` was a `write` of its
-own, so a publisher pipelining a thousand requests cost a thousand syscalls to
-answer. `sock_buffered(fd)` queues them and the runtime empties the queue
-whenever the strand parks — which, for a writer, is the `select` it does
-between frames, and so is exactly the moment the client is waiting to hear.
-It is one line, and it is the same mistake as the confirms above, found by
-looking for the same mistake in the other protocol.
+The journal column is mostly the disk, and it moves with whatever else the
+machine is doing: these were taken on a busy one, and an idle one has given twice
+as much.
+
+Both of those were about forty per cent lower until writes were gathered. Every
+`+OK` and every `MSG` was a `write` of its own, so a publisher pipelining a
+thousand requests cost a thousand syscalls to answer. A strand between the
+connection and its writer now hands over everything owed whenever the writer is
+free, so a client that is keeping up gets a write per reply and one that is
+pipelining gets one for the lot. It began as `sock_buffered`, which flushed from
+inside a park, and which stopped a subscriber dead on a full socket.
 
 Over AMQP, through `RabbitMQ.Client`, 50,000 messages of 64 bytes:
 
 | AMQP | with a journal | keeping nothing |
 |---|---:|---:|
-| publish | 918,000/sec | 935,000/sec |
-| deliver and acknowledge | 261,000/sec | 269,000/sec |
+| publish | 458,000/sec | 705,000/sec |
+| deliver and acknowledge | 160,000/sec | 236,000/sec |
 
 The AMQP publish figure is higher than the native one and it is not a better
 number: with confirms off — which is how the measurement above was taken, and
@@ -1173,15 +1176,15 @@ on disk.
 
 | | |
 |---|---:|
-| binary | 220 KB |
-| idle | 1.4 MB |
+| binary | 570 KB |
+| idle | 2 MB |
 
-A pipelining client has to bound its depth. A client that writes a hundred
-thousand requests and reads none of the answers deadlocks against any broker
-with a finite amount of room in it: the replies fill the socket, the broker
-stops being able to write and therefore stops reading, and the client is still
-writing. `test/bench.rill` writes a thousand and reads a thousand, which is
-what every pipelining client does and for this reason.
+A pipelining client should still bound its depth. One that writes a hundred
+thousand requests and reads none of the answers used to deadlock against this
+broker; now it is read to the end and its answers wait for it, until it has left
+64 MB of them unread, or 1 MB once the broker is past `mem=`, and it is
+disconnected. `test/bench.rill` writes a thousand and reads a thousand, which is
+what every pipelining client does.
 
 Two hundred thousand 64-byte messages sitting in a queue cost 31 MB, which is
 **164 bytes a message**: the sixty-four of body, a hash table entry, a boxed
@@ -1271,7 +1274,7 @@ sh test/amqp.sh              # 72 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 9 checks on what survives a restart and what does not
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 14 checks of passwords, TLS and certificates
-sh test/slow.sh              # 24 checks of clients that do not keep up
+sh test/slow.sh              # 26 checks of clients that do not keep up
 sh test/vhosts.sh            # 10 checks of virtual hosts and rights
 sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
