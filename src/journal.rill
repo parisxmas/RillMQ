@@ -328,7 +328,7 @@ fn j_commit(js: Js, jr: Jr, r) =
   # message is safe until a majority has it. One batch is one message on the
   # wire and one wait, however many records are in it, which is what makes this
   # cost a round trip a batch rather than a round trip a publish.
-  after = j_copy(Js(js.fd, js.path, js.pubs + g.pubs, js.acks + g.acks, js.name, js.copies, js.need, js.term), bytes)
+  after = j_copy({ js | pubs = js.pubs + g.pubs, acks = js.acks + g.acks }, bytes)
   j_told(g.ws, after.enough)
   j_maybe_ask(j_do_todo(after.js, g.todo), jr)
 
@@ -371,7 +371,7 @@ fn j_worth_dialling(c: Copy) = c.fd < 0 && now_millis() - c.tried >= j_redial_ms
 
 fn j_copy_to(copies, js: Js, bytes) =
   j_shout(copies, "REPL " + js.name + " " + int_to_str(js.term) + " " + int_to_str(str_len(bytes)) + " " + int_to_str(file_size(js.fd) - str_len(bytes)) + "\r\n" + bytes)
-  j_count(Js(js.fd, js.path, js.pubs, js.acks, js.name, copies, js.need, js.term), copies, Nil, 0)
+  j_count({ js | copies = copies }, copies, Nil, 0)
 
 fn j_shout(copies, text) = match copies
   Nil -> 0
@@ -400,7 +400,7 @@ fn j_write_to(fd, text) =
   0
 
 fn j_count(js: Js, left, seen, got) = match left
-  Nil -> Copied(Js(js.fd, js.path, js.pubs, js.acks, js.name, reverse(seen), js.need, js.term), got >= js.need)
+  Nil -> Copied({ js | copies = reverse(seen) }, got >= js.need)
   Cons(c, rest) -> j_count_one(js, c, rest, seen, got)
 
 fn j_count_one(js: Js, c: Copy, rest, seen, got) =
@@ -419,11 +419,11 @@ fn j_agreed(a: Copy) =
 # One line back from one copy, and whatever came with it kept for next time.
 fn j_line(c: Copy) =
   at = str_find(c.spill, "\r\n")
-  if at >= 0 then Copy(c.host, c.port, c.fd, c.spill[at + 2:], c.tried, starts_with(c.spill, "+OK"), starts_with(c.spill, "-GAP")) else j_line_more(c)
+  if at >= 0 then { c | spill = c.spill[at + 2:], yes = starts_with(c.spill, "+OK"), gap = starts_with(c.spill, "-GAP") } else j_line_more(c)
 
 fn j_line_more(c: Copy) =
   more = sock_read(c.fd)
-  if str_len(more) == 0 then j_copy_gone(c) else j_line(Copy(c.host, c.port, c.fd, c.spill + more, c.tried, false, false))
+  if str_len(more) == 0 then j_copy_gone(c) else j_line({ c | spill = c.spill + more, yes = false, gap = false })
 
 fn j_copy_gone(c: Copy) =
   sock_close(c.fd)
@@ -645,10 +645,10 @@ fn j_swap(js: Js, tmp, n) =
 # running and stops being durable, which is worth saying out loud.
 fn j_reopened(js: Js, n) =
   fd = file_open(js.path, "a")
-  if fd >= 0 then Js(fd, js.path, n, 0, js.name, js.copies, js.need, js.term)
+  if fd >= 0 then { js | fd = fd, pubs = n, acks = 0 }
   else
     println("rillmq: lost " + js.path + " while rewriting it")
-    Js(fd, js.path, n, 0, js.name, js.copies, js.need, js.term)
+    { js | fd = fd, pubs = n, acks = 0 }
 
 # In chunks rather than one string. A queue holding a million messages would
 # otherwise be asked for a hundred megabytes of contiguous bytes to write a

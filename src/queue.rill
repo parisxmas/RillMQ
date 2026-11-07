@@ -198,7 +198,7 @@ fn q_seed(q: Q, live: Map(Int, Str), ids) = match ids
     None -> q_seed(q, live, rest)
     Some(body) ->
       q.ready[q.tail] = Msg(id, j_body_of(body), j_props_of(body), now_millis())
-      q_seed(Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done), live, rest)
+      q_seed({ q | tail = q.tail + 1 }, live, rest)
 
 fn q_loop(q: Q, inbox, done) = q_turn(q, inbox, done, Guard(false, 0))
 
@@ -394,23 +394,23 @@ fn q_handle_rest(q: Q, r) = match r
     # nothing yet, and a message delivered twice is what at-least-once means.
     q.ready[q.tail] = Msg(id, body, props, now_millis())
     send(q.jr.puts, JPut(j_msg_record(id, props, body), out, OPublished(q.name, id)))
-    Q(q.name, q.ready, q.head, q.tail + 1, q.subs, q.inflight, q.turn, id + 1, q.next_due, q.held, q.jr, q.out, q.done)
+    { q | tail = q.tail + 1, next_id = id + 1 }
   QSub(s, reply) ->
     send(reply, 1)
-    Q(q.name, q.ready, q.head, q.tail, append(q.subs, Cons(s, Nil)), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done)
+    { q | subs = append(q.subs, Cons(s, Nil)) }
   QTune(sub_id, window, group, reply) ->
     send(reply, 1)
     # A window changed under a consumer that already has messages out. What it
     # is holding stays counted where it was counted, so the new window governs
     # what is handed out from here rather than what has already gone.
-    q_pump(Q(q.name, q.ready, q.head, q.tail, q_retune(q.subs, sub_id, window, group), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
+    q_pump({ q | subs = q_retune(q.subs, sub_id, window, group) })
   QTake(group, quick, reply) -> q_take(q, group, quick, reply)
   QUnsub(sub_id, reply) ->
     send(reply, 1)
     # Whatever that subscriber was holding goes back to the front of the
     # queue at once rather than waiting out its deadline: the consumer is
     # gone, and there is nothing to wait for.
-    q_requeue_all(Q(q.name, q.ready, q.head, q.tail, q_without(q.subs, sub_id), q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
+    q_requeue_all({ q | subs = q_without(q.subs, sub_id) })
   QAck(id, reply) ->
     had = map_has(q.inflight, id)
     send(reply, if had then 1 else 0)
@@ -434,7 +434,7 @@ fn q_take(q: Q, group, quick, reply) =
   if q.head >= q.tail then q_took_none(q, reply) else q_take_at(q, group, quick, reply, q.ready[q.head])
 
 fn q_take_at(q: Q, group, quick, reply, at) = match at
-  None -> q_take(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done), group, quick, reply)
+  None -> q_take({ q | head = q.head + 1 }, group, quick, reply)
   Some(m) ->
     send(reply, ODeliver(q.name, q_msg_id(m), q_msg_body(m), q_msg_props(m), group))
     q_took(q, m, group, quick)
@@ -454,7 +454,7 @@ fn q_drain(q: Q, reply) =
   n = q.tail - q.head
   q_forget_ready(q, q.head)
   send(reply, n)
-  Q(q.name, q.ready, q.tail, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done)
+  { q | head = q.tail }
 
 fn q_forget_ready(q: Q, i) =
   if i >= q.tail then 0
@@ -513,7 +513,7 @@ fn q_sub_quick(s: Sub) = s.quick
 # client's mistake, not a message leaving the queue, and counting it would make
 # the rate lie in the direction that matters.
 fn q_counted_ack(q: Q, had) =
-  if !had then q else Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done + 1)
+  if !had then q else { q | done = q.done + 1 }
 
 fn q_oldest(q: Q) = if q.head >= q.tail then 0 else q_at_of(q.ready[q.head])
 
@@ -534,7 +534,7 @@ fn q_requeue(q: Q, id) = match q.inflight[id]
     map_del(q.inflight, id)
     q_hold(q, f.group, -1)
     q.ready[q.head - 1] = f.msg
-    q_clear_due(Q(q.name, q.ready, q.head - 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
+    q_clear_due({ q | head = q.head - 1 })
 
 fn q_requeue_all(q: Q) = q_requeue_each(q, map_keys(q.inflight))
 
@@ -551,11 +551,11 @@ fn q_requeue_each(q: Q, ks) = match ks
 fn q_sweep(q: Q) = q_after_sweep(q_sweep_each(q, map_keys(q.inflight), now_millis()))
 
 fn q_after_sweep(q: Q) =
-  Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, q_soonest(q.inflight, map_keys(q.inflight), 0), q.held, q.jr, q.out, q.done)
+  { q | next_due = q_soonest(q.inflight, map_keys(q.inflight), 0) }
 
 # Nothing in flight means nothing to wake up for.
 fn q_clear_due(q: Q) =
-  if #q.inflight > 0 then q else Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, q.turn, q.next_id, 0, q.held, q.jr, q.out, q.done)
+  if #q.inflight > 0 then q else { q | next_due = 0 }
 
 fn q_sweep_each(q: Q, ks, now) = match ks
   Nil -> q
@@ -570,7 +570,7 @@ fn q_sweep_each(q: Q, ks, now) = match ks
 # for everybody: the message simply stays ready and goes to whoever asks next.
 fn q_pump(q: Q) =
   if q.head >= q.tail || len(q.subs) == 0 then q else match q.ready[q.head]
-    None -> Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done)
+    None -> { q | head = q.head + 1 }
     Some(m) -> q_offer(q, m, 0)
 
 fn q_offer(q: Q, m: Msg, tried) =
@@ -580,7 +580,7 @@ fn q_offer(q: Q, m: Msg, tried) =
     match nth(q.subs, at)
       None -> q
       Some(s) ->
-        moved = Q(q.name, q.ready, q.head, q.tail, q.subs, q.inflight, at + 1, q.next_id, q.next_due, q.held, q.jr, q.out, q.done)
+        moved = { q | turn = at + 1 }
         # Two reasons to pass a subscriber by, and they are different reasons.
         # Its window being full means it has as much as it is allowed; its
         # buffer being full means it is not keeping up with what it already
@@ -615,11 +615,11 @@ fn q_took(q: Q, m: Msg, group, quick) =
 fn q_handed_over(q: Q, m: Msg) =
   map_del(q.ready, q.head)
   send(q.jr.puts, JNote(j_ack_record(m.id)))
-  q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, q.next_due, q.held, q.jr, q.out, q.done))
+  q_pump({ q | head = q.head + 1 })
 
 fn q_in_flight(q: Q, m: Msg, group) =
   due = now_millis() + q_ack_ms()
   map_del(q.ready, q.head)
   q.inflight[m.id] = Flight(m, due, group)
   q_hold(q, group, 1)
-  q_pump(Q(q.name, q.ready, q.head + 1, q.tail, q.subs, q.inflight, q.turn, q.next_id, if q.next_due == 0 then due else q.next_due, q.held, q.jr, q.out + 1, q.done))
+  q_pump({ q | head = q.head + 1, next_due = if q.next_due == 0 then due else q.next_due, out = q.out + 1 })
