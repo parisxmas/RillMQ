@@ -643,9 +643,11 @@ fn b_version() = "0.2.0"
 # that is null, and `p_read` and `p_write` then do exactly what they did
 # before there was any TLS at all.
 type Door
-  Door(users: Str, tls: Tls)
+  Door(users: Str, tls: Tls, lines: Chan(Line), bins: Chan(Chan(Out)))
 
-fn b_door() = Door(b_users(), Tls(null_ptr(), ""))
+fn b_door() = b_door_with(Tls(null_ptr(), ""))
+
+fn b_door_with(t: Tls) = Door(b_users(), t, p_watcher(), b_binman())
 
 # What the accept loop carries: how many connections are up, what to number
 # the next one, and where the ones that end say so.
@@ -657,17 +659,17 @@ type Gate
 # the doorman has other people waiting.
 fn b_serve(fd, reg, done, cid, gone, d: Door) =
   sock_nodelay(fd)
-  if is_null(d.tls.ctx) then b_serving(fd, reg, done, cid, gone, null_ptr()) else b_shaken(fd, reg, done, cid, gone, tls_up(d.tls, fd))
+  if is_null(d.tls.ctx) then b_serving(fd, reg, done, cid, gone, null_ptr(), d) else b_shaken(fd, reg, done, cid, gone, d, tls_up(d.tls, fd))
 
-fn b_shaken(fd, reg, done, cid, gone, ssl) =
-  if is_null(ssl) then b_no_handshake(fd, gone) else b_serving(fd, reg, done, cid, gone, ssl)
+fn b_shaken(fd, reg, done, cid, gone, d: Door, ssl) =
+  if is_null(ssl) then b_no_handshake(fd, gone) else b_serving(fd, reg, done, cid, gone, ssl, d)
 
 fn b_no_handshake(fd, gone) =
   sock_close(fd)
   send(gone, 1)
   0
 
-fn b_serving(fd, reg, done, cid, gone, ssl) =
+fn b_serving(fd, reg, done, cid, gone, ssl, d: Door) =
   # A publisher pipelining a thousand requests is answered a thousand times,
   # and `b_pump` gathers those into one write whenever the writer is busy, so
   # nothing here asks for `sock_buffered`. It used to, and that was a second way
@@ -677,8 +679,8 @@ fn b_serving(fd, reg, done, cid, gone, ssl) =
   out = channel(b_backlog())
   say = channel(b_backlog())
   wire = channel(1)
-  spawn b_writer(p_line(fd, ssl), wire, done, false)
-  spawn b_pump(Pump(fd, say, out, wire, strbuf(), map_new(), done), "")
+  spawn b_writer(p_line(d.lines, fd, ssl), wire, done, false)
+  spawn b_pump(Pump(fd, say, out, wire, strbuf(), map_new(), d.bins), "")
   b_read(Conn(fd, reg, done, cid, out, say, gone, ssl), "", 0, Nil, 0, "")
 
 # Between the connection and its writer, gathering what is owed into one write
@@ -692,7 +694,7 @@ fn b_serving(fd, reg, done, cid, gone, ssl) =
 # `size` is what is held in slot 0, and in slot 1 how much of that is replies.
 # `head` is what has been offered to the writer and not yet taken.
 type Pump
-  Pump(fd: Int, say: Chan(Out), out: Chan(Out), wire: Chan(Out), owed: StrBuf, size: Map(Int, Int), done: Chan(Int))
+  Pump(fd: Int, say: Chan(Out), out: Chan(Out), wire: Chan(Out), owed: StrBuf, size: Map(Int, Int), bins: Chan(Chan(Out)))
 
 type PStep
   PSay(what: Out)
@@ -787,21 +789,55 @@ fn b_cut_off(p: Pump) =
 # send never ends, and the journal stops for everyone. The queues stop behind
 # it at their next acknowledgement, and the broker goes quiet with nothing
 # wrong anywhere. So a channel someone may still answer on is emptied until it
-# has been quiet for long enough that nobody is going to.
-fn b_bin_ms() = 60000
+# has been quiet for long enough that nobody is going to. One strand does this
+# for every connection, for the reason `p_watch` is one strand.
+type Bin
+  Bin(ch: Chan(Out), quiet: Int)
 
-fn b_bin(ch, done) =
+fn b_bin_ms() = 50
+
+fn b_bin_rounds() = 1200
+
+fn b_binman() =
+  bins = channel()
+  spawn b_bins(bins, Nil, 0)
+  bins
+
+fn b_bins(bins, held, due) = match held
+  Nil -> b_bins(bins, Cons(Bin(recv(bins), 0), Nil), now_millis() + b_bin_ms())
+  Cons(first, rest) -> b_bins_wait(bins, held, due)
+
+fn b_bins_wait(bins, held, due) =
+  left = due - now_millis()
+  if left <= 0 then b_bins(bins, b_empty_all(held, Nil), now_millis() + b_bin_ms())
+  else
+    fresh = select
+      c = recv(bins) -> Some(c)
+      timeout(left) -> None
+    b_bins(bins, b_with_bin(fresh, held), due)
+
+fn b_with_bin(fresh, held) = match fresh
+  Some(c) -> Cons(Bin(c, 0), held)
+  None -> held
+
+fn b_empty_all(held, kept) = match held
+  Nil -> kept
+  Cons(b, rest) -> b_empty_all(rest, b_keep(b_emptied(b.ch, 0), b, kept))
+
+fn b_keep(took, b: Bin, kept) =
+  if took > 0 then Cons(Bin(b.ch, 0), kept) else if b.quiet + 1 >= b_bin_rounds() then kept else Cons(Bin(b.ch, b.quiet + 1), kept)
+
+fn b_emptied(ch, took) =
   more = select
     m = recv(ch) -> true
-    recv(done) -> false
-    timeout(b_bin_ms()) -> false
-  if more then b_bin(ch, done) else 0
+    default -> false
+  if more then b_emptied(ch, took + 1) else took
 
 fn b_pump_end(p: Pump, head) =
   b_last_of(p, head)
   b_last_of(p, b_pump_take(p))
-  spawn b_bin(p.say, p.done)
-  spawn b_bin(p.out, p.done)
+  send(p.bins, p.say)
+  send(p.bins, p.out)
   send(p.wire, OFrame(""))
   0
 

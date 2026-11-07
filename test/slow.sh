@@ -49,7 +49,11 @@ say "a window larger than the socket is too" "$($PY drain "$AMQP" 50000 32768)" 
 say "a client that acknowledges in batches is fed until it has one" "$($PY batches "$AMQP" 50000 5000)" "drained"
 stop
 
+# One connection first, because the strands that look after connections are
+# shared and each has a timer of its own, which on Linux is a descriptor.
 start
+$PY closes "$AMQP" 1 >/dev/null
+sleep 1
 before=$(fds)
 $PY closes "$AMQP" 200 >/dev/null
 sleep 1

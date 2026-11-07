@@ -301,25 +301,32 @@ fn p_write(ssl, fd, s) = if is_null(ssl) then sock_write(fd, s) else tls_write(s
 #
 # A client that stops reading parks its writer, and a client that stops reading
 # and stays connected would park it for ever: nothing else on the connection can
-# tell, because the session and the reader are both still free. So a strand of
-# its own looks every `stall=<ms>`, and `sock_shutdown` is what ends a write
-# that has not moved since the last look, since it wakes everything parked on
-# the connection and the ordinary close takes it from there. A client is
-# therefore cut off after between one and two of those.
+# tell, because the session and the reader are both still free. So one strand
+# looks at every connection each `stall=<ms>`, and `sock_shutdown` is what ends
+# a write that has not moved since the last look, since it wakes everything
+# parked on the connection and the ordinary close takes it from there. A client
+# is therefore cut off after between one and two of those.
 #
 # The question is about progress. Writes are counted a piece at a time, because
 # a whole write can be a large message, and a client reading that slowly is slow
 # and not gone. They are counted in a map rather than told over a channel because
 # telling costs two switches per write, which was seven per cent of delivery, to
-# feed something that almost never does anything. In `seen`, slot 0 is pieces
-# begun, slot 1 pieces finished, and slot 2 is set once the socket is closing.
+# feed something that almost never does anything. It is one strand for everyone
+# because on Linux a timer is a descriptor, and one each doubles what a
+# connection costs. In `seen`, slot 0 is pieces begun, slot 1 pieces finished,
+# slot 2 is set once the socket is closing, and slot 3 is what the last look saw.
 type Line
   Line(fd: Int, ssl: Ptr, seen: Map(Int, Int))
 
-fn p_line(fd, ssl) =
-  seen = map_new()
-  spawn p_watch(fd, seen, 0)
-  Line(fd, ssl, seen)
+fn p_watcher() =
+  lines = channel()
+  spawn p_watch(lines, Nil, now_millis() + p_stall_ms())
+  lines
+
+fn p_line(lines, fd, ssl) =
+  l = Line(fd, ssl, map_new())
+  send(lines, l)
+  l
 
 fn p_stall_ms() = opt_int("stall", 30000)
 
@@ -349,13 +356,31 @@ fn p_line_close(l: Line) =
   seen[2] = 1
   p_close(l.ssl, l.fd)
 
-fn p_watch(fd, seen, last) =
-  sleep_ms(p_stall_ms())
-  if map_or(seen, 2, 0) != 0 then 0 else p_watch_look(fd, seen, last, map_or(seen, 0, 0))
+# Against a deadline and not a plain timeout, or a connection arriving more
+# often than the timeout would put the look off for ever.
+fn p_watch(lines, known, due) =
+  left = due - now_millis()
+  if left <= 0 then p_watch(lines, p_look_all(known, Nil), now_millis() + p_stall_ms())
+  else
+    fresh = select
+      l = recv(lines) -> Some(l)
+      timeout(left) -> None
+    p_watch(lines, p_with(fresh, known), due)
 
-fn p_watch_look(fd, seen, last, begun) =
-  if begun == last && begun > map_or(seen, 1, 0) then sock_shutdown(fd) else 0
-  p_watch(fd, seen, begun)
+fn p_with(fresh, known) = match fresh
+  Some(l) -> Cons(l, known)
+  None -> known
+
+fn p_look_all(known, kept) = match known
+  Nil -> kept
+  Cons(l, rest) -> p_look_all(rest, if map_or(l.seen, 2, 0) != 0 then kept else Cons(p_look(l), kept))
+
+fn p_look(l: Line) =
+  seen = l.seen
+  begun = map_or(seen, 0, 0)
+  if begun == map_or(seen, 3, 0) && begun > map_or(seen, 1, 0) then sock_shutdown(l.fd) else 0
+  seen[3] = begun
+  l
 
 fn p_close(ssl, fd) =
   if is_null(ssl) then 0 else tls_down(ssl)

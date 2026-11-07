@@ -19,7 +19,7 @@ type Am
 # that is not deliveries, in a map because a builder does not know its own.
 # `free` holds a token while the writer has nothing to do.
 type Pen
-  Pen(owed: StrBuf, size: Map(Int, Int), wr: Chan(AWrite), free: Chan(Int))
+  Pen(owed: StrBuf, size: Map(Int, Int), wr: Chan(AWrite), free: Chan(Int), bins: Chan(Chan(Out)))
 
 # What reaches the writer. `AWEnd` is the session finished and `AWGone` the
 # reader finished, and they may come in either order.
@@ -46,7 +46,7 @@ type ASes
 # the first byte to the loop. A record rather than seven arguments, because
 # seven arguments is where a Rill call stops being a jump.
 type Who
-  Who(fd: Int, ssl: Ptr, reg: Chan(RReq), done: Chan(Int), cid: Int, gone: Chan(Int), users: Str, wants_blocked: Bool, who: Str, vh: Str, rights: Str)
+  Who(fd: Int, ssl: Ptr, reg: Chan(RReq), done: Chan(Int), cid: Int, gone: Chan(Int), users: Str, wants_blocked: Bool, who: Str, vh: Str, rights: Str, door: Door)
 
 # -- the handshake ---------------------------------------------------------------
 
@@ -72,10 +72,10 @@ fn am_fill_header(w: Who, buf) =
 
 fn am_serve(fd, reg, done, cid, gone, d: Door) =
   sock_nodelay(fd)
-  if is_null(d.tls.ctx) then am_greeted(fd, reg, done, cid, gone, Who(fd, null_ptr(), reg, done, cid, gone, d.users, false, "", am_home(), au_all())) else am_shaken(fd, reg, done, cid, gone, d, tls_up(d.tls, fd))
+  if is_null(d.tls.ctx) then am_greeted(fd, reg, done, cid, gone, Who(fd, null_ptr(), reg, done, cid, gone, d.users, false, "", am_home(), au_all(), d)) else am_shaken(fd, reg, done, cid, gone, d, tls_up(d.tls, fd))
 
 fn am_shaken(fd, reg, done, cid, gone, d: Door, ssl) =
-  if is_null(ssl) then am_hang_up(fd, gone) else am_greeted(fd, reg, done, cid, gone, Who(fd, ssl, reg, done, cid, gone, d.users, false, "", am_home(), au_all()))
+  if is_null(ssl) then am_hang_up(fd, gone) else am_greeted(fd, reg, done, cid, gone, Who(fd, ssl, reg, done, cid, gone, d.users, false, "", am_home(), au_all(), d))
 
 fn am_greeted(fd, reg, done, cid, gone, w: Who) =
   head = am_fill_header(w, "")
@@ -126,7 +126,7 @@ fn am_start_ok(w: Who, payload) =
 # told something it did not ask for, which is a stranger thing to do on
 # purpose than to have happen.
 fn am_noted(w: Who, payload) =
-  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, str_find(payload, "connection.blocked") >= 0, w.who, w.vh, w.rights)
+  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, str_find(payload, "connection.blocked") >= 0, w.who, w.vh, w.rights, w.door)
 
 # A name from a certificate is not asked for a word, because there is nothing
 # it could be asked: what it has instead is a certificate signed by something
@@ -140,7 +140,7 @@ fn am_signs_in(w: Who, said: Said, shown) =
   if !shown then au_ok(w.users, said.name, said.word) else str_len(said.name) > 0 && au_known_name(w.users, said.name)
 
 fn am_signed_in(w: Who, name) =
-  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, name, w.vh, w.rights)
+  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, name, w.vh, w.rights, w.door)
 
 fn am_tune(w: Who, buf) =
   p_write(w.ssl, w.fd, am_connection_tune())
@@ -168,7 +168,7 @@ fn am_opening(w: Who, buf, vhost) =
     am_run(am_in_vhost(w, vhost), buf)
 
 fn am_in_vhost(w: Who, vhost) =
-  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, w.who, vhost, au_rights(w.users, w.who, vhost))
+  Who(w.fd, w.ssl, w.reg, w.done, w.cid, w.gone, w.users, w.wants_blocked, w.who, vhost, au_rights(w.users, w.who, vhost), w.door)
 
 # Refused at the connection rather than at a channel, which is what a client
 # expects here: there is no channel yet to close.
@@ -240,9 +240,9 @@ fn am_run(w: Who, buf) =
   wr = channel(am_writes())
   free = channel(1)
   send(free, 1)
-  spawn am_writer(p_line(w.fd, w.ssl), wr, free, false, false)
+  spawn am_writer(p_line(w.door.lines, w.fd, w.ssl), wr, free, false, false)
   spawn am_reader(w, ses, wr, buf, 0)
-  am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1, w.vh, map_new(), w.who, w.rights, map_new(), Pen(strbuf(), map_new(), wr, free)), ses, w.gone)
+  am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1, w.vh, map_new(), w.who, w.rights, map_new(), Pen(strbuf(), map_new(), wr, free, w.door.bins)), ses, w.gone)
 
 # The reader: frames off the socket and nothing else.
 fn am_reader(w: Who, ses, wr, buf, from) = match a_take(buf, from)
@@ -511,7 +511,7 @@ fn am_close(am: Am, ses, gone, heard_end) =
   am_forget_all(am, map_keys(am.consumers))
   am_theirs(am)
   if am_owing(am) then am_hand_over(am) else 0
-  spawn b_bin(am.out, am.done)
+  send(am.pen.bins, am.out)
   send(am.pen.wr, AWEnd)
   send(gone, 1)
   if heard_end then 0 else am_drain(ses)

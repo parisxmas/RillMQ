@@ -238,7 +238,7 @@ fn wrapped(reg, done, t: Tls) =
   if tls_port <= 0 && amqps <= 0 then 0 else tls_listeners(reg, done, t, tls_port, amqps)
 
 fn tls_listeners(reg, done, t: Tls, tls_port, amqps) =
-  if !tls_working(t) then stop_with("rillmq: " + t.why) else tls_both(reg, done, Door(b_users(), t), tls_port, amqps)
+  if !tls_working(t) then stop_with("rillmq: " + t.why) else tls_both(reg, done, b_door_with(t), tls_port, amqps)
 
 fn tls_both(reg, done, d: Door, tls_port, amqps) =
   native_tls_on(reg, done, tls_port, d)
