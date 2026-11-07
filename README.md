@@ -7,7 +7,7 @@ and written to a journal, so a broker that is killed comes back with what it
 had answered for. It speaks AMQP 0-9-1, so RabbitMQ's own client libraries
 work against it unchanged.
 
-This is version 0.2.6. It builds with Rill 0.16.2.
+This is version 0.2.6. It builds with Rill 0.16.3.
 
 ```sh
 rill build src/main.rill -o rillmq
