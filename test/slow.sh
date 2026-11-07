@@ -46,6 +46,7 @@ while [ "$round" -lt 5 ]; do
   round=$((round + 1))
 done
 say "a window larger than the socket is too" "$($PY drain "$AMQP" 50000 32768)" "drained"
+say "a client that acknowledges in batches is fed until it has one" "$($PY batches "$AMQP" 50000 5000)" "drained"
 stop
 
 start
@@ -75,6 +76,16 @@ wait "$IGNORING" 2>/dev/null
 
 start
 say "a client that only asks is cut off in the end" "$($PY flood "$AMQP" 120)" "cut off"
+say "and costs what the limit says" "$(($(kb) < 400000))" "1"
+stop
+
+# The native protocol has no way to ask for a window, so the broker is told.
+start prefetch=0 ack=600000
+say "the native protocol is read to the end with no window" "$($PY native "$A" 50000)" "drained"
+stop
+
+start
+say "a native client that only asks is cut off in the end" "$($PY pings "$A" 120)" "cut off"
 say "and costs what the limit says" "$(($(kb) < 400000))" "1"
 stop
 

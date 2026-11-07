@@ -140,7 +140,7 @@ type Frame
 # commands would run out of stack. The compiler says so, by name, at the call
 # it cannot promise.
 type Conn
-  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), gone: Chan(Int), ssl: Ptr)
+  Conn(fd: Int, reg: Chan(RReq), done: Chan(Int), cid: Int, out: Chan(Out), say: Chan(Out), gone: Chan(Int), ssl: Ptr)
 
 # -- the registry ---------------------------------------------------------------
 
@@ -669,21 +669,129 @@ fn b_no_handshake(fd, gone) =
 
 fn b_serving(fd, reg, done, cid, gone, ssl) =
   # A publisher pipelining a thousand requests is answered a thousand times,
-  # and every one of those was a `write` of its own. Buffered, they go out in
-  # one call when the writer next has nothing to do, which is exactly when the
-  # client is waiting to hear — the runtime flushes on any park, and the
-  # writer's park is the `select` it does between frames. Not on a TLS
-  # connection: those bytes do not go through `sock_write` at all, and
-  # OpenSSL does its own gathering.
-  b_buffer_writes(ssl, fd)
+  # and `b_pump` gathers those into one write whenever the writer is busy, so
+  # nothing here asks for `sock_buffered`. It used to, and that was a second way
+  # to lose a client: flushing a full socket parks whichever strand happened to
+  # be parking, and a subscriber on `prefetch=0` stopped hearing anything with
+  # thirteen thousand messages out and every buffer empty.
   out = channel(b_backlog())
-  spawn b_writer(fd, out, done, false, ssl)
-  b_read(Conn(fd, reg, done, cid, out, gone, ssl), "", 0, Nil, 0, "")
+  say = channel(b_backlog())
+  wire = channel(1)
+  spawn b_writer(fd, wire, done, false, ssl)
+  spawn b_pump(Pump(fd, say, out, wire, strbuf(), map_new()), "")
+  b_read(Conn(fd, reg, done, cid, out, say, gone, ssl), "", 0, Nil, 0, "")
 
-fn b_buffer_writes(ssl, fd) =
-  if !is_null(ssl) then 0
+# Between the connection and its writer, gathering what is owed into one write
+# for whenever the writer is free. That is what `sock_buffered` was for, and
+# without it or this, delivery runs at two thirds of the rate. Replies arrive on
+# `say` and deliveries on `out`, because only one of them may be refused: a
+# reply is always taken, so the reader never waits on the client, and deliveries
+# stop being taken once the client is behind, for `q_try_send` to leave ready.
+# The limits are `am_writer`'s, for the same reasons.
+#
+# `size` is what is held in slot 0, and in slot 1 how much of that is replies.
+# `head` is what has been offered to the writer and not yet taken.
+type Pump
+  Pump(fd: Int, say: Chan(Out), out: Chan(Out), wire: Chan(Out), owed: StrBuf, size: Map(Int, Int))
+
+type PStep
+  PSay(what: Out)
+  PDeliver(what: Out)
+  PTaken
+
+fn b_behind_at() = 1048576
+
+fn b_lost_at() = 67108864
+
+fn b_owed(p: Pump) = map_or(p.size, 0, 0)
+
+fn b_told(p: Pump) = map_or(p.size, 1, 0)
+
+fn b_pump(p: Pump, head) =
+  if b_told(p) >= b_lost_at() then b_pump(b_cut_off(p), "") else if str_len(head) > 0 then b_offer(p, head) else if b_owed(p) > 0 then b_offer(p, b_pump_take(p)) else b_pump_idle(p)
+
+fn b_pump_idle(p: Pump) =
+  step = select
+    m = recv(p.say) -> PSay(m)
+    o = recv(p.out) -> PDeliver(o)
+  b_pump_on(p, "", step)
+
+fn b_offer(p: Pump, head) =
+  if b_owed(p) >= b_behind_at() then b_offer_behind(p, head) else b_offer_any(p, head)
+
+fn b_offer_any(p: Pump, head) =
+  step = select
+    send(p.wire, OFrame(head)) -> PTaken
+    m = recv(p.say) -> PSay(m)
+    o = recv(p.out) -> PDeliver(o)
+  b_pump_on(p, head, step)
+
+fn b_offer_behind(p: Pump, head) =
+  step = select
+    send(p.wire, OFrame(head)) -> PTaken
+    m = recv(p.say) -> PSay(m)
+  b_pump_on(p, head, step)
+
+fn b_pump_on(p: Pump, head, step) = match step
+  PTaken -> b_pump(p, "")
+  PSay(m) -> if b_is_end(m) then b_pump_end(p, head) else b_pump(b_told_it(p, m), head)
+  PDeliver(m) -> b_pump_out(p, head, m)
+
+# Whatever is waiting on `say` was said before this delivery was made, and a
+# `+OK` must not be overtaken by the message it promised.
+fn b_pump_out(p: Pump, head, m) =
+  first = select
+    r = recv(p.say) -> Some(r)
+    default -> None
+  match first
+    None -> b_pump(b_add(p, b_bytes(m)), head)
+    Some(r) -> if b_is_end(r) then b_pump_end(p, head) else b_pump_out(b_told_it(p, r), head, m)
+
+fn b_is_end(what) = match what
+  OFrame(text) -> str_len(text) == 0
+  _ -> false
+
+fn b_add(p: Pump, text) =
+  strbuf_add(p.owed, text)
+  size = p.size
+  size[0] = b_owed(p) + str_len(text)
+  p
+
+fn b_told_it(p: Pump, m) =
+  text = b_bytes(m)
+  size = p.size
+  size[1] = b_told(p) + str_len(text)
+  b_add(p, text)
+
+fn b_pump_take(p: Pump) =
+  text = strbuf_str(p.owed)
+  b_cleared(p)
+  text
+
+fn b_cleared(p: Pump) =
+  strbuf_clear(p.owed)
+  size = p.size
+  size[0] = 0
+  size[1] = 0
+  p
+
+# Nothing owed is going to be read. The reader wakes and says it has finished,
+# which is what ends this.
+fn b_cut_off(p: Pump) =
+  sock_shutdown(p.fd)
+  b_cleared(p)
+
+fn b_pump_end(p: Pump, head) =
+  b_last_of(p, head)
+  b_last_of(p, b_pump_take(p))
+  send(p.wire, OFrame(""))
+  0
+
+# Empty is how the writer is told to finish, so it is not sent by accident.
+fn b_last_of(p: Pump, text) =
+  if str_len(text) == 0 then 0
   else
-    sock_buffered(fd)
+    send(p.wire, OFrame(text))
     0
 
 # The writer owns the socket. It watches `done` as well as its own channel, so
@@ -725,7 +833,7 @@ fn b_next(out, done) =
 fn b_read(c: Conn, buf, from, subs, idle, who) = match w_take(buf, from)
   Got(cmd, next) -> b_gate(c, buf, next, subs, cmd, who)
   Bad(why, next, fatal) ->
-    send(c.out, OFrame(w_err(why)))
+    send(c.say, OFrame(w_err(why)))
     if fatal then b_bye(c, subs) else b_read(c, buf, next, subs, 0, who)
   Need -> b_fill(c, buf, from, subs, idle, who)
 
@@ -735,7 +843,7 @@ fn b_read(c: Conn, buf, from, subs, idle, who) = match w_take(buf, from)
 fn b_gate(c: Conn, buf, next, subs, cmd, who) =
   if !au_wanted(b_users()) || str_len(who) > 0 || b_always(cmd) then b_do(c, buf, next, subs, cmd, who)
   else
-    send(c.out, OFrame(w_err("say AUTH first")))
+    send(c.say, OFrame(w_err("say AUTH first")))
     b_read(c, buf, next, subs, 0, who)
 
 fn b_always(cmd) = match cmd
@@ -781,67 +889,67 @@ fn b_take(c: Conn, buf, from, subs, who) =
 fn b_quiet(c: Conn, buf, from, subs, idle, who) =
   if len(subs) > 0 || idle < b_idle_secs() then b_read(c, buf, from, subs, idle, who)
   else
-    send(c.out, OFrame(w_err("said nothing for " + int_to_str(b_idle_secs()) + " seconds")))
+    send(c.say, OFrame(w_err("said nothing for " + int_to_str(b_idle_secs()) + " seconds")))
     b_bye(c, subs)
 
 fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
   CAuth(name, word) -> b_signed_in(c, buf, next, subs, name, au_ok(b_users(), name, word))
   CQuit ->
-    send(c.out, OFrame(w_ok()))
+    send(c.say, OFrame(w_ok()))
     b_bye(c, subs)
   CPing ->
-    send(c.out, OFrame(w_pong()))
+    send(c.say, OFrame(w_pong()))
     b_read(c, buf, next, subs, 0, who)
   CStats ->
     back = channel()
     send(c.reg, RTotals(back))
     t = recv(back)
-    send(c.out, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
+    send(c.say, OFrame(w_stats(b_queues(t), b_ready(t), b_inflight(t))))
     b_read(c, buf, next, subs, 0, who)
   CXDecl(ex, kind, inner) ->
     b_exchange_as(c, ex, kind, inner)
-    send(c.out, OFrame(w_ok()))
+    send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CBind(ex, qname, key) ->
     back = channel(1)
     send(b_exchange(c, ex, x_direct()), XBind(qname, key, ToQueue(b_find(c.reg, qname)), false, back))
     recv(back)
-    send(c.out, OFrame(w_ok()))
+    send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CXPub(ex, key, body) ->
-    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.out, 0, x_hops()))
+    send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.say, 0, x_hops()))
     b_read(c, buf, next, subs, 0, who)
   CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, bytes)
   CPromote(qname) ->
     back = channel(1)
     send(c.reg, RPromote(qname, back))
     recv(back)
-    send(c.out, OFrame(w_ok()))
+    send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, subs, 0, who)
   CVote(qname, term, size, node) ->
     back = channel(1)
     send(c.reg, RVote(qname, term, size, node, back))
-    send(c.out, OFrame(if recv(back) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
+    send(c.say, OFrame(if recv(back) == 1 then w_vote_yes() else w_vote_no(b_term(c, qname))))
     b_read(c, buf, next, subs, 0, who)
   CTail(qname, from) ->
     b_say_tail(c, qname, b_tail(c, qname, from))
     b_read(c, buf, next, subs, 0, who)
   CSize(qname) ->
-    send(c.out, OFrame(w_size_line(b_size(c, qname))))
+    send(c.say, OFrame(w_size_line(b_size(c, qname))))
     b_read(c, buf, next, subs, 0, who)
   CWho(qname) ->
     back = channel(1)
     send(c.reg, RWho(qname, back))
-    send(c.out, OFrame(w_who_line(recv(back))))
+    send(c.say, OFrame(w_who_line(recv(back))))
     b_read(c, buf, next, subs, 0, who)
   CDrain(qname) ->
     back = channel(1)
     send(b_find(c.reg, qname), QDrain(back))
-    send(c.out, OFrame(w_drained(recv(back))))
+    send(c.say, OFrame(w_drained(recv(back))))
     b_read(c, buf, next, subs, 0, who)
   CQStat(qname) ->
     st = q_count_of(b_find(c.reg, qname))
-    send(c.out, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st), q_count_delivered(st), q_count_acked(st), b_age(q_count_oldest(st)))))
+    send(c.say, OFrame(w_qstat_line(q_count_ready(st), q_count_inflight(st), q_count_subs(st), q_count_published(st), q_count_delivered(st), q_count_acked(st), b_age(q_count_oldest(st)))))
     b_read(c, buf, next, subs, 0, who)
   CQueues ->
     rows = channel()
@@ -853,47 +961,47 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
     # the `+OK` is put there by whoever makes the message durable; this strand
     # goes straight back to reading, which is what lets a pipelining publisher
     # fill a batch.
-    send(b_find(c.reg, qname), QPub(body, "", c.out))
+    send(b_find(c.reg, qname), QPub(body, "", c.say))
     b_read(c, buf, next, subs, 0, who)
   CSub(qname) ->
-    # The answer goes into the writer's queue before the subscription is made,
-    # so that it is written before any message the subscription brings. Both
-    # travel down the one channel and the writer takes them in order, which is
-    # what makes this enough; asking first and answering after would let a
-    # message overtake the `+OK` that promised it.
-    send(c.out, OFrame(w_ok()))
+    # The answer is sent before the subscription is made, so that it is written
+    # before any message the subscription brings. They travel down different
+    # channels, and `b_pump_out` empties this one before it takes a delivery
+    # from the other, which is what makes this enough; asking first and
+    # answering after would let a message overtake the `+OK` that promised it.
+    send(c.say, OFrame(w_ok()))
     back = channel()
     send(b_find(c.reg, qname), QSub(Sub(c.cid, c.out, false, q_prefetch(), c.cid), back))
     recv(back)
     b_read(c, buf, next, if contains_name(subs, qname) then subs else Cons(qname, subs), 0, who)
   CUnsub(qname) ->
     b_drop(c.reg, c.cid, qname)
-    send(c.out, OFrame(w_ok()))
+    send(c.say, OFrame(w_ok()))
     b_read(c, buf, next, without_name(subs, qname), 0, who)
   CAck(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QAck(id, back))
-    send(c.out, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
+    send(c.say, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
     b_read(c, buf, next, subs, 0, who)
   CNack(qname, id) ->
     back = channel()
     send(b_find(c.reg, qname), QNack(id, back))
-    send(c.out, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
+    send(c.say, OFrame(if recv(back) == 1 then w_ok() else w_err("no such message in flight")))
     b_read(c, buf, next, subs, 0, who)
 
 fn b_signed_in(c: Conn, buf, next, subs, name, yes) =
-  send(c.out, OFrame(if yes then w_ok() else w_err("no")))
+  send(c.say, OFrame(if yes then w_ok() else w_err("no")))
   b_read(c, buf, next, subs, 0, if yes then name else "")
 
 # The count first, then the rows, so a client knows how many to read.
 fn b_say_rows(c: Conn, rows) =
-  send(c.out, OFrame(w_queues_head(len(rows))))
+  send(c.say, OFrame(w_queues_head(len(rows))))
   b_say_each(c, rows)
 
 fn b_say_each(c: Conn, rows) = match rows
   Nil -> 0
   Cons(r, rest) ->
-    send(c.out, OFrame(r))
+    send(c.say, OFrame(r))
     b_say_each(c, rest)
 
 fn b_queues(t: Totals) = t.queues
@@ -918,11 +1026,11 @@ fn b_take_copy(c: Conn, w: Where, qname, term, bytes) =
 fn b_keep_copy(c: Conn, w: Where, qname, bytes) =
   back = channel(1)
   send(c.reg, RCopy(qname, back))
-  send(r_puts(recv(back)), JPut(bytes, c.out, OFrame(w_ok())))
+  send(r_puts(recv(back)), JPut(bytes, c.say, OFrame(w_ok())))
   b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_refuse_copy(c: Conn, w: Where) =
-  send(c.out, OFrame(w_stale()))
+  send(c.say, OFrame(w_stale()))
   b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_size(c: Conn, name) =
@@ -936,7 +1044,7 @@ fn b_tail(c: Conn, name, from) =
   recv(back)
 
 fn b_say_tail(c: Conn, name, t) =
-  send(c.out, OFrame(w_tail_line(str_len(t)) + t))
+  send(c.say, OFrame(w_tail_line(str_len(t)) + t))
   0
 
 fn b_term(c: Conn, name) =
@@ -972,7 +1080,7 @@ fn b_bye(c: Conn, subs) =
   # on the same `done` and have already gone, so asking them to forget this
   # subscriber would be asking nobody, and the ask would never come back.
   if closed(c.done) then 0 else b_drop_all(c.reg, c.cid, subs)
-  send(c.out, OFrame(""))
+  send(c.say, OFrame(""))
   # And the doorman is told, so that the next one may come in. The channel is
   # as large as the limit, so this never waits.
   send(c.gone, 1)

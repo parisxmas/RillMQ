@@ -2,9 +2,12 @@
 """A client too simple to hide a broker's mistakes.
 
     slow.py drain <port> <messages> <window>    read one, ack one, on one thread
+    slow.py batches <port> <messages> <size>    read that many, then ack them all
     slow.py closes <port> <count>               open and politely close
     slow.py ignore <port> <messages>            consume, then never read again
     slow.py flood <port> <seconds>              ask, and never read an answer
+    slow.py native <port> <messages>            drain, on RillMQ's own protocol
+    slow.py pings <port> <seconds>              flood, on RillMQ's own protocol
 
 RabbitMQ's .NET client cannot be used for this, because it reads on a thread of
 its own: the socket keeps emptying whatever the rest of the program is doing. A
@@ -126,6 +129,28 @@ def drain(port, n, window):
     print("drained" if left == 0 else f"{left} left")
 
 
+def batches(port, n, size):
+    queue = "batches"
+    fill(port, queue, n)
+    c = Conn(port)
+    c.consume(queue, 0)
+    done = 0
+    held = []
+    try:
+        while done < n:
+            while len(held) < min(size, n - done):
+                kind, p = c.frame()
+                if kind == 1 and p[:4] == struct.pack(">HH", 60, 60):
+                    held.append(p[5 + p[4]:13 + p[4]])
+            c.s.sendall(b"".join(method(1, 60, 80, t + b"\0") for t in held))
+            done += len(held)
+            held = []
+    except (socket.timeout, TimeoutError):
+        print(f"stuck at {done + len(held)}")
+        return
+    print("drained")
+
+
 def closes(port, count):
     for _ in range(count):
         Conn(port).close()
@@ -157,6 +182,68 @@ def flood(port, seconds):
     print("still connected")
 
 
+def native(port, n):
+    p = socket.create_connection(("127.0.0.1", port))
+    p.settimeout(STALL)
+    for _ in range(0, n, 1000):
+        p.sendall((b"PUB nq 64\r\n" + BODY) * 1000)
+        heard = b""
+        while heard.count(b"\r\n") < 1000:
+            heard += p.recv(1 << 16)
+    c = socket.create_connection(("127.0.0.1", port))
+    c.settimeout(STALL)
+    c.sendall(b"SUB nq\r\n")
+    buf = b""
+    done = 0
+    first = True
+    try:
+        while done < n:
+            at = buf.find(b"\r\n")
+            if at < 0:
+                more = c.recv(1 << 16)
+                if not more:
+                    print(f"closed at {done}")
+                    return
+                buf += more
+                continue
+            line = buf[:at]
+            if first:
+                # What `SUB` promised comes before anything it brings.
+                if line != b"+OK":
+                    print(f"{line!r} came first")
+                    return
+                first = False
+            if line.startswith(b"MSG "):
+                _, mid, _, size = line.split()
+                need = at + 2 + int(size)
+                while len(buf) < need:
+                    buf += c.recv(1 << 16)
+                buf = buf[need:]
+                c.sendall(b"ACK nq " + mid + b"\r\n")
+                done += 1
+            else:
+                buf = buf[at + 2:]
+    except (socket.timeout, TimeoutError):
+        print(f"stuck at {done}")
+        return
+    print("drained")
+
+
+def pings(port, seconds):
+    c = socket.create_connection(("127.0.0.1", port))
+    c.settimeout(seconds)
+    ask = b"PING\r\n" * 100000
+    until = time.monotonic() + seconds
+    try:
+        while time.monotonic() < until:
+            c.sendall(ask)
+    except (ConnectionError, OSError):
+        print("cut off")
+        return
+    print("still connected")
+
+
 mode = sys.argv[1]
 args = [int(a) for a in sys.argv[2:]]
-{"drain": drain, "closes": closes, "ignore": ignore, "flood": flood}[mode](*args)
+{"drain": drain, "batches": batches, "closes": closes, "ignore": ignore, "flood": flood,
+ "native": native, "pings": pings}[mode](*args)

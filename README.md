@@ -1006,9 +1006,19 @@ leaves them ready as it does for any consumer that is behind. A client that asks
 for answers and leaves 64 MB of them unread is disconnected. `test/slow.sh` is
 that client, and the others.
 
-The native protocol still has the deadlock. Nothing a client says can reach it,
-because a native client cannot ask for a window, but a broker started with
-`prefetch=0` will: the window is what keeps it away there, so leave it on.
+The native protocol stopped too under `prefetch=0`, every run, and for another
+reason. It asked the runtime to buffer its writes, and flushing a full socket
+parks whichever strand was about to park, which left a subscriber hearing nothing
+with thirteen thousand messages out and every buffer empty. It no longer asks. A
+strand of its own gathers writes instead, which costs about four per cent of
+delivery where going without would cost a third, and it keeps replies and
+deliveries apart so that a reply is never held up behind a delivery.
+
+A consumer that acknowledges in batches found one more. A queue that passes a
+message over because a consumer's buffer is full offers it again when something
+next happens, and that consumer was waiting for more before saying anything. So
+while there is a message and a window with room for it, the queue looks again
+every five milliseconds by itself.
 
 ## Against RabbitMQ
 

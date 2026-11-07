@@ -108,10 +108,9 @@ fn q_ack_ms() = opt_int("ack", 5000)
 # consumer is then waiting for the broker to read an acknowledgement that the
 # broker cannot read until the consumer reads what it has already been sent.
 # Neither side is at fault and neither can move. AMQP calls the cure prefetch
-# and Kafka calls it max.poll.records; it is the same limit. This is the
-# default, and on the native protocol it is the only thing standing between a
-# broker and that deadlock, so `prefetch=0` puts it back. AMQP has its own way
-# out, because a client there may ask for no limit: see `am_writer`.
+# and Kafka calls it max.poll.records; it is the same limit. It is a default and
+# not a cure: a client may ask for no limit, and `prefetch=0` gives everyone
+# none. What actually keeps the reader moving is `am_writer` and `b_pump`.
 fn q_prefetch() = opt_int("prefetch", 64)
 
 # What the loop waits when nothing is in flight. Not forever, because a queue
@@ -208,7 +207,7 @@ fn q_turn(q: Q, inbox, done, g: Guard) =
     r = recv(inbox) -> if q_is_stop(r) then q_stopping(q, r) else Some(q_pump(q_handle(q, r, g.full)))
     recv(q.jr.want) -> Some(q_hand_over(q))
     recv(done) -> None
-    timeout(q_wait_ms(q)) -> Some(q_pump(q_sweep(q)))
+    timeout(q_wait_ms(q)) -> Some(q_pump(q_sweep_if_due(q)))
   match step
     None -> 0
     Some(next) -> q_turn(next, inbox, done, q_look(g))
@@ -304,16 +303,39 @@ fn q_ready_msgs(q: Q, i, acc) =
     None -> q_ready_msgs(q, i - 1, acc)
     Some(m) -> q_ready_msgs(q, i - 1, Cons(m, acc))
 
+# Waking to offer a message again is not a reason to walk everything in flight.
+fn q_sweep_if_due(q: Q) =
+  if q.next_due != 0 && q.next_due <= now_millis() then q_sweep(q) else q
+
 # The deadline the `select` above is given. With nothing in flight there is
 # nothing to wake up for, and with something in flight the wait is exactly as
 # long as the soonest of them has left. This is what a `timeout` arm is for:
 # the same thing written with a ticker strand would be a strand and a channel
 # per queue, ticking whether or not anything was waiting on it.
 fn q_wait_ms(q: Q) =
+  if q_someone_is_behind(q) then q_retry_ms() else q_deadline_ms(q)
+
+fn q_deadline_ms(q: Q) =
   if q.next_due == 0 then q_idle_ms()
   else
     left = q.next_due - now_millis()
     if left < 1 then 1 else left
+
+# A message passed over because a consumer's buffer was full is offered again
+# when something next happens here, and that may be nothing. A consumer with no
+# window that acknowledges in batches is waiting for more before it says
+# anything, and nothing else is coming, so the queue has to look again by
+# itself: otherwise they wait for each other until a deadline ends it. Only
+# while there is a message and a window with room for it, because `q_pump` has
+# just run and that means it could not be delivered.
+fn q_retry_ms() = 5
+
+fn q_someone_is_behind(q: Q) =
+  q.head < q.tail && q_any_room(q, q.subs)
+
+fn q_any_room(q: Q, subs) = match subs
+  Nil -> false
+  Cons(s, rest) -> !q_no_room(q, s) || q_any_room(q, rest)
 
 # How much is outstanding against one window.
 fn q_held(q: Q, group) = map_or(q.held, group, 0)
