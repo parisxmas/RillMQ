@@ -207,6 +207,10 @@ type JReq
   # each: the bodies are the ones the queue is already holding, and the record
   # is built here, one at a time, on its way to the file.
   JRewriteMsgs(msgs: List(Msg), name: Str)
+  # A file entire, from a leader, in place of this one. It takes the road a
+  # rewrite takes, so it keeps its place among whatever else is arriving, and it
+  # is answered once the file is there.
+  JWhole(bytes: Str, reply: Chan(Out), value: Out)
   # The end of this journal, because the queue it belongs to has gone. Nothing
   # else ends one: every other journal in the program stops when the broker
   # does, on the `done` everybody watches.
@@ -230,7 +234,7 @@ type Jr
 # One other node's copy of this journal, the socket to it, and when it was
 # last tried if there is no socket.
 type Copy
-  Copy(host: Str, port: Int, fd: Int, spill: Str, tried: Int, yes: Bool)
+  Copy(host: Str, port: Int, fd: Int, spill: Str, tried: Int, yes: Bool, gap: Bool)
 
 # Where a journal lives, who else is to have a copy of it, and how many of
 # them have to have a record before anybody is told it is safe.
@@ -287,8 +291,8 @@ fn j_dial_all(copies) = match copies
   Cons(c, rest) -> Cons(j_dial(c), j_dial_all(rest))
 
 fn j_dial(c: Copy) = match connect_to(c.host, c.port)
-  Err(e) -> Copy(c.host, c.port, -1, "", now_millis(), false)
-  Ok(fd) -> Copy(c.host, c.port, fd, "", 0, false)
+  Err(e) -> Copy(c.host, c.port, -1, "", now_millis(), false, false)
+  Ok(fd) -> Copy(c.host, c.port, fd, "", 0, false, false)
 
 fn j_cannot(path, jr: Jr, done) =
   println("rillmq: cannot write " + path + ", this queue is memory only")
@@ -312,6 +316,7 @@ fn j_is_stop(r) = match r
   JSay(reply, value) -> false
   JRewriteReq(recs, name) -> false
   JRewriteMsgs(msgs, name) -> false
+  JWhole(bytes, reply, value) -> false
 
 fn j_commit(js: Js, jr: Jr, r) =
   b = strbuf()
@@ -365,7 +370,7 @@ fn j_redial(copies, acc) = match copies
 fn j_worth_dialling(c: Copy) = c.fd < 0 && now_millis() - c.tried >= j_redial_ms()
 
 fn j_copy_to(copies, js: Js, bytes) =
-  j_shout(copies, "REPL " + js.name + " " + int_to_str(js.term) + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes)
+  j_shout(copies, "REPL " + js.name + " " + int_to_str(js.term) + " " + int_to_str(str_len(bytes)) + " " + int_to_str(file_size(js.fd) - str_len(bytes)) + "\r\n" + bytes)
   j_count(Js(js.fd, js.path, js.pubs, js.acks, js.name, copies, js.need, js.term), copies, Nil, 0)
 
 fn j_shout(copies, text) = match copies
@@ -373,6 +378,20 @@ fn j_shout(copies, text) = match copies
   Cons(c, rest) ->
     if j_fd(c) >= 0 then j_write_to(j_fd(c), text) else 0
     j_shout(rest, text)
+
+# A copy that says `-GAP` is sent everything at once, with this batch in it, and
+# what it says to that is its answer to this batch. Waiting for the next one would
+# refuse a publish that a node coming back had every means of confirming.
+fn j_settled(js: Js, a: Copy) =
+  if a.fd < 0 || !a.gap then a
+  else
+    j_write_to(a.fd, j_all_of(js))
+    j_line(a)
+
+fn j_all_of(js: Js) =
+  fd = file_open(js.path, "r")
+  bytes = if fd < 0 then "" else j_shut(fd, file_pread(fd, 0, file_size(fd)))
+  "WHOLE " + js.name + " " + int_to_str(js.term) + " " + int_to_str(str_len(bytes)) + "\r\n" + bytes
 
 fn j_fd(c: Copy) = c.fd
 
@@ -387,7 +406,7 @@ fn j_count(js: Js, left, seen, got) = match left
 fn j_count_one(js: Js, c: Copy, rest, seen, got) =
   if c.fd < 0 then j_count(js, rest, Cons(c, seen), got)
   else
-    a = j_line(c)
+    a = j_settled(js, j_line(c))
     j_count(js, rest, Cons(a, seen), if j_agreed(a) then got + 1 else got)
 
 # A line is an answer and not a yes. `-STALE` is a node saying it has heard of a
@@ -400,15 +419,15 @@ fn j_agreed(a: Copy) =
 # One line back from one copy, and whatever came with it kept for next time.
 fn j_line(c: Copy) =
   at = str_find(c.spill, "\r\n")
-  if at >= 0 then Copy(c.host, c.port, c.fd, c.spill[at + 2:], c.tried, starts_with(c.spill, "+OK")) else j_line_more(c)
+  if at >= 0 then Copy(c.host, c.port, c.fd, c.spill[at + 2:], c.tried, starts_with(c.spill, "+OK"), starts_with(c.spill, "-GAP")) else j_line_more(c)
 
 fn j_line_more(c: Copy) =
   more = sock_read(c.fd)
-  if str_len(more) == 0 then j_copy_gone(c) else j_line(Copy(c.host, c.port, c.fd, c.spill + more, c.tried, false))
+  if str_len(more) == 0 then j_copy_gone(c) else j_line(Copy(c.host, c.port, c.fd, c.spill + more, c.tried, false, false))
 
 fn j_copy_gone(c: Copy) =
   sock_close(c.fd)
-  Copy(c.host, c.port, -1, "", now_millis(), false)
+  Copy(c.host, c.port, -1, "", now_millis(), false, false)
 
 fn j_do_todo(js: Js, todo) = match todo
   Nil -> js
@@ -450,6 +469,7 @@ fn j_add(b: StrBuf, r, g: JBatch) = match r
   JSay(reply, value) -> JBatch(Cons(JWait(reply, value), g.ws), g.pubs, g.acks, g.todo)
   JRewriteReq(recs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
   JRewriteMsgs(msgs, name) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
+  JWhole(bytes, reply, value) -> JBatch(g.ws, g.pubs, g.acks, Cons(r, Nil))
   JStop -> g
 
 # In the order the records went in. `j_add` puts each on the front as it
@@ -586,6 +606,7 @@ fn j_rewrite(js: Js, c) = match c
   JSay(reply, value) -> js
   JRewriteReq(recs, name) -> j_rewriting(js, name, recs, Nil, len(recs))
   JRewriteMsgs(msgs, name) -> j_rewriting(js, name, Nil, msgs, len(msgs))
+  JWhole(bytes, reply, value) -> j_whole(js, bytes, reply, value)
 
 fn j_rewriting(js: Js, name, recs, msgs, n) =
   tmp = js.path + ".new"
@@ -598,6 +619,19 @@ fn j_rewriting(js: Js, name, recs, msgs, n) =
     file_sync(nfd)
     file_close(nfd)
     j_swap(js, tmp, n)
+
+fn j_whole(js: Js, bytes, reply, value) =
+  tmp = js.path + ".new"
+  nfd = file_open(tmp, "w")
+  if nfd < 0 then js else j_whole_into(js, tmp, nfd, bytes, reply, value)
+
+fn j_whole_into(js: Js, tmp, nfd, bytes, reply, value) =
+  file_write(nfd, bytes)
+  file_sync(nfd)
+  file_close(nfd)
+  after = j_swap(js, tmp, 0)
+  send(reply, value)
+  after
 
 fn j_swap(js: Js, tmp, n) =
   if !file_rename(tmp, js.path) then js

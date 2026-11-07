@@ -961,7 +961,8 @@ fn b_always(cmd) = match cmd
   CXDecl(x, k, i) -> false
   CBind(x, q, k) -> false
   CXPub(x, k, b) -> false
-  CRepl(q, t, n) -> false
+  CRepl(q, t, a, n) -> false
+  CWhole(q, t, n) -> false
   CVote(q, t, n, f) -> false
   CWho(q) -> false
   CTail(q, f) -> false
@@ -1018,7 +1019,8 @@ fn b_do(c: Conn, buf, next, subs, cmd, who) = match cmd
   CXPub(ex, key, body) ->
     send(b_exchange(c, ex, x_direct()), XPub(key, body, "", c.say, 0, x_hops()))
     b_read(c, buf, next, subs, 0, who)
-  CRepl(qname, term, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, bytes)
+  CRepl(qname, term, at, bytes) -> b_take_copy(c, Where(buf, next, subs, who), qname, term, at, bytes)
+  CWhole(qname, term, bytes) -> b_take_whole(c, Where(buf, next, subs, who), qname, term, bytes)
   CPromote(qname) ->
     back = channel(1)
     send(c.reg, RPromote(qname, back))
@@ -1119,8 +1121,26 @@ fn b_inflight(t: Totals) = t.inflight
 type Where
   Where(buf: Str, next: Int, subs: List(Str), who: Str)
 
-fn b_take_copy(c: Conn, w: Where, qname, term, bytes) =
-  if term < b_term(c, qname) then b_refuse_copy(c, w) else b_keep_copy(c, w, qname, bytes)
+fn b_take_copy(c: Conn, w: Where, qname, term, at, bytes) =
+  if term < b_term(c, qname) then b_refuse_copy(c, w) else if at != b_size(c, qname) then b_say_gap(c, w) else b_keep_copy(c, w, qname, bytes)
+
+# Appended to a file of another length, these bytes would leave a hole that looks
+# like a copy, and the node holding it could be elected. It says so instead, and
+# is sent the whole file: a node that was away, a leader that has rewritten its
+# file and a node that stood down all arrive here, and nothing else has to know
+# which it was.
+fn b_say_gap(c: Conn, w: Where) =
+  send(c.say, OFrame(w_gap()))
+  b_read(c, w.buf, w.next, w.subs, 0, w.who)
+
+fn b_take_whole(c: Conn, w: Where, qname, term, bytes) =
+  if term < b_term(c, qname) then b_refuse_copy(c, w) else b_keep_whole(c, w, qname, bytes)
+
+fn b_keep_whole(c: Conn, w: Where, qname, bytes) =
+  back = channel(1)
+  send(c.reg, RCopy(qname, back))
+  send(r_puts(recv(back)), JWhole(bytes, c.say, OFrame(w_ok())))
+  b_read(c, w.buf, w.next, w.subs, 0, w.who)
 
 fn b_keep_copy(c: Conn, w: Where, qname, bytes) =
   back = channel(1)

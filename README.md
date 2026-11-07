@@ -1276,6 +1276,7 @@ sh test/blocked.sh           # 1 check that a full broker asks a publisher to st
 sh test/secure.sh            # 14 checks of passwords, TLS and certificates
 sh test/slow.sh              # 26 checks of clients that do not keep up
 sh test/stale.sh             # 5 checks of a leader that was replaced while frozen
+sh test/gap.sh               # a copy that was away ends up the same as the leader's
 sh test/vhosts.sh            # 10 checks of virtual hosts and rights
 sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes
@@ -1318,13 +1319,13 @@ All hundred and eighty-four of them pass, with or without a journal.
   queue nobody is watching over. It has nothing in it, which is why this is
   liveable, but the first message to a cold queue on a dead node still waits
   for somebody to ask.
-- **A term is per queue, and catching up is a whole file's tail.** A node that
-  is behind asks the others how much of the queue they have, fetches
-  everything past what it has from the one with the most, and then stands.
-  That is enough because a journal is only ever appended to and replaced
-  whole, so there is nothing to reconcile — but it is a byte range, not a log
-  comparison, and a copy that has diverged rather than fallen behind is not a
-  case this can tell apart or repair.
+- **A term is per queue, and a copy that differs is sent the whole file.** Every
+  batch says how long the leader's file was before it, and a copy of any other
+  length says `-GAP` and gets all of it, in the same round trip. A node that was
+  away, a leader that rewrote its file and a node that stood down all arrive
+  there, so nothing has to know which it was. It is a length and not a log
+  comparison, and a whole file is a whole file: a large queue pays for that once
+  each time, and it has to fit in a gigabyte.
 - **Only the lowest-numbered node that is still there stands.** Two standing
   at once for the same turn can each grant the other, because a vote is one
   round and nothing here steps down on seeing a later turn. Until catching up

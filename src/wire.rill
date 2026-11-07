@@ -41,7 +41,11 @@ type Cmd
   CStats
   CQueues
   CQStat(queue: Str)
-  CRepl(queue: Str, term: Int, bytes: Str)
+  # `at` is how long the leader's file was before these bytes, and what they are
+  # appended to has to be the same length or there is a hole in it.
+  CRepl(queue: Str, term: Int, at: Int, bytes: Str)
+  # All of it, for a copy that said it could not take the rest.
+  CWhole(queue: Str, term: Int, bytes: Str)
   CVote(queue: Str, term: Int, size: Int, node: Int)
   CWho(queue: Str)
   # `TAIL <queue> <from>` is a node that has fallen behind asking a node that
@@ -96,7 +100,7 @@ fn w_most_body() = 1048576
 fn w_take_line(buf, line, rest) =
   parts = split(line, " ")
   verb = upper(unwrap_or(nth(parts, 0), ""))
-  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "TAIL") == 0 then w_tail(parts, rest) else if str_cmp(verb, "SIZE") == 0 then w_size(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "DRAIN") == 0 then w_drain(parts, rest) else if str_cmp(verb, "AUTH") == 0 then w_auth(parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
+  if str_cmp(verb, "PUB") == 0 then w_take_pub(buf, parts, rest) else if str_cmp(verb, "SUB") == 0 then w_sub(parts, rest) else if str_cmp(verb, "UNSUB") == 0 then w_unsub(parts, rest) else if str_cmp(verb, "ACK") == 0 then w_ack(parts, rest) else if str_cmp(verb, "NACK") == 0 then w_nack(parts, rest) else if str_cmp(verb, "STATS") == 0 then Got(CStats, rest) else if str_cmp(verb, "QUEUES") == 0 then Got(CQueues, rest) else if str_cmp(verb, "QSTAT") == 0 then w_qstat(parts, rest) else if str_cmp(verb, "REPL") == 0 then w_take_repl(buf, parts, rest) else if str_cmp(verb, "WHOLE") == 0 then w_take_whole(buf, parts, rest) else if str_cmp(verb, "VOTE") == 0 then w_vote(parts, rest) else if str_cmp(verb, "WHO") == 0 then w_who(parts, rest) else if str_cmp(verb, "TAIL") == 0 then w_tail(parts, rest) else if str_cmp(verb, "SIZE") == 0 then w_size(parts, rest) else if str_cmp(verb, "PROMOTE") == 0 then w_promote(parts, rest) else if str_cmp(verb, "XDECL") == 0 then w_xdecl(parts, rest) else if str_cmp(verb, "BIND") == 0 then w_bind(parts, rest) else if str_cmp(verb, "XPUB") == 0 then w_take_xpub(buf, parts, rest) else if str_cmp(verb, "DRAIN") == 0 then w_drain(parts, rest) else if str_cmp(verb, "AUTH") == 0 then w_auth(parts, rest) else if str_cmp(verb, "PING") == 0 then Got(CPing, rest) else if str_cmp(verb, "QUIT") == 0 then Got(CQuit, rest) else if str_len(verb) == 0 then Need else Bad("unknown command `" + verb + "`", rest, false)
 
 # A constructor is not a value in Rill, so the four commands that differ only
 # in which one they build are written out rather than handed a maker.
@@ -148,7 +152,16 @@ fn w_promote(parts, rest) =
 fn w_take_repl(buf, parts, at) =
   queue = w_name(parts)
   len = str_to_int(unwrap_or(nth(parts, 3), "-1"))
-  if str_len(queue) == 0 || len < 0 then Bad("a queue, a term and a length are wanted", at, false) else if len > w_most_body() then Bad("batch too long", 0, true) else if str_len(buf) - at < len then Need else Got(CRepl(queue, str_to_int(w_second(parts)), buf[at:at + len]), at + len)
+  if str_len(queue) == 0 || len < 0 then Bad("a queue, a term and a length are wanted", at, false) else if len > w_most_body() then Bad("batch too long", 0, true) else if str_len(buf) - at < len then Need else Got(CRepl(queue, str_to_int(w_second(parts)), str_to_int(unwrap_or(nth(parts, 4), "-1")), buf[at:at + len]), at + len)
+
+# `WHOLE <queue> <term> <len>`, a journal entire. It is not a batch, so it is not
+# held to a batch's limit.
+fn w_most_whole() = 1073741824
+
+fn w_take_whole(buf, parts, at) =
+  queue = w_name(parts)
+  len = str_to_int(unwrap_or(nth(parts, 3), "-1"))
+  if str_len(queue) == 0 || len < 0 then Bad("a queue, a term and a length are wanted", at, false) else if len > w_most_whole() then Bad("journal too long", 0, true) else if str_len(buf) - at < len then Need else Got(CWhole(queue, str_to_int(w_second(parts)), buf[at:at + len]), at + len)
 
 # `VOTE <queue> <term> <size> <node>` is one node asking to lead a queue: which
 # turn it means, how much of that queue's journal it has, and which node it is
@@ -186,6 +199,8 @@ fn w_vote_no(term) = "-VOTE " + int_to_str(term) + crlf()
 fn w_who_line(node) = "+WHO " + int_to_str(node) + crlf()
 
 fn w_stale() = "-STALE" + crlf()
+
+fn w_gap() = "-GAP" + crlf()
 
 # Four numbers became seven, and the three new ones are on the end so that a
 # client reading the first four goes on working. `delivered` and `acked` only
