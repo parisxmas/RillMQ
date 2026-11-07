@@ -62,7 +62,11 @@ time.sleep(1.2)
 pub('one'); time.sleep(1.0)
 subprocess.run(['kill', '-9', '$N1']); time.sleep(1.2)
 pub('two'); time.sleep(1.2)
-pub('three'); time.sleep(1.5)
+pub('three')
+# Waited for rather than slept through: how long this takes is how busy the
+# machine is, and a fixed sleep failed on a slow runner with nothing wrong.
+until = time.time() + 15
+while len(got) < 3 and time.time() < until: time.sleep(0.1)
 print(','.join(said) + '|' + ','.join(got))
 ")
 

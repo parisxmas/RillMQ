@@ -92,9 +92,15 @@ start 60000
 # was making this check fail when the rest of the suite was running beside it.
 # What is asserted is unchanged: if it never shrinks, the wait runs out and the
 # size that comes back is the size that fails.
+#
+# How small depends on where the last rewrite landed, and that depends on how
+# busy the machine is. One that lands late leaves fewer than `j_compact_floor`
+# records with nothing left to earn another, which is as designed: up to 4096
+# records, about 110 KB at the most. Never rewritten, this file is about 227 KB.
+# The limit was 40 KB, and a slow machine failed it at 77 KB with nothing wrong.
 BULK=$(wc -c < "$DIR/bulk.log" | tr -d ' ')
 WAITED=0
-while [ "$BULK" -ge 40000 ] && [ "$WAITED" -lt 60 ]; do
+while [ "$BULK" -ge 120000 ] && [ "$WAITED" -lt 60 ]; do
   sleep 0.5
   WAITED=$((WAITED + 1))
   BULK=$(wc -c < "$DIR/bulk.log" | tr -d ' ')
@@ -103,7 +109,7 @@ done
 # ready, so counting only what is ready would be counting a different thing on
 # either side of the crash.
 LEFT=$(stats | awk '{print $3 + $4}')
-say "the journal was rewritten to about what is left" "$([ "$BULK" -lt 40000 ] && echo small || echo "$BULK")" "small"
+say "the journal was rewritten to about what is left" "$([ "$BULK" -lt 120000 ] && echo small || echo "$BULK")" "small"
 crash
 
 start 60000
