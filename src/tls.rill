@@ -297,11 +297,7 @@ fn tls_write_from(ssl, fd, p, want, sent) =
 fn tls_write_more(ssl, fd, p, want, sent) =
   ERR_clear_error()
   k = SSL_write(ssl, ptr_offset(p, sent), want - sent)
-  e = if k > 0 then 0 else SSL_get_error(ssl, k)
-  tls_wrote(ssl, fd, p, want, sent, k, e)
-
-fn tls_wrote(ssl, fd, p, want, sent, k, e) =
-  if k > 0 then tls_write_from(ssl, fd, p, want, sent + k) else tls_write_again(ssl, fd, p, want, sent, e)
+  if k > 0 then tls_write_from(ssl, fd, p, want, sent + k) else tls_write_again(ssl, fd, p, want, sent, SSL_get_error(ssl, k))
 
 fn tls_write_again(ssl, fd, p, want, sent, e) =
   if e == tls_want_read() then tls_write_after_read(ssl, fd, p, want, sent) else if e == tls_want_write() then tls_write_after_pause(ssl, fd, p, want, sent) else -1
