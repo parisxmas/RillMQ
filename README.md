@@ -7,7 +7,7 @@ and written to a journal, so a broker that is killed comes back with what it
 had answered for. It speaks AMQP 0-9-1, so RabbitMQ's own client libraries
 work against it unchanged.
 
-This is version 0.2.1. It builds with Rill 0.16.1 and with the
+This is version 0.2.2. It builds with Rill 0.16.1 and with the
 `rillmq-foundations` branch.
 
 ```sh
@@ -1032,10 +1032,10 @@ of its own each run. Neither broker knows which it is.
 
 | over AMQP, through RabbitMQ's own .NET client | RabbitMQ | RillMQ |
 |---|---:|---:|
-| publish, transient | 211,000/sec | 686,000/sec |
-| deliver and acknowledge | 140,000/sec | 208,000/sec |
-| publish, durable, waiting for confirms | 274,000/sec | 720,000/sec |
-| grew by, holding 200,000 durable messages | 76 MB | 114 MB |
+| publish, transient | 276,000/sec | 791,000/sec |
+| deliver and acknowledge | 181,000/sec | 252,000/sec |
+| publish, durable, waiting for confirms | 315,000/sec | 680,000/sec |
+| grew by, holding 200,000 durable messages | 86 MB | 54 MB |
 
 Each rate is the median of three runs, taken in one sitting with the two
 brokers alternating. An earlier table here said 837,000 for the transient
@@ -1044,13 +1044,15 @@ build measures under 800,000 today, and so does the build from before this
 week's work. Something outside these numbers changed. The ratios are what
 they were.
 
-The memory row is the one that changed direction, and it is worth reading
-carefully. RabbitMQ starts at 86 MB where this starts at 2 MB, so on the whole
-figure this is far smaller — but per message held it is not: two hundred
-thousand 64-byte messages cost RabbitMQ 76 MB and cost this 114 MB. RabbitMQ
-writes a durable message down and lets go of it; this keeps every message it
-is holding in memory and uses the journal only to come back from. That is a
-deliberate difference and this is the side of it that costs.
+The memory row has changed direction twice. RabbitMQ starts at about 140 MB
+where this starts at 1 MB, so this was always far smaller on the whole figure,
+but per message it used to be the larger of the two: 114 MB against 76 MB. Half
+of that was a leak. A compiler bug kept a reference to everything read through
+one spelling of `select`, and with that gone two hundred thousand 64-byte
+messages cost this 54 MB against RabbitMQ's 86 MB. RabbitMQ writes a durable
+message down and lets go of it; this keeps every message it is holding in memory
+and uses the journal only to come back from, so it is still the side that grows
+with what it holds.
 
 The transient publish figure is the one to read carefully: with confirms off
 there is nothing to wait for, so it measures how fast a broker takes messages
@@ -1270,6 +1272,7 @@ sh test/amqp.sh              # 72 checks through RabbitMQ's own .NET client
 sh test/deleted.sh           # 9 checks on what survives a restart and what does not
 sh test/blocked.sh           # 1 check that a full broker asks a publisher to stop
 sh test/secure.sh            # 14 checks of passwords, TLS and certificates
+sh test/slow.sh              # 23 checks of clients that do not keep up
 sh test/vhosts.sh            # 10 checks of virtual hosts and rights
 sh test/manage.sh            # 17 checks of the management pages
 sh test/cluster.sh           # 7 checks across two nodes

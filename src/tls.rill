@@ -25,6 +25,15 @@ extern "-L/opt/homebrew/opt/openssl@3/lib" fn OPENSSL_version_major() -> U32
 
 extern "-L/usr/local/opt/openssl@3/lib" fn OPENSSL_version_minor() -> U32
 
+# The runtime's own writes cannot raise SIGPIPE. OpenSSL's can, because it calls
+# `write` itself, and on Linux a client that had gone took the whole broker with
+# it. Ignored, the write answers with an error like any other.
+extern "c" fn signal(sig: I32, handler: Ptr) -> Ptr
+
+fn p_ignore_broken_pipes() =
+  signal(13, ptr_offset(null_ptr(), 1))
+  0
+
 extern "ssl" fn TLS_server_method() -> Ptr
 
 extern "ssl" fn SSL_CTX_new(method: Ptr) -> Ptr
@@ -309,23 +318,29 @@ fn p_write(ssl, fd, s) = if is_null(ssl) then sock_write(fd, s) else tls_write(s
 #
 # The question is about progress. Writes are counted a piece at a time, because
 # a whole write can be a large message, and a client reading that slowly is slow
-# and not gone. They are counted in a map rather than told over a channel because
-# telling costs two switches per write, which was seven per cent of delivery, to
-# feed something that almost never does anything. It is one strand for everyone
-# because on Linux a timer is a descriptor, and one each doubles what a
-# connection costs. In `seen`, slot 0 is pieces begun, slot 1 pieces finished,
-# slot 2 is set once the socket is closing, and slot 3 is what the last look saw.
+# and not gone. It is one strand for everyone because on Linux a timer is a
+# descriptor, and one each doubles what a connection costs.
+#
+# Nothing here is shared. `state` is a channel of one holding the latest count,
+# odd while a piece is being written: the writer replaces it and the watchdog
+# reads it, and neither waits, because telling it over a channel with nobody
+# holding it costs two switches per write, which was seven per cent of delivery.
+# `count` is the writer's own. What the watchdog remembers is the watchdog's.
 type Line
-  Line(fd: Int, ssl: Ptr, seen: Map(Int, Int))
+  Line(fd: Int, ssl: Ptr, state: Chan(Int), count: Map(Int, Int), lines: Chan(LineSays))
+
+type LineSays
+  LineOpen(line: Line)
+  LineShut(fd: Int)
 
 fn p_watcher() =
   lines = channel()
-  spawn p_watch(lines, Nil, now_millis() + p_stall_ms())
+  spawn p_watch(lines, map_new(), map_new(), now_millis() + p_stall_ms())
   lines
 
 fn p_line(lines, fd, ssl) =
-  l = Line(fd, ssl, map_new())
-  send(lines, l)
+  l = Line(fd, ssl, channel(1), map_new(), lines)
+  send(lines, LineOpen(l))
   l
 
 fn p_stall_ms() = opt_int("stall", 30000)
@@ -343,44 +358,83 @@ fn p_line_pieces(l: Line, s, from) =
     p_line_pieces(l, s, upto)
 
 fn p_line_piece(l: Line, s) =
-  seen = l.seen
-  seen[0] = map_or(seen, 0, 0) + 1
+  p_moved(l)
   p_write(l.ssl, l.fd, s)
-  seen[1] = map_or(seen, 0, 0)
-  0
+  p_moved(l)
 
-# Marked before it is closed, so a look that comes after finds it marked and
-# leaves alone a descriptor that may by then be somebody else's.
+fn p_moved(l: Line) =
+  n = map_or(l.count, 0, 0) + 1
+  count = l.count
+  count[0] = n
+  p_take(l.state)
+  p_put(l.state, n)
+
+fn p_take(ch) =
+  v = select
+    n = recv(ch) -> n
+    default -> -1
+  v
+
+fn p_put(ch, n) =
+  ok = select
+    send(ch, n) -> 1
+    default -> 0
+  ok
+
+# Said and heard before the socket closes, so the watchdog cannot shut a
+# descriptor that has been handed to somebody else.
 fn p_line_close(l: Line) =
-  seen = l.seen
-  seen[2] = 1
+  send(l.lines, LineShut(l.fd))
   p_close(l.ssl, l.fd)
 
 # Against a deadline and not a plain timeout, or a connection arriving more
 # often than the timeout would put the look off for ever.
-fn p_watch(lines, known, due) =
+fn p_watch(lines, known: Map(Int, Line), last: Map(Int, Int), due) =
   left = due - now_millis()
-  if left <= 0 then p_watch(lines, p_look_all(known, Nil), now_millis() + p_stall_ms())
+  if left <= 0 then p_watch_again(lines, known, last)
   else
-    fresh = select
-      l = recv(lines) -> Some(l)
+    said = select
+      m = recv(lines) -> Some(m)
       timeout(left) -> None
-    p_watch(lines, p_with(fresh, known), due)
+    p_heard(said, known, last)
+    p_watch(lines, known, last, due)
 
-fn p_with(fresh, known) = match fresh
-  Some(l) -> Cons(l, known)
-  None -> known
+fn p_watch_again(lines, known, last) =
+  p_look_all(known, last, map_keys(known))
+  p_watch(lines, known, last, now_millis() + p_stall_ms())
 
-fn p_look_all(known, kept) = match known
-  Nil -> kept
-  Cons(l, rest) -> p_look_all(rest, if map_or(l.seen, 2, 0) != 0 then kept else Cons(p_look(l), kept))
+fn p_heard(said, known: Map(Int, Line), last: Map(Int, Int)) = match said
+  None -> 0
+  Some(m) -> match m
+    LineOpen(l) ->
+      known[l.fd] = l
+      last[l.fd] = 0
+      0
+    LineShut(fd) ->
+      map_del(known, fd)
+      map_del(last, fd)
+      0
 
-fn p_look(l: Line) =
-  seen = l.seen
-  begun = map_or(seen, 0, 0)
-  if begun == map_or(seen, 3, 0) && begun > map_or(seen, 1, 0) then sock_shutdown(l.fd) else 0
-  seen[3] = begun
-  l
+fn p_look_all(known: Map(Int, Line), last: Map(Int, Int), fds) = match fds
+  Nil -> 0
+  Cons(fd, rest) ->
+    match known[fd]
+      None -> 0
+      Some(l) -> p_look(l, last)
+    p_look_all(known, last, rest)
+
+# Put back after reading, unless the writer got there first, which is newer.
+fn p_look(l: Line, last: Map(Int, Int)) =
+  n = p_take(l.state)
+  if n < 0 then 0
+  else
+    p_put(l.state, n)
+    p_compare(l, last, n)
+
+fn p_compare(l: Line, last: Map(Int, Int), n) =
+  if n == map_or(last, l.fd, 0) && n - n / 2 * 2 == 1 then sock_shutdown(l.fd) else 0
+  last[l.fd] = n
+  0
 
 fn p_close(ssl, fd) =
   if is_null(ssl) then 0 else tls_down(ssl)

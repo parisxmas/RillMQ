@@ -636,14 +636,14 @@ fn b_peer() = opt("peer", "")
 # What version this is. It is said in one place on the wire — the server
 # properties of an AMQP connection — and read from here rather than written
 # there, so that the next version is one line rather than a search.
-fn b_version() = "0.2.1"
+fn b_version() = "0.2.2"
 
 # What a listener hands to every connection it takes: who may connect, and
 # whether the connection is wrapped in TLS. A plain port carries a context
 # that is null, and `p_read` and `p_write` then do exactly what they did
 # before there was any TLS at all.
 type Door
-  Door(users: Str, tls: Tls, lines: Chan(Line), bins: Chan(Chan(Out)))
+  Door(users: Str, tls: Tls, lines: Chan(LineSays), bins: Chan(Chan(Out)))
 
 fn b_door() = b_door_with(Tls(null_ptr(), ""))
 

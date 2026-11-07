@@ -8,15 +8,17 @@
     slow.py flood <port> <seconds>              ask, and never read an answer
     slow.py gone <port> <messages>              ignore, then say whether it was cut off
     slow.py dawdle <port> <messages> <seconds>  read, but slowly
+    slow.py behind <port> <messages>            publish beside a client that stopped
     slow.py native <port> <messages>            drain, on RillMQ's own protocol
     slow.py pings <port> <seconds>              flood, on RillMQ's own protocol
 
 RabbitMQ's .NET client cannot be used for this, because it reads on a thread of
 its own: the socket keeps emptying whatever the rest of the program is doing. A
 client that reads and writes on one thread is the one that parks in a write
-while the broker parks in a write to it. Every mode prints one line.
+while the broker parks in a write to it. Every mode prints one line. With
+WRAPPED set in the environment the AMQP modes speak TLS.
 """
-import socket, struct, sys, time
+import os, socket, ssl, struct, sys, time
 
 STALL = 20
 BODY = b"x" * 64
@@ -48,6 +50,11 @@ def publish(key):
 class Conn:
     def __init__(self, port):
         self.s = socket.create_connection(("127.0.0.1", port))
+        if os.environ.get("WRAPPED"):
+            wrap = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            wrap.check_hostname = False
+            wrap.verify_mode = ssl.CERT_NONE
+            self.s = wrap.wrap_socket(self.s)
         self.s.settimeout(STALL)
         self.buf = b""
         self.s.sendall(b"AMQP\0\0\x09\x01")
@@ -205,6 +212,32 @@ def dawdle(port, n, seconds):
     print("still connected")
 
 
+def behind(port, n):
+    source = "behind"
+    shared = "behind-shared"
+    fill(port, source, n)
+    late = Conn(port)
+    late.s.sendall(declare(shared))
+    late.expect(50, 11)
+    late.consume(source, 0)
+    time.sleep(1)
+    # A client that has stopped reading goes on publishing, so what it is owed
+    # for that comes back to a connection that is not taking anything.
+    late.s.sendall(b"".join(publish(shared) for _ in range(5000)))
+    time.sleep(1)
+    well = Conn(port)
+    well.s.sendall(method(1, 85, 10, b"\0"))
+    well.expect(85, 11)
+    well.s.sendall(publish(shared))
+    well.s.settimeout(5)
+    try:
+        well.expect(60, 80)
+    except (socket.timeout, TimeoutError):
+        print("held up")
+        return
+    print("answered")
+
+
 def flood(port, seconds):
     c = Conn(port)
     name = "f" * 255
@@ -285,4 +318,4 @@ def pings(port, seconds):
 mode = sys.argv[1]
 args = [int(a) for a in sys.argv[2:]]
 {"drain": drain, "batches": batches, "closes": closes, "ignore": ignore, "flood": flood,
- "native": native, "pings": pings, "gone": gone, "dawdle": dawdle}[mode](*args)
+ "native": native, "pings": pings, "gone": gone, "dawdle": dawdle, "behind": behind}[mode](*args)

@@ -19,7 +19,7 @@ type Am
 # that is not deliveries, in a map because a builder does not know its own.
 # `free` holds a token while the writer has nothing to do.
 type Pen
-  Pen(owed: StrBuf, size: Map(Int, Int), wr: Chan(AWrite), free: Chan(Int), bins: Chan(Chan(Out)))
+  Pen(owed: StrBuf, size: Map(Int, Int), wr: Chan(AWrite), free: Chan(Int), bins: Chan(Chan(Out)), say: Chan(Out))
 
 # What reaches the writer. `AWEnd` is the session finished and `AWGone` the
 # reader finished, and they may come in either order.
@@ -238,11 +238,12 @@ fn am_run(w: Who, buf) =
   ses = channel(am_backlog())
   out = channel(am_backlog())
   wr = channel(am_writes())
+  say = channel(am_backlog())
   free = channel(1)
   send(free, 1)
   spawn am_writer(p_line(w.door.lines, w.fd, w.ssl), wr, free, false, false)
   spawn am_reader(w, ses, wr, buf, 0)
-  am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1, w.vh, map_new(), w.who, w.rights, map_new(), Pen(strbuf(), map_new(), wr, free, w.door.bins)), ses, w.gone)
+  am_loop(Am(w.fd, w.ssl, w.reg, w.done, w.cid, out, 1, map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), map_new(), Nil, "", "", 0, false, 0, "", "", false, 1, w.wants_blocked, false, 0, 1, 0, 0, false, 0, map_new(), map_new(), 1, w.vh, map_new(), w.who, w.rights, map_new(), Pen(strbuf(), map_new(), wr, free, w.door.bins, say)), ses, w.gone)
 
 # The reader: frames off the socket and nothing else.
 fn am_reader(w: Who, ses, wr, buf, from) = match a_take(buf, from)
@@ -342,6 +343,7 @@ fn am_look(am: Am, ses, gone) =
   step = select
     m = recv(ses) -> m
     o = recv(am.out) -> AOut(o)
+    a = recv(am.pen.say) -> AOut(a)
     default -> AIdle
   am_step(am, ses, gone, step)
 
@@ -352,6 +354,7 @@ fn am_block_clear(am: Am, ses, gone) =
   step = select
     m = recv(ses) -> m
     o = recv(am.out) -> AOut(o)
+    a = recv(am.pen.say) -> AOut(a)
     recv(am.done) -> AStop
   am_step(am, ses, gone, step)
 
@@ -359,14 +362,18 @@ fn am_block_owing(am: Am, ses, gone) =
   step = select
     m = recv(ses) -> m
     o = recv(am.out) -> AOut(o)
+    a = recv(am.pen.say) -> AOut(a)
     recv(am.pen.free) -> AFree
     recv(am.done) -> AStop
   am_step(am, ses, gone, step)
 
-# As above with `out` left alone, and only ever reached owing something.
+# As above with `out` left alone, and only ever reached owing something. `say`
+# is still taken: a journal answering a publish waits to be heard, and it answers
+# everyone else's publishes too, so a client that is behind must not keep it.
 fn am_behind(am: Am, ses, gone) =
   step = select
     m = recv(ses) -> m
+    a = recv(am.pen.say) -> AOut(a)
     recv(am.pen.free) -> AFree
     recv(am.done) -> AStop
   am_step(am, ses, gone, step)
@@ -485,14 +492,17 @@ type AStat
 fn am_hand(am: Am, ch, req) = select
   send(ch, req) -> am
   o = recv(am.out) -> am_hand(am_from_queue(am, o), ch, req)
+  a = recv(am.pen.say) -> am_hand(am_from_queue(am, a), ch, req)
 
 fn am_wait(am: Am, back) = select
   v = recv(back) -> AInt(am, v)
   o = recv(am.out) -> am_wait(am_from_queue(am, o), back)
+  a = recv(am.pen.say) -> am_wait(am_from_queue(am, a), back)
 
 fn am_wait_stat(am: Am, back) = select
   v = recv(back) -> AStat(am, v)
   o = recv(am.out) -> am_wait_stat(am_from_queue(am, o), back)
+  a = recv(am.pen.say) -> am_wait_stat(am_from_queue(am, a), back)
 
 # The same wait with a way of giving up, which only `Basic.Get` needs.
 type AKept
@@ -501,6 +511,7 @@ type AKept
 fn am_wait_one(am: Am, one, until) = select
   v = recv(one) -> AKept(am, Some(v))
   o = recv(am.out) -> am_wait_one(am_from_queue(am, o), one, until)
+  a = recv(am.pen.say) -> am_wait_one(am_from_queue(am, a), one, until)
   timeout(until) -> AKept(am, None)
 
 # The writer closes the socket, once the last of this has gone. `heard_end` is
@@ -512,6 +523,7 @@ fn am_close(am: Am, ses, gone, heard_end) =
   am_theirs(am)
   if am_owing(am) then am_hand_over(am) else 0
   send(am.pen.bins, am.out)
+  send(am.pen.bins, am.pen.say)
   send(am.pen.wr, AWEnd)
   send(gone, 1)
   if heard_end then 0 else am_drain(ses)
@@ -1295,14 +1307,14 @@ fn am_only_exchanges(am: Am, chan, name) =
 
 fn am_deposit_direct(am: Am, body, found) = match found
   None -> am_deposited(am_confirm(am_dropped_here(am, body)))
-  Some(qh) -> am_deposited(am_hand(am, qh, QPub(body, am.pub_props, am.out)))
+  Some(qh) -> am_deposited(am_hand(am, qh, QPub(body, am.pub_props, am.pen.say)))
 
 fn am_deposit_at(am: Am, body, found) = match found
   # Nothing is counted for a publish that did not happen: the confirm numbers
   # and the acknowledgement numbers have to keep step, and this channel is
   # about to be closed anyway.
   None -> am_done_with_publish(am_no_exchange(am, am.pub_chan, am.pub_x, 40))
-  Some(x) -> am_deposited(am_hand(am, x, XPub(am_route_by(am, am.pub_x, am.pub_to, am.pub_props), body, am.pub_props, am.out, if am.pub_back then am.pub_chan else 0, x_hops())))
+  Some(x) -> am_deposited(am_hand(am, x, XPub(am_route_by(am, am.pub_x, am.pub_to, am.pub_props), body, am.pub_props, am.pen.say, if am.pub_back then am.pub_chan else 0, x_hops())))
 
 # What this message is routed on. For every kind but one it is the routing key
 # the client sent; for `headers` it is the message's own headers, read into the

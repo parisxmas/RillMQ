@@ -92,6 +92,37 @@ start stall=2000 ack=600000
 say "a client that is only slow keeps it" "$($PY dawdle "$AMQP" 200000 8)" "still connected"
 stop
 
+# Nobody else waits on it, either: a publish beside it is answered.
+start stall=600000 ack=600000
+say "a client that is behind does not hold up another's publish" "$($PY behind "$AMQP" 50000)" "answered"
+stop
+
+# All of it again over TLS, which writes by a road of its own.
+K="$(mktemp -d)"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$K/key.pem" -out "$K/cert.pem" \
+  -days 1 -subj /CN=127.0.0.1 >/dev/null 2>&1
+WRAP="$((AMQP + 1))"
+wrapped() {
+  ./rillmq "$A" "amqps=$WRAP" "cert=$K/cert.pem" "key=$K/key.pem" "$@" >/dev/null 2>&1 &
+  BROKER=$!
+  up "$A" "$BROKER" || exit 1
+  up "$WRAP" "$BROKER" || exit 1
+}
+wrapped
+WRAPPED=1 $PY closes "$WRAP" 20 >/dev/null 2>&1
+say "over tls, a client leaving leaves the broker up" "$(kill -0 "$BROKER" 2>/dev/null && echo up)" "up"
+stop
+wrapped ack=600000
+say "over tls, a window of zero is read to the end" "$(WRAPPED=1 $PY drain "$WRAP" 50000 0)" "drained"
+stop
+wrapped stall=2000
+say "over tls, a write that goes nowhere ends the connection" "$(WRAPPED=1 $PY gone "$WRAP" 50000)" "cut off"
+stop
+wrapped stall=2000 ack=600000
+say "over tls, a client that is only slow keeps it" "$(WRAPPED=1 $PY dawdle "$WRAP" 200000 8)" "still connected"
+stop
+rm -rf "$K"
+
 # The native protocol has no way to ask for a window, so the broker is told.
 start prefetch=0 ack=600000
 say "the native protocol is read to the end with no window" "$($PY native "$A" 50000)" "drained"

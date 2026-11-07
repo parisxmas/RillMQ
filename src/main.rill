@@ -44,6 +44,7 @@ fn said_wrong() =
 # stale broker with another `dir` and another `peers`, and looked like a
 # message queue losing messages.
 fn start() =
+  p_ignore_broken_pipes()
   port = if arg_count() > 1 then str_to_int(arg(1)) else default_port()
   dir = where_to_keep_it()
   match listen_on(port)
