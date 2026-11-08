@@ -1039,11 +1039,49 @@ class Program
         Check("and rejecting it with requeue puts it back",
             (int)rch.QueueDeclare(rq, true, false, false, null).MessageCount, 1);
         var rgot2 = rch.BasicGet(rq, autoAck: false);
+        Check("and it says it has been out before", rgot2 != null && rgot2.Redelivered, true);
         if (rgot2 != null) rch.BasicReject(rgot2.DeliveryTag, requeue: false);
         Thread.Sleep(600);
         Check("and rejecting it without requeue does not",
             (int)rch.QueueDeclare(rq, true, false, false, null).MessageCount, 0);
         rch.QueueDelete(rq);
+
+        // Two workers, a job each, and one of them dies holding its job. What
+        // it held goes to the other, marked as delivered before; what the other
+        // was holding living with it. Giving that out again as well had two
+        // workers doing one job, and nothing was ever marked.
+        var dieq = "workers-" + Environment.TickCount;
+        using (var dset = conn.CreateModel())
+        {
+            dset.QueueDeclare(dieq, true, false, false, null);
+            dset.BasicPublish("", dieq, null, Encoding.UTF8.GetBytes("first"));
+            dset.BasicPublish("", dieq, null, Encoding.UTF8.GetBytes("second"));
+        }
+        Thread.Sleep(400);
+        var dying = factory.CreateConnection();
+        var dyingch = dying.CreateModel();
+        dyingch.BasicQos(0, 1, false);
+        var dyinggot = new BlockingCollection<string>();
+        var dcon = new EventingBasicConsumer(dyingch);
+        dcon.Received += (_, ea) => dyinggot.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+        dyingch.BasicConsume(dieq, false, dcon);
+        dyinggot.TryTake(out var dyingHeld, 3000);
+        using var living = factory.CreateConnection();
+        using var lch = living.CreateModel();
+        lch.BasicQos(0, 2, false);
+        var livinggot = new BlockingCollection<(string, bool)>();
+        var lcon = new EventingBasicConsumer(lch);
+        lcon.Received += (_, ea) => livinggot.Add((Encoding.UTF8.GetString(ea.Body.ToArray()), ea.Redelivered));
+        lch.BasicConsume(dieq, false, lcon);
+        livinggot.TryTake(out var livingHeld, 3000);
+        dying.Abort();
+        var handed = livinggot.TryTake(out var handedNow, 3000) ? handedNow : ("(nothing)", false);
+        Check("a worker that dies gives its job to the other", handed.Item1, dyingHeld);
+        Check("marked as delivered before", handed.Item2, true);
+        Check("and what it held first was new to it", livingHeld.Item2, false);
+        Check("and nothing the other was holding came round again",
+            livinggot.TryTake(out var again2, 800) ? again2.Item1 : "(nothing)", "(nothing)");
+        lch.QueueDelete(dieq);
 
         // A queue with no name is the broker's to name, and two of them are
         // two queues. They used to both be a queue genuinely called the empty

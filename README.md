@@ -82,6 +82,10 @@ The two protocols are two doors into the same queues. A message published by
 the .NET client over AMQP is delivered to a subscriber on RillMQ's own port,
 is written to the same journal, and is there after a restart.
 
+[`examples/jobs`](examples/jobs) is the same thing in Python: a producer and two
+workers written with `pika` for RabbitMQ, one of which dies holding a job that
+the other is then given.
+
 What is implemented is what a client actually uses.
 
 The handshake: `PLAIN`, or `EXTERNAL` where the name is the client
@@ -103,7 +107,10 @@ Moving messages: `Basic.Qos`, including `global`; `Basic.Publish` with
 `mandatory` and `Basic.Return`; `Basic.Consume` with `no-ack`,
 `Basic.Deliver`, `Basic.Cancel` from either side; `Basic.Get` that hands back
 a delivery tag meaning what it says; `Basic.Ack` with `multiple`,
-`Basic.Nack` and `Basic.Reject` with `requeue`; `Confirm.Select`.
+`Basic.Nack` and `Basic.Reject` with `requeue`; `Confirm.Select`. A message
+that comes back — rejected, or held by a consumer that went away, or out past
+its deadline — is marked `redelivered` the next time it goes out, and a
+consumer that goes away gives back what it was holding and nothing else.
 
 And closing a channel or a connection from either side, since the broker
 closes a channel itself when it has to refuse something. A message's

@@ -395,7 +395,7 @@ fn am_step(am: Am, ses, gone, m) = match m
     if next.fd < 0 then am_close(next, ses, gone, false) else am_loop(next, ses, gone)
 
 fn am_from_queue(am: Am, what) = match what
-  ODeliver(queue, id, body, props, sub) -> am_send_delivery(am, queue, id, body, props, sub)
+  ODeliver(queue, id, body, props, sub, again) -> am_send_delivery(am, queue, id, body, props, sub, again)
   ONoRoute(exchange, key, body, props, chan) -> am_hand_back(am, chan, exchange, key, body, props)
   OCancelled(queue, sub) -> am_tell_cancelled(am, sub)
   OPublished(queue, id) -> am_confirm(am)
@@ -757,22 +757,24 @@ fn am_put_props(b: StrBuf, props) =
     b += props
     0
 
-fn am_deliver(chan, tag, consumer, queue, body, props) =
+fn am_deliver(chan, tag, consumer, queue, body, props, again) =
   b = strbuf()
   a_shortstr(b, consumer)
   a_u64(b, tag)
-  a_u8(b, 0)
+  a_u8(b, if again then 1 else 0)
   a_shortstr(b, "")
   a_shortstr(b, queue)
   am_method(chan, a_class_basic(), 60, strbuf_str(b)) + am_content(chan, body, props)
 
-fn am_get_ok(chan, tag, queue, left, body, props) =
+fn am_get_ok(chan, tag, queue, body, props, again) =
   b = strbuf()
   a_u64(b, tag)
-  a_u8(b, 0)
+  a_u8(b, if again then 1 else 0)
   a_shortstr(b, "")
   a_shortstr(b, queue)
-  a_u32(b, left)
+  # How many are left behind it. Zero is allowed, and what a client does with
+  # the number is print it.
+  a_u32(b, 0)
   am_method(chan, a_class_basic(), 71, strbuf_str(b)) + am_content(chan, body, props)
 
 # A subscriber's name to the queue. It has to be this connection's alone and
@@ -1484,15 +1486,15 @@ fn am_cancelled_here(am: Am, tag, chan) =
   am_say(am, am_basic_cancel(chan, tag))
   am_dropped(am, tag)
 
-fn am_send_delivery(am: Am, queue, id, body, props, sub) =
+fn am_send_delivery(am: Am, queue, id, body, props, sub, again) =
   am.whose[am.tag] = queue
   am.which[am.tag] = id
   am.borne[am.tag] = map_or(am.where, map_or(am.serving, sub, ""), 1)
-  am_deliver_on(am, queue, body, props, map_or(am.serving, sub, ""))
+  am_deliver_on(am, queue, body, props, map_or(am.serving, sub, ""), again)
   { am | tag = am.tag + 1 }
 
-fn am_deliver_on(am: Am, queue, body, props, tag) =
-  am_owe(am, am_deliver(map_or(am.where, tag, 1), am.tag, tag, am_out(am, queue), body, props))
+fn am_deliver_on(am: Am, queue, body, props, tag, again) =
+  am_owe(am, am_deliver(map_or(am.where, tag, 1), am.tag, tag, am_out(am, queue), body, props, again))
   0
 
 # `Basic.Get` takes one without subscribing. It is a poll, so it subscribes,
@@ -1531,7 +1533,7 @@ fn am_getting(w: AKept, chan, queue, quick) = match w.got
 # anyway.
 fn am_got_one(am: Am, chan, queue, quick, what) = match what
   OFrame(text) -> if str_len(text) == 0 then am_answer(am, am_basic_get_empty(chan)) else am_get_over_there(am, chan, queue, quick)
-  ODeliver(q, id, body, props, sub) -> am_one(am, chan, queue, quick, what)
+  ODeliver(q, id, body, props, sub, again) -> am_one(am, chan, queue, quick, what)
   OPublished(q, id) -> am_answer(am, am_basic_get_empty(chan))
   ONoRoute(exchange, key, body, props, on) -> am_answer(am, am_basic_get_empty(chan))
   OCancelled(q, sub) -> am_answer(am, am_basic_get_empty(chan))
@@ -1556,7 +1558,7 @@ fn am_after_get(w: AKept, chan, queue) = match w.got
   Some(what) -> am_got_there(w.am, chan, queue, what)
 
 fn am_got_there(am: Am, chan, queue, what) = match what
-  ODeliver(q, id, body, props, sub) -> am_ungot(am_drop_get(am_ack_there(am, queue, id), queue), chan, queue, Some(what))
+  ODeliver(q, id, body, props, sub, again) -> am_ungot(am_drop_get(am_ack_there(am, queue, id), queue), chan, queue, Some(what))
   OFrame(text) -> am_ungot(am_drop_get(am, queue), chan, queue, None)
   OPublished(q, id) -> am_ungot(am_drop_get(am, queue), chan, queue, None)
   ONoRoute(exchange, key, body, props, on) -> am_ungot(am_drop_get(am, queue), chan, queue, None)
@@ -1583,18 +1585,18 @@ fn am_one(am: Am, chan, queue, quick, what) = match what
   OPublished(q, id) -> am_answer(am, am_basic_get_empty(chan))
   ONoRoute(exchange, key, body, props, on) -> am_answer(am, am_basic_get_empty(chan))
   OCancelled(q, sub) -> am_answer(am, am_basic_get_empty(chan))
-  ODeliver(q, id, body, props, sub) -> am_gave(am, chan, queue, quick, id, body, props)
+  ODeliver(q, id, body, props, sub, again) -> am_gave(am, chan, queue, quick, id, body, props, again)
 
 # A tag is minted and remembered unless the client said it would not answer
 # for the message, which is the same rule a delivery to a consumer follows.
-fn am_gave(am: Am, chan, queue, quick, id, body, props) =
-  if quick then am_answer(am, am_get_ok(chan, am.tag, am_out(am, queue), 0, body, props)) else am_gave_on_credit(am, chan, queue, id, body, props)
+fn am_gave(am: Am, chan, queue, quick, id, body, props, again) =
+  if quick then am_answer(am, am_get_ok(chan, am.tag, am_out(am, queue), body, props, again)) else am_gave_on_credit(am, chan, queue, id, body, props, again)
 
 fn am_next_tag(am: Am) =
   { am | tag = am.tag + 1 }
 
-fn am_gave_on_credit(am: Am, chan, queue, id, body, props) =
+fn am_gave_on_credit(am: Am, chan, queue, id, body, props, again) =
   am.whose[am.tag] = queue
   am.which[am.tag] = id
   am.borne[am.tag] = chan
-  am_answer(am_next_tag(am), am_get_ok(chan, am.tag, am_out(am, queue), 0, body, props))
+  am_answer(am_next_tag(am), am_get_ok(chan, am.tag, am_out(am, queue), body, props, again))

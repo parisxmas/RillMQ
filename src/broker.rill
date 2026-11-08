@@ -921,7 +921,7 @@ fn b_put(l: Line, out, done, stopping, text) =
 # says it has finished and the socket may go.
 fn b_bytes(what) = match what
   OFrame(text) -> text
-  ODeliver(queue, id, body, props, sub) -> w_msg(id, queue, body)
+  ODeliver(queue, id, body, props, sub, again) -> w_msg(id, queue, body)
   # This protocol has no `mandatory` and so never asks for one of these.
   ONoRoute(exchange, key, body, props, chan) -> ""
   # This protocol has no way of saying it, and a subscriber on it finds out
