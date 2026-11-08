@@ -7,7 +7,6 @@
 # explicitly one strand's at a time on a `--parallel` build, so this is not
 # only the tidy way to write it, it is the only way that stays correct when
 # the program is given more than one worker.
-import "call"
 import "wire"
 import "journal"
 
