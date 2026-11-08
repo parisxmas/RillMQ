@@ -59,7 +59,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: parisxmas/rill
-          ref: v0.16.4
+          ref: v0.16.5
           ssh-key: ${{ secrets.RILL_SSH_KEY }}
           path: rill-lang
 
